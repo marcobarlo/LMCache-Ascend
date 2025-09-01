@@ -55,20 +55,18 @@ Once that is built, run it with the following cmd
 DEVICE_LIST="0,1,2,3,4,5,6,7"
 docker run -it \
     --privileged \
-    --cap-add=SYS_PTRACE \
-    --net=host \
+    --cap-add=SYS_RESOURCE \
+    --cap-add=IPC_LOCK \
+    --port 8000:8000 \
+    --port 8001:8001 \
     --name lmcache-ascend-dev \
-    --rm \
     -e ASCEND_VISIBLE_DEVICES=${DEVICE_LIST} \
     -e ASCEND_RT_VISIBLE_DEVICES=${DEVICE_LIST} \
     -e ASCEND_TOTAL_MEMORY_GB=32 \
     -e VLLM_TARGET_DEVICE=npu \
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
     -v /etc/localtime:/etc/localtime \
-    -v /usr/local/dcmi:/etc/local/dcmi \
     -v /var/log/npu:/var/log/npu \
-    -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
     -v /dev/davinci_manager:/dev/davinci_manager \
     -v /dev/devmm_svm:/dev/devmm_svm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -76,6 +74,8 @@ docker run -it \
     lmcache-ascend:v0.3.3-vllm-ascend-v0.9.2rc1-910b-cann-8.2rc1-py3.11-openeuler-22.03 \
     /bin/bash
 ```
+
+For further info about deployment notes, please refer to the [guide about deployment](docs/deployment.md)
 
 ### Manual Installation
 
