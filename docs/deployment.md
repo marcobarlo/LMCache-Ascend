@@ -64,7 +64,7 @@ spec:
           add: ["SYS_RESOURCE", "IPC_LOCK"]
     env:
     - name: ASCEND_VISIBLE_DEVICES  # Only if on Ascend Docker
-      value: "0,1,2,3,4,5,6,7"		# Replace with your devices
+      value: "0,1,2,3,4,5,6,7"        # Replace with your devices
     - name: ASCEND_RT_VISIBLE_DEVICES
       value: "0,1,2,3,4,5,6,7"
     - name: ASCEND_TOTAL_MEMORY_GB
