@@ -11,7 +11,7 @@ docker build -t lmcache-ascend:latest --file docker/Dockerfile.a2.openEuler .
 ```
 Once you have built the image, you can run it with:
 ```
-export IMAGE=lmcache-ascend:latest  ## Replace with your iamge name
+export IMAGE=lmcache-ascend:latest  ## Replace with your image name
 DEVICE_LIST="0,1,2,3,4,5,6,7"
 docker run -it \
     --privileged \
