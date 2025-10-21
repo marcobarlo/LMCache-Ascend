@@ -7,6 +7,7 @@ import sys
 # Third Party
 from setuptools import find_packages, setup, Extension
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 from setuptools.command.install import install
 
@@ -15,7 +16,8 @@ import sysconfig
 import subprocess
 import platform
 import shutil
-
+import configparser 
+import glob
 
 ROOT_DIR = Path(__file__).parent
 
@@ -58,6 +60,40 @@ def _get_npu_soc():
             raise RuntimeError(f"Retrieve SoC version failed: {e}")
     return _soc_version
 
+def _get_aicore_arch_number(ascend_path, soc_version, host_arch):
+    platform_config_path = os.path.join(ascend_path, f"{host_arch}-linux/data/platform_config")
+    ini_file = os.path.join(platform_config_path, f"{soc_version}.ini")
+
+    if not os.path.exists(ini_file):
+        raise ValueError(f"The file '{ini_file}' is not found, please check your SOC_VERSION")
+
+    # read the file and extract
+    logger.info(f"Extracting AIC Version from: {ini_file}")
+    cp = configparser.ConfigParser()
+    cp.read(ini_file)
+
+    aic_version = cp.get("version", "AIC_version")
+    logger.info(f"AIC Version: {aic_version}")
+
+    version_number = aic_version.split("-")[-1]
+    return version_number
+
+class custom_build_info(build_py):
+
+    def run(self):
+        soc_version = _get_npu_soc()
+        if not soc_version:
+            raise ValueError(
+                "SOC version is not set. Please set SOC_VERSION environment variable."
+            )
+
+        package_dir = os.path.join(ROOT_DIR, "lmcache_ascend", "_build_info.py")
+        with open(package_dir, "w+") as f:
+            f.write('# Auto-generated file\n')
+            f.write(f"__soc_version__ = '{soc_version}'\n")
+        logging.info(
+            f"Generated _build_info.py with SOC version: {soc_version}")
+        super().run()
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwargs) -> None:
@@ -83,6 +119,8 @@ class CustomAscendCmakeBuildExt(build_ext):
         ascend_home_path = _get_ascend_home_path()
         env_path = _get_ascend_env_path()
         _soc_version = _get_npu_soc()
+        arch = platform.machine()
+        _aicore_arch = _get_aicore_arch_number(ascend_home_path, _soc_version, arch)
         _cxx_compiler = os.getenv("CXX")
         _cc_compiler = os.getenv("CC")
         python_executable = sys.executable
@@ -110,7 +148,6 @@ class CustomAscendCmakeBuildExt(build_ext):
         # python include
         python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
 
-        arch = platform.machine()
         install_path = os.path.join(BUILD_OPS_DIR, "install")
         if isinstance(self.distribution.get_command_obj("develop"), develop):
             install_path = BUILD_OPS_DIR
@@ -119,6 +156,7 @@ class CustomAscendCmakeBuildExt(build_ext):
             f"source {env_path} && "
             f"cmake -S {ROOT_DIR} -B {BUILD_OPS_DIR}"
             f"  -DSOC_VERSION={_soc_version}"
+            f"  -DASCEND_AICORE_ARCH={_aicore_arch}"
             f"  -DARCH={arch}"
             "  -DUSE_ASCEND=1"
             f"  -DPYTHON_EXECUTABLE={python_executable}"
@@ -156,28 +194,68 @@ class CustomAscendCmakeBuildExt(build_ext):
         package_name = ext.name.split(".")[0]  # e.g., 'lmcache'
         src_dir = os.path.join(ROOT_DIR, package_name)
 
-        for root, _, files in os.walk(install_path):
-            for file in files:
-                if file.endswith(".so"):
-                    src_path = os.path.join(root, file)
-                    dst_path = os.path.join(os.path.dirname(build_lib_dir), file)
-                    if os.path.exists(dst_path):
-                        os.remove(dst_path)
+        # Expected file patterns (using glob patterns for flexibility)
+        expected_patterns = [
+            "c_ops*.so", 
+            "libcache_kernels.so"
+        ]
 
-                    if isinstance(
-                        self.distribution.get_command_obj("develop"), develop
-                    ):
-                        # For the ascend kernels
-                        src_dir_file = os.path.join(src_dir, file)
-                        shutil.copy(src_path, src_dir_file)
-                    shutil.copy(src_path, dst_path)
+        # Search for files matching our patterns
+        so_files = []
+        for pattern in expected_patterns:
+            # Search in main directory and common subdirectories
+            search_paths = [
+                install_path,
+                os.path.join(install_path, "lib"),
+                os.path.join(install_path, "lib64")
+            ]
+            
+            for search_path in search_paths:
+                if os.path.exists(search_path):
+                    matches = glob.glob(os.path.join(search_path, pattern))
+                    so_files.extend(matches)
 
-                    logger.info(f"Copied {file} to {dst_path}")
+        # For develop mode, also copy to source directory
+        is_develop_mode = isinstance(
+            self.distribution.get_command_obj("develop"), develop
+        )
+        # Remove duplicates
+        so_files = list(dict.fromkeys(so_files))
+
+        if not so_files:
+            raise RuntimeError(f"No .so files found matching patterns {expected_patterns}")
+
+        logger.info(f"Found {len(so_files)} .so files:")
+        for so_file in so_files:
+            logger.info(f"  - {so_file}")
+
+        # Copy each file with improved path validation and duplicate handling compared to previous implementation
+        for src_path in so_files:
+            filename = os.path.basename(src_path)
+            dst_path = os.path.join(os.path.dirname(build_lib_dir), filename)
+            
+            if os.path.abspath(src_path) != os.path.abspath(dst_path):
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+                shutil.copy2(src_path, dst_path)
+                logger.info(f"Copied {filename} to {dst_path}")
+            
+            if is_develop_mode:
+                src_dir_file = os.path.join(src_dir, filename)
+                if os.path.abspath(src_path) != os.path.abspath(src_dir_file):
+                    if os.path.exists(src_dir_file):
+                        os.remove(src_dir_file)
+                    shutil.copy2(src_path, src_dir_file)
+                    logger.info(f"Copied {filename} to source directory: {src_dir_file}")
+
+        logger.info("All files copied successfully")
+
 
 
 def ascend_extension():
     print("Building Ascend extensions")
     return [CMakeExtension(name="lmcache_ascend.c_ops")], {
+        "build_py": custom_build_info,
         "build_ext": CustomAscendCmakeBuildExt
     }
 
