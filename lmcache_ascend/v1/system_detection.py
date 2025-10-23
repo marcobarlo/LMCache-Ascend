@@ -9,7 +9,7 @@ logger = init_logger(__name__)
 if torch.npu.is_available():
     try:
         # First Party
-        from lmcache_ascend.c_ops import get_gpu_pci_bus_id    ## Is this lmcache or lmcache_ascend?
+        from lmcache_ascend.c_ops import get_gpu_pci_bus_id
     except ImportError:
         # Fallback if c_ops is not available
         get_gpu_pci_bus_id = None
