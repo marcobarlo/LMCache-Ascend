@@ -20,7 +20,7 @@ def _read_from_sys() -> Optional[NUMAMapping]:
     """
 
     try:
-        device_index = torch.cuda.current_device()
+        device_index = torch.npu.current_device()
         pci_bus_id = get_gpu_pci_bus_id(device_index).lower()
 
         numa_node_file = f"/sys/bus/pci/devices/{pci_bus_id}/numa_node"
