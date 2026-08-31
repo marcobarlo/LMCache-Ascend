@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Env-only policy helpers for skipping scheduler groups at registration time."""
 
+# Future
 from __future__ import annotations
 
+# Standard
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence, Union
 import os
 
+# Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 import torch
+
+# First Party
+from lmcache_ascend.v1.kv_format import MultiPlaneBundle
 
 logger = init_logger(__name__)
 
@@ -152,7 +158,15 @@ def _filter_multi_plane_entry(
     entry: tuple[torch.Tensor, ...] | list[torch.Tensor],
     active_indices: Sequence[int],
 ) -> tuple[torch.Tensor, ...] | list[torch.Tensor]:
-    """Slice tuple/list entries to active plane indices."""
+    """Slice tuple/list entries to active plane indices.
+
+    Preserves a ``MultiPlaneBundle`` provenance tag: a filtered bundle is
+    still a set of independently paged planes, and dropping the tag would
+    make format detection fall back to the shape heuristic (misclassifying
+    equal-block-size bundles as SEPARATE_KV / MLA_KV).
+    """
+    if isinstance(entry, MultiPlaneBundle):
+        return MultiPlaneBundle(entry[i] for i in active_indices)
     if isinstance(entry, tuple):
         return tuple(entry[i] for i in active_indices)
     return [entry[i] for i in active_indices]
@@ -167,8 +181,7 @@ def apply_skip_filter_to_flattened(
     bundled: bool,
     policy: SkipStateGroupsPolicy | None,
 ) -> tuple[dict[str, _KVEntry], tuple[int, ...], dict[str, list[int]]]:
-    """Filter flattened registration artifacts so skipped groups never reach planning.
-    """
+    """Filter flattened registration artifacts to keep skipped groups out."""
     kept_layer_to_groups = {
         layer: [int(g) for g in groups]
         for layer, groups in layer_to_scheduler_groups.items()
@@ -205,7 +218,9 @@ def apply_skip_filter_to_flattened(
 
     # Unbundled path: one flat entry maps to exactly one scheduler group.
     if not bundled:
-        for (layer_name, entry), sched_g in zip(flat_kv.items(), sched_by_layer):
+        for (layer_name, entry), sched_g in zip(
+            flat_kv.items(), sched_by_layer, strict=True
+        ):
             if _drop_flat_layer(layer_name, int(sched_g)):
                 continue
             kept_flat[layer_name] = entry

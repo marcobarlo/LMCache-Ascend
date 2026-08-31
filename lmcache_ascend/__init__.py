@@ -200,6 +200,17 @@ def _patch_config():
         "This config is only used when pd_pull_mode is set to True.",
     }
 
+    # Add pd_handoff_lease_ttl config
+    lmcache.v1.config._CONFIG_DEFINITIONS["pd_handoff_lease_ttl"] = {
+        "type": float,
+        "default": 300.0,
+        "env_converter": float,
+        "description": "TTL in seconds for receiver-side PD pull handoff leases. "
+        "The lease protects PullReady hits until the decoder lookup claims them. "
+        "Expired, unclaimed handoffs are released to avoid leaked KV entries. "
+        "Keep this lower than pd_pull_pending_ttl on the sender.",
+    }
+
     # Add pd_pull_backpressure_reserve_pct config
     lmcache.v1.config._CONFIG_DEFINITIONS["pd_pull_backpressure_reserve_pct"] = {
         "type": float,
@@ -367,8 +378,8 @@ def _patch_memory_object_tensor():
     flat ``uint8`` here so disk/copy paths need no metadata mutation.
     """
     # Third Party
-    import torch
     from lmcache.v1.memory_management import TensorMemoryObj
+    import torch
 
     _orig_tensor_fget = TensorMemoryObj.tensor.fget
 
@@ -430,17 +441,27 @@ def _patch_storage_manager():
     import lmcache.v1.storage_backend.storage_manager as lm_storage_manager
 
     # First Party
-    from lmcache_ascend.v1.storage_backend import local_disk_backend as ascend_local_disk
+    from lmcache_ascend.v1.storage_backend import (
+        local_disk_backend as ascend_local_disk,
+    )
     from lmcache_ascend.v1.storage_backend.storage_manager import (
         allocate_and_copy_objects as ascend_allocate_and_copy_objects,
+    )
+    from lmcache_ascend.v1.storage_backend.storage_manager import (
+        batched_contains as ascend_batched_contains,
+    )
+    from lmcache_ascend.v1.storage_backend.storage_manager import (
         batched_get as ascend_batched_get,
-        get as ascend_get,
+    )
+    from lmcache_ascend.v1.storage_backend.storage_manager import get as ascend_get
+    from lmcache_ascend.v1.storage_backend.storage_manager import (
         local_cpu_touch_cache,
         local_disk_touch_cache,
         patched_prefetch_all_done_callback,
     )
 
     lm_storage_manager.StorageManager.get = ascend_get
+    lm_storage_manager.StorageManager.batched_contains = ascend_batched_contains
     lm_storage_manager.StorageManager.batched_get = ascend_batched_get
     lm_storage_manager.StorageManager.prefetch_all_done_callback = (
         patched_prefetch_all_done_callback
@@ -621,7 +642,19 @@ def _patch_vllm_v1_adapter():
     lmc_vllm_v1_adapter.ReqMeta = mg.ReqMeta
     lmc_vllm_v1_adapter.LMCacheConnectorV1Impl = ascend_LMCacheAscendConnectorV1Impl
 
-    def handle_preemptions(self, preempted_req_ids):
+    def handle_preemptions(self, preemption_payload):
+        # vLLM 0.18 passes request IDs directly, while vLLM 0.23 carries
+        # them in connector metadata built by the scheduler-side adapter.
+        if isinstance(preemption_payload, set):
+            preempted_req_ids = set(preemption_payload)
+        else:
+            preempted_req_ids = set(
+                getattr(preemption_payload, "preempted_req_ids", None) or ()
+            )
+
+        if not preempted_req_ids:
+            return
+
         method = getattr(self._lmcache_engine, "handle_preemptions", None)
         if callable(method):
             method(preempted_req_ids)
@@ -637,15 +670,17 @@ def _patch_vllm_ascend_connector():
     ``vllm_ascend.distributed.kv_transfer.register_connector`` so the factory
     loader is swapped immediately after vllm-ascend registers connectors.
     """
+    # First Party
     from lmcache_ascend.integration.vllm.lmcache_ascend_connector import (
         LMCacheAscendConnector,
     )
 
     try:
-        import vllm_ascend.distributed.kv_transfer as vt
+        # Third Party
         from vllm.distributed.kv_transfer.kv_connector.factory import (
             KVConnectorFactory,
         )
+        import vllm_ascend.distributed.kv_transfer as vt
     except ImportError:
         return
 
@@ -654,9 +689,7 @@ def _patch_vllm_ascend_connector():
     def _point_factory_at_ascend_connector() -> None:
         if _CONNECTOR_NAME not in KVConnectorFactory._registry:
             return
-        KVConnectorFactory._registry[_CONNECTOR_NAME] = (
-            lambda: LMCacheAscendConnector
-        )
+        KVConnectorFactory._registry[_CONNECTOR_NAME] = lambda: LMCacheAscendConnector
 
     if getattr(vt.register_connector, "_lmcache_ascend_patched", False):
         _point_factory_at_ascend_connector()
@@ -688,12 +721,14 @@ def _patch_metadata_get_shapes():
        multi-plane groups keep logical ``num_tokens`` because the NPU kernel packs
        a full logical chunk across planes.
     """
-    # Third Party
+    # Standard
     from typing import Optional
 
-    import torch
+    # Third Party
     from lmcache.v1.metadata import LMCacheMetadata
+    import torch
 
+    # First Party
     from lmcache_ascend.v1.kv_layer_groups import _lmc_chunk_hidden_bytes
 
     _orig_get_shapes = LMCacheMetadata.get_shapes
