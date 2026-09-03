@@ -754,6 +754,87 @@ def test_mp_launch_meta_matches_runtime_row() -> None:
             assert counts_npu.cpu().tolist() == exp_counts.tolist()
 
 
+def test_to_gpu_with_mp_launch_meta_skips_launch_row() -> None:
+    """Precomputed mp_launch_meta must not call compute_mp_plane_launch_row."""
+    connector, _, kv_caches, dev = make_ds4_setup()
+    num_tokens = DS4_CHUNK_SIZE
+    slot_mappings = make_slot_mappings(num_tokens, dev)
+    cpu_mappings = tuple(sm.cpu() for sm in slot_mappings)
+    filtered_cpu, prefixes = build_filtered_slot_mappings(cpu_mappings)
+    filtered_npu = tuple(f.to(dev) for f in filtered_cpu)
+    ratios = DS4_COMPRESS_RATIOS[: len(slot_mappings)]
+
+    with patch(
+        "lmcache_ascend.v1.npu_connector.npu_connectors.is_310p",
+        return_value=False,
+    ):
+        connector._initialize_pointers(kv_caches)
+
+    chunk_ranges = [(0, DS4_CHUNK_SIZE)]
+    meta = build_mp_launch_meta(
+        connector,
+        chunk_ranges=chunk_ranges,
+        slot_mappings_by_group=cpu_mappings,
+        prefixes_by_group=prefixes,
+        filtered_slot_mappings_npu=filtered_npu,
+        compress_ratios=ratios,
+    )
+    dummy = torch.empty(64, dtype=torch.uint8, device=dev)
+    row_mod = "lmcache_ascend.v1.npu_connector.npu_connectors.compute_mp_plane_launch_row"
+    kernel_mod = (
+        "lmcache_ascend.v1.npu_connector.npu_connectors.lmc_ops"
+        ".multi_layer_kv_transfer_multi_plane"
+    )
+    assert connector.per_group_params is not None
+    assert connector.group_kv_cache_pointers is not None
+
+    with (
+        patch(row_mod) as spy_row,
+        patch(kernel_mod),
+    ):
+        for npu_g, group_params in enumerate(connector.per_group_params):
+            if not _uses_multi_plane_kv_transfer(group_params):
+                continue
+            connector._invoke_multi_plane_kv_transfer(
+                mem_tensor=dummy,
+                group_ptrs=connector.group_kv_cache_pointers[npu_g],
+                group_params=group_params,
+                slot_mappings_by_group=cpu_mappings,
+                filtered_slot_mappings_npu=filtered_npu,
+                slot_valid_prefix_by_group=prefixes,
+                compress_ratios=ratios,
+                g_start=0,
+                g_end=DS4_CHUNK_SIZE,
+                is_store=False,
+                npu_group_idx=npu_g,
+                mp_launch_meta=meta,
+            )
+    spy_row.assert_not_called()
+
+    with (
+        patch(row_mod, wraps=compute_mp_plane_launch_row) as spy_fallback,
+        patch(kernel_mod),
+    ):
+        for npu_g, group_params in enumerate(connector.per_group_params):
+            if not _uses_multi_plane_kv_transfer(group_params):
+                continue
+            connector._invoke_multi_plane_kv_transfer(
+                mem_tensor=dummy,
+                group_ptrs=connector.group_kv_cache_pointers[npu_g],
+                group_params=group_params,
+                slot_mappings_by_group=cpu_mappings,
+                filtered_slot_mappings_npu=filtered_npu,
+                slot_valid_prefix_by_group=prefixes,
+                compress_ratios=ratios,
+                g_start=0,
+                g_end=DS4_CHUNK_SIZE,
+                is_store=False,
+                npu_group_idx=npu_g,
+                mp_launch_meta=None,
+            )
+    assert spy_fallback.call_count >= 1
+
+
 def test_group_compress_ratio_from_uniform_type_bundle() -> None:
     class MLAAttentionSpec:
         def __init__(self, compress_ratio: int) -> None:
