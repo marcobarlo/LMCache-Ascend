@@ -690,6 +690,9 @@ def _patch_mp_transfer_context():
     from lmcache_ascend.v1.multiprocess.npu_gather import install_overrides
 
     install_overrides()
+    # Registration unwrap/wrap now lives in LMCache-MP (detect_format +
+    # wrap_kv_caches + planes_per_layer). Keep only NPU gather/scatter
+    # overrides here so serving exercises the core registration path.
 
 
 def _patch_gpu_connector():

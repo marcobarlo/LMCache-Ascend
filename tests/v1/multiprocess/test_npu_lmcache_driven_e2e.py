@@ -8,8 +8,10 @@ context, real transfers, real events).
 """
 
 # Standard
+import gc
 import math
 import multiprocessing as mp
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,6 +31,7 @@ import lmcache_ascend  # noqa: F401, E402  (registers AscendIPCWrapper)
 # First Party
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 from lmcache.utils import EngineType  # noqa: E402
+from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
 from lmcache.v1.gpu_connector.utils import LayoutHints  # noqa: E402
 from lmcache.v1.multiprocess.custom_types import KVCache  # noqa: E402
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer  # noqa: E402
@@ -42,10 +45,11 @@ from tests.v1.multiprocess.test_custom_types import (  # noqa: E402
     get_customized_encoder,
 )
 
-NL = 4
-NB = 16
+NL = int(os.environ.get("LMCACHE_E2E_NL", "4"))
+NB = int(os.environ.get("LMCACHE_E2E_NB", "16"))
 BS = 16
-CHUNK = 256  # BS * NB
+CHUNK = 256
+BLOCKS_IN_CHUNK = CHUNK // BS
 W_LATENT = 128
 W_ROPE = 16
 HIDDEN = W_LATENT + W_ROPE
@@ -60,10 +64,19 @@ def _worker(device_index: int, conn) -> None:
     device = f"npu:{device_index}"
     wrappers: list[AscendIPCWrapper] = []
     planes: list[torch.Tensor] = []
+    # Keep tuple planes on one shared block step in bytes so one
+    # block_stride_elems can describe the whole tuple layer.
+    latent_block_step = BS * W_LATENT
     for layer in range(NL):
         latent = torch.zeros(NB, BS, 1, W_LATENT, device=device)
-        rope = torch.zeros(NB, BS, 1, W_ROPE, device=device)
-        for block in range(NB):
+        rope_storage = torch.zeros(NB * latent_block_step, device=device)
+        rope = rope_storage.as_strided(
+            (NB, BS, 1, W_ROPE),
+            (latent_block_step, W_ROPE, W_ROPE, 1),
+        )
+        # Allocate the full page table (NB) so IPC covers DSv4-scale
+        # mappings; only the transferred chunk needs filled values.
+        for block in range(BLOCKS_IN_CHUNK):
             latent[block].fill_(float(layer * 1000 + block) % 251.0)
             rope[block].fill_(float((layer * 7 + block) % 13.0))
         planes.extend([latent, rope])
@@ -167,10 +180,10 @@ class _FakeStorageManager:
 
 
 def _expected_staging() -> torch.Tensor:
-    """Rank-3 [L, NB*BS, W] expectation: latent then rope plane per layer."""
-    expected = torch.empty(NL, NB * BS, HIDDEN, dtype=torch.float32)
+    """Rank-3 [L, chunk_tokens, W] expectation: latent then rope plane per layer."""
+    expected = torch.empty(NL, BLOCKS_IN_CHUNK * BS, HIDDEN, dtype=torch.float32)
     for layer in range(NL):
-        for block in range(NB):
+        for block in range(BLOCKS_IN_CHUNK):
             expected[layer, block * BS : (block + 1) * BS, :W_LATENT] = (
                 float(layer * 1000 + block) % 251.0
             )
@@ -226,7 +239,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             CHUNK,
             layout_hints=LayoutHints(
                 kv_layout="NHD",
-                planes_per_layer=2,
+                planes_per_layer=[2] * NL,
             ),
             engine_group_infos=(),
             engine_type=EngineType.VLLM,
@@ -247,7 +260,14 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
                     publish_on_stream=lambda stream, event: None,
                     has_subscribers=lambda event_type: False,
                 ),
-                resolve_obj_keys=lambda key, group_ids: [[("chunk", 0)]],
+                resolve_obj_keys=lambda key, group_ids: [[
+                    ObjectKey(
+                        chunk_hash=b"chunk-0",
+                        model_name="mla-e2e",
+                        kv_rank=0,
+                        cache_salt="",
+                    )
+                ]],
             )
         )
         entry = lmcache_driven_transfer.ContextEntry(
@@ -266,7 +286,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             end=CHUNK,
         )
 
-        block_ids = [list(range(NB))]
+        block_ids = [list(range(BLOCKS_IN_CHUNK))]
         monkeypatch.setattr(
             lmcache_driven_transfer, "DeviceHostFuncDispatcher", _NoopDispatcher
         )
@@ -282,9 +302,15 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
 
         # Stored bytes equal the worker's plane contents in [L, tokens, W]
         # staging order (latent plane then rope plane per layer).
-        stored_obj = storage_manager.objects[("chunk", 0)]
+        obj_key = ObjectKey(
+            chunk_hash=b"chunk-0",
+            model_name="mla-e2e",
+            kv_rank=0,
+            cache_salt="",
+        )
+        stored_obj = storage_manager.objects[obj_key]
         host = stored_obj.raw_tensor.view(torch.float32)
-        assert torch.allclose(host.view(NL, NB * BS, HIDDEN), _expected_staging())
+        assert torch.allclose(host.view(NL, BLOCKS_IN_CHUNK * BS, HIDDEN), _expected_staging())
 
         # Retrieve: mutate host bytes, scatter back into the same blocks.
         stored_obj.raw_tensor.view(torch.float32).add_(1.0)
@@ -302,7 +328,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         for layer in range(NL):
             latent = kv_tensors[layer][0]
             rope = kv_tensors[layer][1]
-            for block in range(NB):
+            for block in range(BLOCKS_IN_CHUNK):
                 exp_latent = (
                     expected[layer, block * BS : (block + 1) * BS, :W_LATENT] + 1.0
                 )
@@ -311,8 +337,32 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
                 )
                 assert torch.allclose(latent[block, :, 0, :].cpu(), exp_latent)
                 assert torch.allclose(rope[block, :, 0, :].cpu(), exp_rope)
-        cache_context.close()
     finally:
+        if "latent" in locals():
+            del latent
+        if "rope" in locals():
+            del rope
+        if "kv_tensors" in locals():
+            del kv_tensors
+        if "expected" in locals():
+            del expected
+        if "host" in locals():
+            del host
+        if "stored_obj" in locals():
+            del stored_obj
+        if "module" in locals():
+            del module
+        if "entry" in locals():
+            del entry
+        if "event_backend" in locals():
+            del event_backend
+        if "cache_context" in locals() and cache_context is not None:
+            cache_context.close()
+            del cache_context
+        if "kv_caches" in locals():
+            del kv_caches
+        gc.collect()
+        torch.npu.synchronize()
         parent_conn.send("done")
-        process.join(timeout=60)
+        process.join(timeout=300)
     assert process.exitcode == 0
