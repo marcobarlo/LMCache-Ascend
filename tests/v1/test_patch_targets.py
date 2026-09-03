@@ -137,3 +137,19 @@ def test_upstream_tag_is_a_ref_not_stale_release():
     tag = lmcache_ascend.LMCACHE_UPSTREAM_TAG
     assert tag != "v0.4.5"
     assert tag.startswith(("v0.", "dev", "feature/", "release/"))
+
+
+def test_compress_ratio_patch_rebinds_mp_connector_helper():
+    """_patch_kv_cache_groups must wrap get_tokens_per_block on both namespaces."""
+    # Third Party
+    from types import SimpleNamespace
+
+    import lmcache.integration.vllm.kv_cache_groups as kv_cache_groups
+    import lmcache.integration.vllm.lmcache_mp_connector as mp_conn
+
+    lmcache_ascend._patch_kv_cache_groups()
+
+    spec = SimpleNamespace(block_size=8, compress_ratio=128)
+    assert kv_cache_groups.get_tokens_per_block(spec, 1) == 1024
+    assert mp_conn.get_tokens_per_block is kv_cache_groups.get_tokens_per_block
+    assert mp_conn.get_tokens_per_block(spec, 1) == 1024

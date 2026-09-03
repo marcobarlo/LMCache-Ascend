@@ -690,6 +690,9 @@ def _patch_mp_transfer_context():
     from lmcache_ascend.v1.multiprocess.npu_gather import install_overrides
 
     install_overrides()
+    # Registration unwrap/wrap now lives in LMCache-MP (detect_format +
+    # wrap_kv_caches + planes_per_layer). Do not install the plugin shim
+    # so serving exercises the core path.
 
 
 def _patch_gpu_connector():
@@ -736,6 +739,22 @@ def _patch_gpu_connector():
     _manager_mod = sys.modules.get("lmcache.v1.manager")
     if _manager_mod is not None:
         _manager_mod.CreateGPUConnector = CreateNPUConnector
+
+
+def _patch_kv_cache_groups():
+    """Multiply MP tokens_per_block by vLLM-Ascend spec.compress_ratio.
+
+    Core LMCache treats kv_cache_spec.block_size as logical tokens per
+    block. vLLM-Ascend stores the physical slot count there and puts the
+    compression factor in compress_ratio; without this overlay every DSv4
+    group looks uncompressed and GetStoreMetadata under-counts.
+    """
+    # First Party
+    from lmcache_ascend.integration.vllm.kv_cache_groups import (
+        apply_get_tokens_per_block_patch,
+    )
+
+    apply_get_tokens_per_block_patch()
 
 
 def _patch_vllm_v1_adapter():
@@ -1048,6 +1067,7 @@ if not LMCACHE_ASCEND_PATCHED:
             _patch_sys_detection()
 
         _patch_lookup_client_factory()
+        _patch_kv_cache_groups()
         _patch_vllm_v1_adapter()
 
         _patch_cache_engine()

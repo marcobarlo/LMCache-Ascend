@@ -10,6 +10,7 @@ context, real transfers, real events).
 # Standard
 import math
 import multiprocessing as mp
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -42,10 +43,11 @@ from tests.v1.multiprocess.test_custom_types import (  # noqa: E402
     get_customized_encoder,
 )
 
-NL = 4
-NB = 16
+NL = int(os.environ.get("LMCACHE_E2E_NL", "4"))
+NB = int(os.environ.get("LMCACHE_E2E_NB", "16"))
 BS = 16
-CHUNK = 256  # BS * NB
+CHUNK = 256
+BLOCKS_IN_CHUNK = CHUNK // BS
 W_LATENT = 128
 W_ROPE = 16
 HIDDEN = W_LATENT + W_ROPE
@@ -63,7 +65,9 @@ def _worker(device_index: int, conn) -> None:
     for layer in range(NL):
         latent = torch.zeros(NB, BS, 1, W_LATENT, device=device)
         rope = torch.zeros(NB, BS, 1, W_ROPE, device=device)
-        for block in range(NB):
+        # Allocate the full page table (NB) so IPC covers DSv4-scale
+        # mappings; only the transferred chunk needs filled values.
+        for block in range(BLOCKS_IN_CHUNK):
             latent[block].fill_(float(layer * 1000 + block) % 251.0)
             rope[block].fill_(float((layer * 7 + block) % 13.0))
         planes.extend([latent, rope])
@@ -167,10 +171,10 @@ class _FakeStorageManager:
 
 
 def _expected_staging() -> torch.Tensor:
-    """Rank-3 [L, NB*BS, W] expectation: latent then rope plane per layer."""
-    expected = torch.empty(NL, NB * BS, HIDDEN, dtype=torch.float32)
+    """Rank-3 [L, chunk_tokens, W] expectation: latent then rope plane per layer."""
+    expected = torch.empty(NL, BLOCKS_IN_CHUNK * BS, HIDDEN, dtype=torch.float32)
     for layer in range(NL):
-        for block in range(NB):
+        for block in range(BLOCKS_IN_CHUNK):
             expected[layer, block * BS : (block + 1) * BS, :W_LATENT] = (
                 float(layer * 1000 + block) % 251.0
             )
@@ -266,7 +270,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             end=CHUNK,
         )
 
-        block_ids = [list(range(NB))]
+        block_ids = [list(range(BLOCKS_IN_CHUNK))]
         monkeypatch.setattr(
             lmcache_driven_transfer, "DeviceHostFuncDispatcher", _NoopDispatcher
         )
@@ -284,7 +288,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         # staging order (latent plane then rope plane per layer).
         stored_obj = storage_manager.objects[("chunk", 0)]
         host = stored_obj.raw_tensor.view(torch.float32)
-        assert torch.allclose(host.view(NL, NB * BS, HIDDEN), _expected_staging())
+        assert torch.allclose(host.view(NL, BLOCKS_IN_CHUNK * BS, HIDDEN), _expected_staging())
 
         # Retrieve: mutate host bytes, scatter back into the same blocks.
         stored_obj.raw_tensor.view(torch.float32).add_(1.0)
@@ -302,7 +306,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         for layer in range(NL):
             latent = kv_tensors[layer][0]
             rope = kv_tensors[layer][1]
-            for block in range(NB):
+            for block in range(BLOCKS_IN_CHUNK):
                 exp_latent = (
                     expected[layer, block * BS : (block + 1) * BS, :W_LATENT] + 1.0
                 )
@@ -314,5 +318,5 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         cache_context.close()
     finally:
         parent_conn.send("done")
-        process.join(timeout=60)
+        process.join(timeout=300)
     assert process.exitcode == 0
