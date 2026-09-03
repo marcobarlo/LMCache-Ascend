@@ -102,6 +102,11 @@ def _worker(device_index: int, conn) -> None:
         }
     )
     conn.recv()  # hold the mappings until the parent finishes
+    # Explicitly tear down producer-side IPC exports before interpreter exit.
+    wrappers.clear()
+    planes.clear()
+    gc.collect()
+    torch.npu.synchronize()
 
 
 class _NoopDispatcher:
