@@ -33,6 +33,18 @@ void multi_layer_kv_transfer_kernel_v2(
     const int64_t kHiddenDims = 0, const int64_t vHiddenDims = 0,
     const int64_t dsaHiddenDims = 0);
 
+void multi_layer_kv_transfer_kernel_v3(
+    kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
+    const kvcache_ops::KVCacheFormat kvcache_format, uint32_t blockDim,
+    void *stream, uint8_t *pagedKVCaches, uint8_t *dstCacheTensor,
+    uint8_t *slotmappings, const int64_t hiddenDims, const int32_t kvs,
+    const int32_t numLayers, const int64_t pageBuffSize,
+    const int32_t numTokensChunk, const int64_t perLoopBuffer,
+    const int32_t maxTokensPerLoop, const bool page2L,
+    const int64_t kHiddenDims = 0, const int64_t vHiddenDims = 0,
+    const int64_t dsaHiddenDims = 0, const int64_t blockStrideElems = 0,
+    const int32_t blockSize = 0, const int64_t lmcRowElems = 0);
+
 void single_layer_kv_transfer_kernel_v2(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCache,
@@ -73,7 +85,8 @@ void multi_layer_kv_transfer(
     const int64_t k_hidden_dims = 0, const int64_t v_hidden_dims = 0,
     const int64_t dsa_hidden_dims = 0,
     const int64_t dsa_c8_scale_plane_bytes = 0,
-    const int32_t paged_kv_block_size = 0);
+    const int32_t paged_kv_block_size = 0,
+    const int64_t block_stride_elems = 0, const int64_t lmc_row_elems = 0);
 
 void fused_multi_layer_kv_transfer(
     torch::Tensor &key_value,
@@ -84,7 +97,8 @@ void fused_multi_layer_kv_transfer(
     const int64_t k_hidden_dims = 0, const int64_t v_hidden_dims = 0,
     const int64_t dsa_hidden_dims = 0,
     const int64_t dsa_c8_scale_plane_bytes = 0,
-    const int32_t paged_kv_block_size = 0);
+    const int32_t paged_kv_block_size = 0,
+    const int64_t block_stride_elems = 0, const int64_t lmc_row_elems = 0);
 
 void multi_layer_kv_transfer_310p(
     torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]

@@ -74,7 +74,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("kvcache_format_raw"), py::arg("k_hidden_dims") = 0,
         py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
         py::arg("dsa_c8_scale_plane_bytes") = 0,
-        py::arg("paged_kv_block_size") = 0);
+        py::arg("paged_kv_block_size") = 0,
+        py::arg("block_stride_elems") = 0, py::arg("lmc_row_elems") = 0);
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer,
         py::arg("key_value"), py::arg("staging_cache"),
         py::arg("key_value_ptrs"), py::arg("slot_mapping"),
@@ -82,7 +83,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("direction"), py::arg("use_mla"), py::arg("kvcache_format_raw"),
         py::arg("k_hidden_dims") = 0, py::arg("v_hidden_dims") = 0,
         py::arg("dsa_hidden_dims") = 0, py::arg("dsa_c8_scale_plane_bytes") = 0,
-        py::arg("paged_kv_block_size") = 0);
+        py::arg("paged_kv_block_size") = 0,
+        py::arg("block_stride_elems") = 0, py::arg("lmc_row_elems") = 0);
   m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);
   m.def("batched_fused_single_layer_kv_transfer",

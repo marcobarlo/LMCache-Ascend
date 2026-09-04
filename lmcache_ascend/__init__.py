@@ -493,6 +493,16 @@ def _patch_ops():
     # First Party
     import lmcache_ascend.c_ops as ascend_c_ops
 
+    # Bind the fused NPU block-transfer shim BEFORE the torch_ops merge so
+    # ``hasattr(ascend_c_ops, "multi_layer_block_kv_transfer")`` is True and
+    # the Python fallback is not injected under that name.
+    from lmcache_ascend.v1.multiprocess.npu_block_transfer import (
+        multi_layer_block_kv_transfer as _npu_block_kv_transfer,
+    )
+
+    if not hasattr(ascend_c_ops, "multi_layer_block_kv_transfer"):
+        ascend_c_ops.multi_layer_block_kv_transfer = _npu_block_kv_transfer
+
     for attr_name in dir(python_ops_fallback):
         if not attr_name.startswith("__") and not hasattr(ascend_c_ops, attr_name):
             setattr(ascend_c_ops, attr_name, getattr(python_ops_fallback, attr_name))
@@ -685,11 +695,20 @@ def _patch_mp_transfer_context():
     ``fused_multi_layer_kv_transfer`` for SEPARATE_KV caches on 910B/C NPU,
     falling back to the upstream PyTorch path otherwise. See
     :mod:`lmcache_ascend.v1.multiprocess.npu_gather` for scope and limits.
+
+    Also installs lmcache_driven server-side spans/counters and an optional
+    file-triggered torch_npu profiler (see ``server_transfer_trace``).
     """
     # First Party
     from lmcache_ascend.v1.multiprocess.npu_gather import install_overrides
+    from lmcache_ascend.v1.multiprocess.server_transfer_trace import (
+        install_server_transfer_trace,
+        start_file_triggered_server_profiler,
+    )
 
     install_overrides()
+    install_server_transfer_trace()
+    start_file_triggered_server_profiler()
     # Registration unwrap/wrap now lives in LMCache-MP (detect_format +
     # wrap_kv_caches + planes_per_layer). Keep only NPU gather/scatter
     # overrides here so serving exercises the core registration path.

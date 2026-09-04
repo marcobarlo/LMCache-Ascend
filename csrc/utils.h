@@ -83,6 +83,10 @@ struct MultiLayerKVConfig {
   /// vLLM paged ``block_size`` (slots per block); required for DSA_C8 scale
   /// kernel path.
   int32_t paged_kv_block_size{0};
+  /// Paged block-axis stride in the launched scalar's units. 0 = tight.
+  int64_t block_stride_elems{0};
+  /// Token-major packed LMC row width in launched scalar units. 0 = plane-major.
+  int64_t lmc_row_elems{0};
 };
 
 MultiLayerKVConfig prepare_multi_layer_kv_config(
@@ -91,7 +95,8 @@ MultiLayerKVConfig prepare_multi_layer_kv_config(
     int page_buffer_size, bool direction, bool use_mla, int kvcache_format_raw,
     int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
     int64_t dsa_hidden_dims = 0, int64_t dsa_c8_scale_plane_bytes = 0,
-    int32_t paged_kv_block_size = 0);
+    int32_t paged_kv_block_size = 0, int64_t block_stride_elems = 0,
+    int64_t lmc_row_elems = 0);
 
 void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
                                    const torch::Tensor &key_value,

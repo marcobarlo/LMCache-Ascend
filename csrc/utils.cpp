@@ -35,7 +35,8 @@ MultiLayerKVConfig prepare_multi_layer_kv_config(
     const torch::Tensor &slot_mapping, const torch::Device &paged_memory_device,
     int page_buffer_size, bool direction, bool use_mla, int kvcache_format_raw,
     int64_t k_hidden_dims, int64_t v_hidden_dims, int64_t dsa_hidden_dims,
-    int64_t dsa_c8_scale_plane_bytes, int32_t paged_kv_block_size) {
+    int64_t dsa_c8_scale_plane_bytes, int32_t paged_kv_block_size,
+    int64_t block_stride_elems, int64_t lmc_row_elems) {
   MultiLayerKVConfig config;
 
   config.page_buffer_ptrs =
@@ -67,6 +68,8 @@ MultiLayerKVConfig prepare_multi_layer_kv_config(
   config.dsa_hidden_dims = dsa_hidden_dims;
   config.dsa_c8_scale_plane_bytes = dsa_c8_scale_plane_bytes;
   config.paged_kv_block_size = paged_kv_block_size;
+  config.block_stride_elems = block_stride_elems;
+  config.lmc_row_elems = lmc_row_elems;
 
   if (config.is_dsa_c8) {
     config.kv_size = 4;
@@ -140,7 +143,11 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
     elem_size = 1;
   }
 
-  int64_t baseBuffSize = numBuffsOnDev * max_hidden_dims * elem_size;
+  // Pad each token's UB row to 32 B so narrow planes (KG0 2 B scale) can
+  // stage at dataBlock-aligned LocalTensor offsets.
+  int64_t perTokenBytes = max_hidden_dims * elem_size;
+  perTokenBytes = (perTokenBytes + 31) & ~static_cast<int64_t>(31);
+  int64_t baseBuffSize = numBuffsOnDev * perTokenBytes;
 
   if (ubSize < static_cast<uint64_t>(baseBuffSize)) {
     std::string errStr =

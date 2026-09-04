@@ -67,7 +67,8 @@ built extension — this keeps the slot-mapping and fallback logic unit-testable
 
 # Standard
 from collections.abc import Sequence
-from typing import NamedTuple, Optional
+from contextlib import contextmanager
+from typing import Iterator, NamedTuple, Optional
 
 # Third Party
 from lmcache.logging import init_logger
@@ -78,6 +79,81 @@ import torch
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _trace_span(name: str, stream: object = None) -> Iterator[None]:
+    """CPU + MSTX span so torch_npu / msprof chrome traces show LMCache op names.
+
+    ``record_function`` labels the host/Kineto side; ``range_push``/``range_pop``
+    labels the NPU timeline when ``msprof_tx`` is enabled. (``mstx_range`` is a
+    decorator, not a context manager.)
+    """
+    pushed = False
+    try:
+        import torch_npu.npu.mstx as mstx
+
+        try:
+            mstx.range_push(name)
+            pushed = True
+        except TypeError:
+            mstx.range_push(name, domain="lmcache")
+            pushed = True
+        except Exception:
+            pushed = False
+    except Exception:
+        pushed = False
+
+    try:
+        with torch.profiler.record_function(name):
+            yield
+    finally:
+        if pushed:
+            try:
+                import torch_npu.npu.mstx as mstx
+
+                mstx.range_pop()
+            except Exception:
+                pass
+
+
+def _log_transfer_counts(
+    *,
+    op: str,
+    fmt: str,
+    num_chunks: int,
+    chunks_per_sub: int,
+    fused_launches: int,
+    copy_calls: int,
+    tokens_per_chunk: int,
+) -> None:
+    """Emit a one-line summary of fused-kernel vs per-chunk copy call counts."""
+    copies_per_chunk = (copy_calls / num_chunks) if num_chunks else 0.0
+    fused_per_chunk = (fused_launches / num_chunks) if num_chunks else 0.0
+    logger.warning(
+        "LMCache NPU transfer counters op=%s fmt=%s chunks=%d "
+        "chunks_per_subbatch=%d tokens_per_chunk=%d "
+        "fused_multi_layer_kv_transfer_launches=%d "
+        "host_copy_calls=%d fused_launches_per_chunk=%.3f "
+        "host_copy_calls_per_chunk=%.3f",
+        op,
+        fmt,
+        num_chunks,
+        chunks_per_sub,
+        tokens_per_chunk,
+        fused_launches,
+        copy_calls,
+        fused_per_chunk,
+        copies_per_chunk,
+    )
+    print(
+        f"[LMCACHE_COUNTERS] op={op} fmt={fmt} chunks={num_chunks} "
+        f"chunks_per_sub={chunks_per_sub} tokens_per_chunk={tokens_per_chunk} "
+        f"fused_launches={fused_launches} host_copy_calls={copy_calls} "
+        f"fused_per_chunk={fused_per_chunk:.3f} "
+        f"host_copy_per_chunk={copies_per_chunk:.3f}",
+        flush=True,
+    )
 
 # Formats whose chunk-shape contract is compatible with the fused kernel.
 # MLA_KV / DSA_KV concatenate their differing-width planes into one flat
@@ -449,6 +525,9 @@ def _npu_gather_paged_kv_to_cpu(
     tokens_per_chunk = blocks_per_chunk * desc.block_size
     max_tokens = _max_tokens_per_subbatch(desc)
     chunks_per_sub = max(1, max_tokens // tokens_per_chunk)
+    fused_launches = 0
+    copy_calls = 0
+    fmt_name = desc.kv_format.name
 
     # LMC-A: one paged->staging kernel launch per sub-batch, then per-chunk async
     # D2H from disjoint staging slices. All on the dedicated transfer stream so
@@ -471,45 +550,68 @@ def _npu_gather_paged_kv_to_cpu(
             staging = desc.staging_for(kv_lead=desc.staging_kv_lead, tokens=len(sub_block_ids) * desc.block_size)
 
             # Paged KV -> NPU staging (device-to-device; no host memory involved).
-            lmc_ops.multi_layer_kv_transfer(
-                key_value=staging,
-                key_value_ptrs=desc.ptr_table,
-                slot_mapping=slot_mapping,
-                paged_memory_device=desc.device,
-                page_buffer_size=desc.page_buffer_size,
-                direction=True,  # from_gpu: paged -> staging
-                use_mla=desc.use_mla,
-                kvcache_format_raw=desc.kv_format.value,
-                k_hidden_dims=k1,
-                v_hidden_dims=k2,
-                dsa_hidden_dims=k3,
-                dsa_c8_scale_plane_bytes=k4,
-                paged_kv_block_size=desc.block_size,
+            # C++ OpCommand name: multi_layer_kv_transfer_kernel_v3
+            span = (
+                f"lmcache.multi_layer_kv_transfer_kernel_v3/"
+                f"gather_paged_to_staging/{fmt_name}/"
+                f"chunks={len(sub)}/tokens={len(sub_block_ids) * desc.block_size}"
             )
+            with _trace_span(span, stream=desc.transfer_stream):
+                lmc_ops.multi_layer_kv_transfer(
+                    key_value=staging,
+                    key_value_ptrs=desc.ptr_table,
+                    slot_mapping=slot_mapping,
+                    paged_memory_device=desc.device,
+                    page_buffer_size=desc.page_buffer_size,
+                    direction=True,  # from_gpu: paged -> staging
+                    use_mla=desc.use_mla,
+                    kvcache_format_raw=desc.kv_format.value,
+                    k_hidden_dims=k1,
+                    v_hidden_dims=k2,
+                    dsa_hidden_dims=k3,
+                    dsa_c8_scale_plane_bytes=k4,
+                    paged_kv_block_size=desc.block_size,
+                )
+            fused_launches += 1
 
             # Per-chunk D2H from disjoint staging slices. ``non_blocking=True``
             # is async when the host dst is pinned (SHM pool pinned by
             # NpuPinMemoryBackend, or the freshly-allocated pinned CPU buffer);
             # otherwise torch falls back to a synchronous copy, still correctly
             # ordered before the caller's single stream sync.
-            for k, _chunk_idx in enumerate(sub):
+            for k, chunk_idx in enumerate(sub):
                 t0 = k * tokens_per_chunk
                 slc = staging[:, :, t0 : t0 + tokens_per_chunk]
                 out_idx = sub_start + k
-                if out is not None:
-                    # The SHM slot's nominal shape is the server-negotiated shape
-                    # (rank-4 [2, L, tokens, H] for SEPARATE_KV, rank-3
-                    # [L, tokens, hidden] for MLA/DSA); ``view_as`` zero-copies
-                    # it to the slice's staging shape, so one path covers all
-                    # formats.
-                    out[out_idx].view_as(slc).copy_(slc, non_blocking=True)
-                else:
-                    dst = torch.empty(
-                        slc.shape, dtype=desc.dtype, device="cpu", pin_memory=True
-                    )
-                    dst.copy_(slc, non_blocking=True)
-                    chunks.append(dst)
+                copy_span = (
+                    f"lmcache.copy_d2h/staging_to_cpu/{fmt_name}/"
+                    f"chunk={chunk_idx}/tokens={tokens_per_chunk}"
+                )
+                with _trace_span(copy_span, stream=desc.transfer_stream):
+                    if out is not None:
+                        # The SHM slot's nominal shape is the server-negotiated shape
+                        # (rank-4 [2, L, tokens, H] for SEPARATE_KV, rank-3
+                        # [L, tokens, hidden] for MLA/DSA); ``view_as`` zero-copies
+                        # it to the slice's staging shape, so one path covers all
+                        # formats.
+                        out[out_idx].view_as(slc).copy_(slc, non_blocking=True)
+                    else:
+                        dst = torch.empty(
+                            slc.shape, dtype=desc.dtype, device="cpu", pin_memory=True
+                        )
+                        dst.copy_(slc, non_blocking=True)
+                        chunks.append(dst)
+                copy_calls += 1
 
+    _log_transfer_counts(
+        op="gather",
+        fmt=fmt_name,
+        num_chunks=len(needed),
+        chunks_per_sub=chunks_per_sub,
+        fused_launches=fused_launches,
+        copy_calls=copy_calls,
+        tokens_per_chunk=tokens_per_chunk,
+    )
     return chunks
 
 
@@ -570,6 +672,10 @@ def _npu_scatter_cpu_to_paged_kv(
         return
 
     max_tokens = _max_tokens_per_subbatch(desc)
+    fused_launches = 0
+    copy_calls = 0
+    fmt_name = desc.kv_format.name
+    tokens_per_chunk = blocks_per_chunk * desc.block_size
 
     # LMC-A: one staging->paged kernel launch per sub-batch on the dedicated
     # transfer stream (mirrors gather). Per-chunk H2D into disjoint staging
@@ -597,30 +703,56 @@ def _npu_scatter_cpu_to_paged_kv(
                 kv_lead=desc.staging_kv_lead, tokens=sub_tokens
             )
             off = 0
-            for src_slice, eff_tokens in sub_slices:
+            for src_idx, (src_slice, eff_tokens) in enumerate(sub_slices):
                 # H2D the host slice into its disjoint staging offset. The dst
                 # view is a strided region of the contiguous staging buffer;
                 # ``copy_`` handles the non-contiguity (a sliced host chunk is
                 # not contiguous across layers, as in the per-chunk path).
-                staging[:, :, off : off + eff_tokens].copy_(src_slice, non_blocking=True)
+                copy_span = (
+                    f"lmcache.copy_h2d/cpu_to_staging/{fmt_name}/"
+                    f"sub_chunk={src_idx}/tokens={eff_tokens}"
+                )
+                with _trace_span(copy_span, stream=desc.transfer_stream):
+                    staging[:, :, off : off + eff_tokens].copy_(
+                        src_slice, non_blocking=True
+                    )
+                copy_calls += 1
                 off += eff_tokens
 
             slot_mapping = _build_slot_mapping(sub_block_ids, desc.block_size, desc.device)
-            lmc_ops.multi_layer_kv_transfer(
-                key_value=staging,
-                key_value_ptrs=desc.ptr_table,
-                slot_mapping=slot_mapping,
-                paged_memory_device=desc.device,
-                page_buffer_size=desc.page_buffer_size,
-                direction=False,  # to_gpu: staging -> paged
-                use_mla=desc.use_mla,
-                kvcache_format_raw=desc.kv_format.value,
-                k_hidden_dims=k1,
-                v_hidden_dims=k2,
-                dsa_hidden_dims=k3,
-                dsa_c8_scale_plane_bytes=k4,
-                paged_kv_block_size=desc.block_size,
+            # C++ OpCommand name: multi_layer_kv_transfer_kernel_v3
+            span = (
+                f"lmcache.multi_layer_kv_transfer_kernel_v3/"
+                f"scatter_staging_to_paged/{fmt_name}/"
+                f"chunks={len(sub_slices)}/tokens={sub_tokens}"
             )
+            with _trace_span(span, stream=desc.transfer_stream):
+                lmc_ops.multi_layer_kv_transfer(
+                    key_value=staging,
+                    key_value_ptrs=desc.ptr_table,
+                    slot_mapping=slot_mapping,
+                    paged_memory_device=desc.device,
+                    page_buffer_size=desc.page_buffer_size,
+                    direction=False,  # to_gpu: staging -> paged
+                    use_mla=desc.use_mla,
+                    kvcache_format_raw=desc.kv_format.value,
+                    k_hidden_dims=k1,
+                    v_hidden_dims=k2,
+                    dsa_hidden_dims=k3,
+                    dsa_c8_scale_plane_bytes=k4,
+                    paged_kv_block_size=desc.block_size,
+                )
+            fused_launches += 1
+
+    _log_transfer_counts(
+        op="scatter",
+        fmt=fmt_name,
+        num_chunks=len(plan),
+        chunks_per_sub=max(1, max_tokens // max(tokens_per_chunk, 1)),
+        fused_launches=fused_launches,
+        copy_calls=copy_calls,
+        tokens_per_chunk=tokens_per_chunk,
+    )
 
 
 # --- Override installation -------------------------------------------------
