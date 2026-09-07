@@ -15,7 +15,6 @@ import torch
 import lmcache.lmcache_native as lmcache_native
 from lmcache_ascend.v1.multiprocess import npu_block_transfer as nbt
 from lmcache_ascend.v1.multiprocess import npu_gather
-from lmcache_ascend.v1.multiprocess import server_transfer_trace as stt
 
 EngineKVFormat = lmcache_native.EngineKVFormat
 TransferDirection = lmcache_native.TransferDirection
@@ -386,13 +385,6 @@ def test_fallback_cpu_transfer_matches_torch_ops():
     )
     assert nbt.last_fallback_reason == "non-npu"
     assert torch.equal(objs_a[0], objs_b[0])
-
-
-def test_trace_counters_include_fused_launches():
-    stt.reset_counters()
-    snap = stt.snapshot_counters()
-    assert "block_kv_fused_launches" in snap
-    assert snap["block_kv_fused_launches"] == 0.0
 
 
 def test_npu_gather_slot_mapping_unchanged():

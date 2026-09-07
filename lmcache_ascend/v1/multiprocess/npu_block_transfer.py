@@ -46,7 +46,7 @@ _SUPPORTED_TUPLE = frozenset({EngineKVFormat.NL_X_TWO_X_NB_BS_HS})
 
 _ptr_table_cache: dict[tuple[int, ...], torch.Tensor] = {}
 
-#: Incremented once per fused kernel launch. Read by server_transfer_trace.
+#: Incremented once per fused kernel launch (tests).
 fused_kernel_launches: int = 0
 last_fallback_reason: str = ""
 
