@@ -226,7 +226,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             CHUNK,
             layout_hints=LayoutHints(
                 kv_layout="NHD",
-                planes_per_layer=2,
+                planes_per_layer=[2] * NL,
             ),
             engine_group_infos=(),
             engine_type=EngineType.VLLM,
