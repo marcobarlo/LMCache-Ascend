@@ -518,15 +518,102 @@ def _patch_ops():
 
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
-    # PR #3171 PageBufferShapeDesc is CUDA pybind only; reuse the
-    # Python equivalent (same __slots__) for Ascend.
-    if not hasattr(ascend_c_ops, "PageBufferShapeDesc"):
-        # Third Party
-        from lmcache.v1.platform.torch_ops import PageBufferShapeDesc
+    # MP's make_page_buffer_shape_desc sets desc.dtype (torch dtype side
+    # channel). Keep lmcache_native's dynamic_attr class on c_ops/device_ops
+    # so bind_native cannot pin the C++ struct (no dtype field).
+    from lmcache.lmcache_native import PageBufferShapeDesc as _NativeShapeDesc
 
-        ascend_c_ops.PageBufferShapeDesc = PageBufferShapeDesc
+    ascend_c_ops.PageBufferShapeDesc = _NativeShapeDesc
+
+    # Block kernel: 16 equal K/V, 17 packed MLA (KG0), 13 fused NH_CS.
+    # Annotation has no Tensor so MP stays in ptr mode.
+    _native_block = ascend_c_ops.multi_layer_block_kv_transfer
+    _fmt_13 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_BS_NH_CS)
+    _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
+    _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_HS)
+
+    def _paged_arg_to_ptr_tensor(paged, device):
+        """NPU cache context returns per-layer tensors; the C++ op wants int64 ptrs."""
+        import torch
+
+        if isinstance(paged, torch.Tensor):
+            return paged
+        ptrs: list[int] = []
+        for layer in paged:
+            if isinstance(layer, (tuple, list)):
+                ptrs.extend(int(plane.data_ptr()) for plane in layer)
+            else:
+                ptrs.append(int(layer.data_ptr()))
+        return torch.tensor(ptrs, dtype=torch.int64, device=device)
+
+    def multi_layer_block_kv_transfer(
+        paged_buffer_ptrs_tensor,
+        lmcache_objects_ptrs: list[int],
+        block_ids,
+        device,
+        direction,
+        shape_desc,
+        lmcache_chunk_size,
+        engine_kv_format,
+        skip_prefix_n_blocks,
+    ):
+        if int(engine_kv_format) in (_fmt_13, _fmt_16, _fmt_17):
+            import torch
+
+            paged = _paged_arg_to_ptr_tensor(paged_buffer_ptrs_tensor, device)
+            if isinstance(block_ids, torch.Tensor):
+                block_ids = block_ids.contiguous()
+            return _native_block(
+                paged,
+                lmcache_objects_ptrs,
+                block_ids,
+                device,
+                direction,
+                shape_desc,
+                lmcache_chunk_size,
+                engine_kv_format,
+                skip_prefix_n_blocks,
+            )
+        return python_ops_fallback.multi_layer_block_kv_transfer(
+            paged_buffer_ptrs_tensor,
+            lmcache_objects_ptrs,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+
+    ascend_c_ops.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
+    dop = getattr(sys.modules.get("lmcache"), "device_ops", None)
+    if dop is not None:
+        dop.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
+        dop.PageBufferShapeDesc = _NativeShapeDesc
+        # bind_native may have run before this wrap; re-bind the CUDA plan
+        # surface so hasattr(device_ops, "execute_object_group_transfer")
+        # matches a CUDA build.
+        for _plan_name in (
+            "execute_object_group_transfer",
+            "KernelGroupSpec",
+            "StagingCopy",
+            "LaunchVar",
+            "BatchStep",
+        ):
+            if hasattr(ascend_c_ops, _plan_name):
+                setattr(dop, _plan_name, getattr(ascend_c_ops, _plan_name))
 
     sys.modules["lmcache.c_ops"] = ascend_c_ops
+
+    try:
+        import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as _ldt
+
+        _ldt._HAS_NATIVE_OBJECT_GROUP_TRANSFER = hasattr(
+            ascend_c_ops, "execute_object_group_transfer"
+        )
+    except ImportError:
+        pass
 
 
 def _patch_storage_backend_init():
