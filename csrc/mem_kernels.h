@@ -3,6 +3,7 @@
 #include "managed_mem.h"
 #include <torch/extension.h>
 #include <torch/torch.h>
+#include <vector>
 
 namespace kvcache_ops {
 void multi_layer_kv_transfer_kernel(
@@ -34,14 +35,7 @@ void multi_layer_kv_transfer_kernel_v2(
     const int64_t dsaHiddenDims = 0);
 
 void multi_layer_kv_transfer_multi_plane_kernel_v2(
-    uint32_t blockDim, void *stream, uint8_t *pagedKVCaches,
-    uint8_t *dstCacheTensor, int64_t *perPlaneSlotPtrs,
-    int32_t *perPlaneSlotStarts, int32_t *perPlaneSlotCounts,
-    int32_t *perPlaneHdBytes, int32_t *perPlaneBlockSizes,
-    int32_t *perPlanePageBuffSizes, int32_t *perPlaneLmcRowOffset,
-    int32_t numPlanes, int32_t numLayers, int64_t lmcChunkLastDimBytes,
-    int32_t numTokensLmcChunk, int64_t perLoopBuffer, int32_t maxTokensPerLoop,
-    bool page2L);
+    const MultiPlaneKernelLaunch &launch);
 
 void single_layer_kv_transfer_kernel_v2(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
@@ -131,13 +125,16 @@ void reshape_and_cache_back_flash(torch::Tensor &key_value,
                                   torch::Tensor &slot_mapping,
                                   const int layer_idx);
 
-// Per-plane slot_mapping_ptrs must point at dense mappings (no -1); see .cpp.
+// Per-plane slot_maps are dense (no -1). Prefixes are NPU int32; kernel
+// computes dense start/count from g_start/g_end and compress_ratios.
 void multi_layer_kv_transfer_multi_plane(
     torch::Tensor &key_value, const torch::Tensor &key_value_ptrs,
-    const torch::Tensor &slot_mapping_ptrs,
-    const torch::Tensor &slot_mapping_starts,
-    const torch::Tensor &slot_mapping_counts,
-    const torch::Tensor &page_buffer_sizes, const torch::Tensor &block_sizes,
-    const torch::Tensor &hidden_dim_bytes, const int64_t max_hidden_dim_bytes,
-    const torch::Device &paged_memory_device, const bool direction,
-    const int num_planes, const torch::Tensor &lmc_row_offsets);
+    const std::vector<torch::Tensor> &slot_maps,
+    const std::vector<torch::Tensor> &prefixes,
+    const std::vector<int64_t> &hidden_dim_bytes,
+    const std::vector<int64_t> &block_sizes,
+    const std::vector<int64_t> &page_buffer_sizes,
+    const std::vector<int64_t> &lmc_row_offsets,
+    const std::vector<int64_t> &compress_ratios, const int32_t g_start,
+    const int32_t g_end, const int64_t max_hidden_dim_bytes,
+    const torch::Device &paged_memory_device, const bool direction);

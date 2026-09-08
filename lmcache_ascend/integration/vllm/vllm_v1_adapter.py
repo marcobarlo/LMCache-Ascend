@@ -215,6 +215,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
 
             slot_mappings_npu: list[torch.Tensor] = []
             filtered_slot_mappings_npu: tuple[torch.Tensor, ...] | None = None
+            prefixes_npu: tuple[torch.Tensor, ...] | None = None
             with torch.npu.stream(gpu_connector.load_stream):
                 for sm_cpu in slot_mappings_cpu:
                     slot_mappings_npu.append(
@@ -225,6 +226,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                     filtered_slot_mappings_npu = tuple(
                         sm_cpu.to(device="npu", dtype=torch.long, non_blocking=True)
                         for sm_cpu in request.filtered_slot_by_group
+                    )
+                if request.slot_valid_prefix_by_group is not None:
+                    prefixes_npu = tuple(
+                        p.to(device="npu", dtype=torch.int32, non_blocking=True)
+                        for p in request.slot_valid_prefix_by_group
                     )
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -249,10 +255,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                 retrieve_kwargs["filtered_slot_mappings_npu"] = (
                     filtered_slot_mappings_npu
                 )
-            if request.slot_valid_prefix_by_group is not None:
-                retrieve_kwargs["slot_valid_prefix_by_group"] = (
-                    request.slot_valid_prefix_by_group
-                )
+            if prefixes_npu is not None:
+                retrieve_kwargs["slot_valid_prefix_by_group"] = prefixes_npu
 
             if self.use_layerwise:
                 if idx == last_idx:
@@ -466,6 +470,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                 # lmcache-ascend start ---------------------
                 slot_mappings_npu: list[torch.Tensor] = []
                 filtered_slot_mappings_npu: tuple[torch.Tensor, ...] | None = None
+                prefixes_npu: tuple[torch.Tensor, ...] | None = None
                 with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
                     for sm_cpu in slot_mappings_cpu:
                         slot_mappings_npu.append(
@@ -476,6 +481,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                         filtered_slot_mappings_npu = tuple(
                             sm_cpu.to(device="npu", dtype=torch.long, non_blocking=True)
                             for sm_cpu in request.filtered_slot_by_group
+                        )
+                    if request.slot_valid_prefix_by_group is not None:
+                        prefixes_npu = tuple(
+                            p.to(device="npu", dtype=torch.int32, non_blocking=True)
+                            for p in request.slot_valid_prefix_by_group
                         )
                 # lmcache-ascend end ---------------------
 
@@ -548,10 +558,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                     store_kwargs["filtered_slot_mappings_npu"] = (
                         filtered_slot_mappings_npu
                     )
-                if request.slot_valid_prefix_by_group is not None:
-                    store_kwargs["slot_valid_prefix_by_group"] = (
-                        request.slot_valid_prefix_by_group
-                    )
+                if prefixes_npu is not None:
+                    store_kwargs["slot_valid_prefix_by_group"] = prefixes_npu
 
                 self.lmcache_engine.store(
                     token_ids,

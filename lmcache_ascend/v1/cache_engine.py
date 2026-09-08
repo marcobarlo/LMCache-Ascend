@@ -543,14 +543,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Consider reducing broadcast_shard_size."
             )
 
-        # Same precompute as batched_to_gpu: sharded _submit_togpu calls
-        # to_gpu per chunk and would otherwise hit pin_memory=True fallback.
-        chunk_starts = [s for s, _e, _m in meta_table]
-        chunk_ends = [e for _s, e, _m in meta_table]
-        self.gpu_connector._ensure_mp_launch_meta_for_batch(
-            chunk_starts, chunk_ends, kwargs, stream=load_stream
-        )
-
         pending: List[Tuple[List[MemoryObj], torch.npu.Event]] = []
 
         prev_ctx = None

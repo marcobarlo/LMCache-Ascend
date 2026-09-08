@@ -35,7 +35,7 @@ def _filtered_slot_invoke_kwargs(
     dev = slot_mappings[0].device
     return {
         "filtered_slot_mappings_npu": tuple(f.to(dev) for f in filtered),
-        "slot_valid_prefix_by_group": prefixes,
+        "slot_valid_prefix_by_group": tuple(p.to(dev) for p in prefixes),
     }
 
 
@@ -261,12 +261,10 @@ def multi_plane_round_trip_via_connector(
             mem_tensor=lmc_chunk,
             group_ptrs=ptrs_store,
             group_params=g_params,
-            slot_mappings_by_group=slot_mappings,
             compress_ratios=compress_ratios,
             g_start=0,
             g_end=chunk,
             is_store=True,
-            npu_group_idx=gi,
             **slot_invoke,
         )
         torch.npu.synchronize()
@@ -275,12 +273,10 @@ def multi_plane_round_trip_via_connector(
             mem_tensor=lmc_chunk,
             group_ptrs=ptrs_load,
             group_params=g_params,
-            slot_mappings_by_group=slot_mappings,
             compress_ratios=compress_ratios,
             g_start=0,
             g_end=chunk,
             is_store=False,
-            npu_group_idx=gi,
             **slot_invoke,
         )
         torch.npu.synchronize()
@@ -374,12 +370,10 @@ def separate_kv_round_trip_via_connector(
             mem_tensor=lmc_tensor,
             group_ptrs=ptrs_store,
             group_params=g_params,
-            slot_mappings_by_group=slot_mappings,
             compress_ratios=compress_ratios,
             g_start=0,
             g_end=chunk,
             is_store=True,
-            npu_group_idx=gi,
             **slot_invoke,
         )
         torch.npu.synchronize()
@@ -388,12 +382,10 @@ def separate_kv_round_trip_via_connector(
             mem_tensor=lmc_tensor,
             group_ptrs=ptrs_load,
             group_params=g_params,
-            slot_mappings_by_group=slot_mappings,
             compress_ratios=compress_ratios,
             g_start=0,
             g_end=chunk,
             is_store=False,
-            npu_group_idx=gi,
             **slot_invoke,
         )
         torch.npu.synchronize()

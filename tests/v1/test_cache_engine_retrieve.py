@@ -4,7 +4,7 @@
 # Standard
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 # Third Party
 import torch
@@ -27,20 +27,11 @@ class _RetrieveStats:
         return 0.001
 
 
-class _StreamCM:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
 def _make_retrieve_engine(*, save_only_first_rank: bool, chunks) -> AscendLMCacheEngine:
     engine = object.__new__(AscendLMCacheEngine)
     stats = _RetrieveStats()
     engine.gpu_connector = SimpleNamespace(
         batched_to_gpu=Mock(),
-        _ensure_mp_launch_meta_for_batch=Mock(),
         to_gpu=Mock(),
     )
     engine.is_healthy = lambda: True
@@ -104,60 +95,3 @@ def test_retrieve_save_only_first_rank_uses_sharded_pipeline():
 
     engine.gpu_connector.batched_to_gpu.assert_not_called()
     engine._pipelined_sharded_broadcast_and_load.assert_called_once()
-
-
-def test_sharded_pipeline_precomputes_mp_launch_meta_before_togpu():
-    """_pipeline_broadcast_and_load must ensure launch meta before to_gpu."""
-    engine = object.__new__(AscendLMCacheEngine)
-    call_order: list[str] = []
-
-    def ensure(starts, ends, kwargs, *, stream):
-        call_order.append("ensure")
-        kwargs["mp_launch_meta"] = {"ok": True}
-        assert list(starts) == [0, 256]
-        assert list(ends) == [256, 512]
-
-    def submit_togpu(_ctx, _load_stream, _pending, **kwargs):
-        call_order.append("togpu")
-        assert kwargs.get("mp_launch_meta") == {"ok": True}
-
-    mem_obj = SimpleNamespace(ref_count_down=Mock())
-    engine.gpu_connector = SimpleNamespace(_ensure_mp_launch_meta_for_batch=ensure)
-    engine.metadata = SimpleNamespace(
-        worker_id=0, first_rank=0, is_first_rank=lambda: True
-    )
-    engine._ensure_merged_pool = Mock(return_value=True)
-    engine._merged_pool = [
-        torch.empty(8, dtype=torch.uint8),
-        torch.empty(8, dtype=torch.uint8),
-    ]
-    engine._pool_scatter_ev = [Mock(), Mock()]
-    engine.broadcast_stream = object()
-    engine.broadcast_fn = Mock()
-    engine._submit_togpu = submit_togpu
-    engine._fill_shard_sender = Mock(return_value=([mem_obj], [0], [256]))
-
-    plan = {
-        "meta": [(0, 256, {}), (256, 512, {})],
-        "shard_plan": [0],
-        "shard_layouts": [[(0, 0, 8)]],
-        "max_shard_bytes": 8,
-    }
-    load_stream = SimpleNamespace(synchronize=Mock(), wait_event=Mock())
-    fake_npu = SimpleNamespace(
-        stream=lambda *_a, **_k: _StreamCM(),
-        Event=lambda: SimpleNamespace(record=Mock()),
-    )
-
-    with patch.object(torch, "npu", fake_npu, create=True):
-        engine._pipeline_broadcast_and_load(
-            plan,
-            load_stream,
-            reordered_chunks=[(object(), mem_obj, 0, 256)],
-            slot_mapping=object(),
-        )
-
-    assert call_order[0] == "ensure"
-    assert "togpu" in call_order
-    assert call_order.index("ensure") < call_order.index("togpu")
-    load_stream.synchronize.assert_called()

@@ -29,7 +29,6 @@ from lmcache_ascend.integration.vllm.multi_group_vllm_adapter import (
 from lmcache_ascend.integration.vllm.multi_spec_flatten import build_flat_kv_caches
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemNPUConnectorV2,
-    build_mp_launch_meta,
 )
 from lmcache_ascend.v1.slot_mapping_utils import build_filtered_slot_mappings
 import lmcache_ascend  # noqa: F401
@@ -232,26 +231,16 @@ def make_slot_transfer_kwargs(
     connector: VLLMPagedMemNPUConnectorV2 | None = None,
     chunk_ranges: list[tuple[int, int]] | None = None,
 ) -> dict:
-    """Build filtered NPU mappings + CPU prefix kwargs for multi-group transfer."""
-    ratios = compress_ratios or DS4_COMPRESS_RATIOS[: len(slot_mappings_npu)]
+    """Build filtered NPU mappings + prefix kwargs for multi-group transfer."""
     cpu_mappings = tuple(sm.cpu() for sm in slot_mappings_npu)
     filtered_cpu, prefixes = build_filtered_slot_mappings(cpu_mappings)
     dev = slot_mappings_npu[0].device
     filtered_npu = tuple(f.to(dev) for f in filtered_cpu)
-    kwargs: dict = {
+    prefixes_npu = tuple(p.to(dev) for p in prefixes)
+    return {
         "filtered_slot_mappings_npu": filtered_npu,
-        "slot_valid_prefix_by_group": prefixes,
+        "slot_valid_prefix_by_group": prefixes_npu,
     }
-    if connector is not None and chunk_ranges:
-        kwargs["mp_launch_meta"] = build_mp_launch_meta(
-            connector,
-            chunk_ranges=chunk_ranges,
-            slot_mappings_by_group=cpu_mappings,
-            prefixes_by_group=prefixes,
-            filtered_slot_mappings_npu=filtered_npu,
-            compress_ratios=ratios,
-        )
-    return kwargs
 
 
 def make_production_slot_mappings(
@@ -304,6 +293,8 @@ def build_connector_and_metadata(
         "scheduler_group_by_flat_layer": sched_by_layer,
         "primary_kv_group_idx": 1,
         "bundle_multi_spec": bundled,
+        "block_sizes_by_group": DS4_BLOCK_SIZES_BY_GROUP,
+        "compress_ratios_by_group": DS4_COMPRESS_RATIOS,
     }
     connector = build_connector_via_from_metadata(
         num_model_layers,
@@ -335,6 +326,7 @@ def build_bundled_ds4_connector(
         "flat_layer_names": list(flat.keys()),
         "bundle_multi_spec": True,
         "primary_kv_group_idx": 1,
+        "compress_ratios_by_group": DS4_COMPRESS_RATIOS,
     }
     connector = build_connector_via_from_metadata(
         DS4_NUM_MODEL_LAYERS, layout_hints=layout_hints

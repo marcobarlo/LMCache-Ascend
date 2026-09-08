@@ -3,6 +3,8 @@
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <acl/acl.h>
+#include <algorithm>
 #include <pybind11/pybind11.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
@@ -453,48 +455,36 @@ void reshape_and_cache_back_flash(
   return;
 };
 
-// Multi-plane KV transfer: per-plane slot pointers must reference dense
-// mappings (no -1). Starts/counts index the chunk slice within each plane's
-// mapping.
+// Multi-plane KV transfer: per-plane slot maps are dense (no -1). The kernel
+// computes dense start/count from NPU prefixes and g_start/g_end.
 void multi_layer_kv_transfer_multi_plane(
     torch::Tensor &key_value, const torch::Tensor &key_value_ptrs,
-    const torch::Tensor &slot_mapping_ptrs,
-    const torch::Tensor &slot_mapping_starts,
-    const torch::Tensor &slot_mapping_counts,
-    const torch::Tensor &page_buffer_sizes, const torch::Tensor &block_sizes,
-    const torch::Tensor &hidden_dim_bytes, const int64_t max_hidden_dim_bytes,
-    const torch::Device &paged_memory_device, const bool direction,
-    const int num_planes, const torch::Tensor &lmc_row_offsets) {
-  TORCH_CHECK(num_planes > 0, "num_planes must be positive");
-  TORCH_CHECK(num_planes <= 32, "num_planes cannot exceed 32 (kMaxPlanes)");
-  TORCH_CHECK(slot_mapping_ptrs.dim() == 1 &&
-                  slot_mapping_ptrs.size(0) == num_planes,
-              "slot_mapping_ptrs length mismatch");
-  TORCH_CHECK(slot_mapping_starts.dim() == 1 &&
-                  slot_mapping_starts.size(0) == num_planes,
-              "slot_mapping_starts length mismatch");
-  TORCH_CHECK(slot_mapping_counts.dim() == 1 &&
-                  slot_mapping_counts.size(0) == num_planes,
-              "slot_mapping_counts length mismatch");
-  TORCH_CHECK(page_buffer_sizes.dim() == 1 &&
-                  page_buffer_sizes.size(0) == num_planes,
-              "page_buffer_sizes length mismatch");
-  TORCH_CHECK(block_sizes.dim() == 1 && block_sizes.size(0) == num_planes,
-              "block_sizes length mismatch");
-  TORCH_CHECK(hidden_dim_bytes.dim() == 1 &&
-                  hidden_dim_bytes.size(0) == num_planes,
+    const std::vector<torch::Tensor> &slot_maps,
+    const std::vector<torch::Tensor> &prefixes,
+    const std::vector<int64_t> &hidden_dim_bytes,
+    const std::vector<int64_t> &block_sizes,
+    const std::vector<int64_t> &page_buffer_sizes,
+    const std::vector<int64_t> &lmc_row_offsets,
+    const std::vector<int64_t> &compress_ratios, const int32_t g_start,
+    const int32_t g_end, const int64_t max_hidden_dim_bytes,
+    const torch::Device &paged_memory_device, const bool direction) {
+  const int num_planes = static_cast<int>(slot_maps.size());
+  TORCH_CHECK(num_planes == 1 || num_planes == 2 || num_planes == 4 ||
+                  num_planes == 8,
+              "num_planes must be 1, 2, 4, or 8, got ", num_planes);
+  TORCH_CHECK(prefixes.size() == static_cast<size_t>(num_planes),
+              "prefixes length mismatch");
+  TORCH_CHECK(hidden_dim_bytes.size() == static_cast<size_t>(num_planes),
               "hidden_dim_bytes length mismatch");
-  TORCH_CHECK(slot_mapping_ptrs.scalar_type() == torch::kInt64,
-              "slot_mapping_ptrs must be int64");
-  TORCH_CHECK(slot_mapping_starts.scalar_type() == torch::kInt32,
-              "slot_mapping_starts must be int32");
-  TORCH_CHECK(slot_mapping_counts.scalar_type() == torch::kInt32,
-              "slot_mapping_counts must be int32");
-  TORCH_CHECK(lmc_row_offsets.dim() == 1 &&
-                  lmc_row_offsets.size(0) == num_planes,
+  TORCH_CHECK(block_sizes.size() == static_cast<size_t>(num_planes),
+              "block_sizes length mismatch");
+  TORCH_CHECK(page_buffer_sizes.size() == static_cast<size_t>(num_planes),
+              "page_buffer_sizes length mismatch");
+  TORCH_CHECK(lmc_row_offsets.size() == static_cast<size_t>(num_planes),
               "lmc_row_offsets length mismatch");
-  TORCH_CHECK(lmc_row_offsets.scalar_type() == torch::kInt32,
-              "lmc_row_offsets must be int32");
+  TORCH_CHECK(compress_ratios.size() == static_cast<size_t>(num_planes),
+              "compress_ratios length mismatch");
+  TORCH_CHECK(g_end >= g_start, "g_end must be >= g_start");
 
   const int64_t lmc_chunk_last_dim_bytes =
       key_value.size(-1) * key_value.element_size();
@@ -511,32 +501,47 @@ void multi_layer_kv_transfer_multi_plane(
   const int32_t num_tokens_lmc_chunk =
       key_value.dim() >= 3 ? static_cast<int32_t>(key_value.size(2)) : 1;
 
-  uint8_t *key_value_ptr = get_kernel_ptr<uint8_t, torch::Tensor>(key_value);
-  uint8_t *paged_ptrs =
+  kvcache_ops::MultiPlaneKernelLaunch launch{};
+  launch.pagedKVCaches =
       get_kernel_ptr<uint8_t, const torch::Tensor>(key_value_ptrs);
-  int64_t *slot_ptrs =
-      get_kernel_ptr<int64_t, const torch::Tensor>(slot_mapping_ptrs);
-  int32_t *slot_starts_ptr =
-      get_kernel_ptr<int32_t, const torch::Tensor>(slot_mapping_starts);
-  int32_t *slot_counts_ptr =
-      get_kernel_ptr<int32_t, const torch::Tensor>(slot_mapping_counts);
-  int32_t *hd_ptr =
-      get_kernel_ptr<int32_t, const torch::Tensor>(hidden_dim_bytes);
-  int32_t *bs_ptr = get_kernel_ptr<int32_t, const torch::Tensor>(block_sizes);
-  int32_t *pbs_ptr =
-      get_kernel_ptr<int32_t, const torch::Tensor>(page_buffer_sizes);
-  int32_t *lmc_row_off_ptr =
-      get_kernel_ptr<int32_t, const torch::Tensor>(lmc_row_offsets);
+  launch.dstCacheTensor = get_kernel_ptr<uint8_t, torch::Tensor>(key_value);
+  launch.numPlanes = num_planes;
+  launch.gStart = g_start;
+  launch.gEnd = g_end;
+  launch.numLayers = num_layers;
+  launch.lmcChunkLastDimBytes = lmc_chunk_last_dim_bytes;
+  launch.numTokensLmcChunk = num_tokens_lmc_chunk;
+  launch.page2L = direction;
+
+  for (int i = 0; i < num_planes; ++i) {
+    TORCH_CHECK(prefixes[i].scalar_type() == torch::kInt32,
+                "prefixes must be int32");
+    TORCH_CHECK(prefixes[i].numel() >= 1, "prefixes must be non-empty");
+    TORCH_CHECK(slot_maps[i].scalar_type() == torch::kLong ||
+                    slot_maps[i].scalar_type() == torch::kInt64,
+                "slot_maps must be int64");
+    launch.slotMaps[i] =
+        get_kernel_ptr<uint8_t, const torch::Tensor>(slot_maps[i]);
+    launch.prefixes[i] =
+        get_kernel_ptr<int32_t, const torch::Tensor>(prefixes[i]);
+    launch.hd[i] = static_cast<int32_t>(hidden_dim_bytes[i]);
+    launch.bs[i] = static_cast<int32_t>(block_sizes[i]);
+    launch.pbs[i] = static_cast<int32_t>(page_buffer_sizes[i]);
+    launch.lmcRowOff[i] = static_cast<int32_t>(lmc_row_offsets[i]);
+    const int32_t ratio = static_cast<int32_t>(compress_ratios[i]);
+    TORCH_CHECK(ratio >= 1, "compress_ratios must be >= 1");
+    launch.ratio[i] = ratio;
+  }
 
   const c10::OptionalDeviceGuard device_guard(paged_memory_device);
-  void *stream = c10_npu::getCurrentNPUStream().stream();
+  launch.stream = c10_npu::getCurrentNPUStream().stream();
 
   const char *socName = aclrtGetSocName();
   auto ascendcPlatform =
       platform_ascendc::PlatformAscendCManager::GetInstance(socName);
   uint64_t ubSize = 0;
   ascendcPlatform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-  const uint32_t aiv_num = static_cast<uint32_t>(std::min(num_layers, 4));
+  launch.blockDim = static_cast<uint32_t>(std::min(num_layers, 4));
   constexpr int32_t numBuffsOnDev = 2;
   const int64_t baseBuffSize = numBuffsOnDev * max_hidden_dim_bytes;
   TORCH_CHECK(ubSize >= static_cast<uint64_t>(baseBuffSize),
@@ -545,16 +550,13 @@ void multi_layer_kv_transfer_multi_plane(
   maxTokensPerLoop = std::min(maxTokensPerLoop, num_tokens_lmc_chunk);
   const int64_t totalPerLoopBuffer =
       static_cast<int64_t>(maxTokensPerLoop) * baseBuffSize;
-  const int64_t singlePerLoopBuffer = totalPerLoopBuffer / numBuffsOnDev;
+  launch.maxTokensPerLoop = maxTokensPerLoop;
+  launch.perLoopBuffer = totalPerLoopBuffer / numBuffsOnDev;
 
   at_npu::native::OpCommand cmd;
   cmd.Name("multi_layer_kv_transfer_multi_plane_kernel_v2");
-  cmd.SetCustomHandler([=]() -> int {
-    kvcache_ops::multi_layer_kv_transfer_multi_plane_kernel_v2(
-        aiv_num, stream, paged_ptrs, key_value_ptr, slot_ptrs, slot_starts_ptr,
-        slot_counts_ptr, hd_ptr, bs_ptr, pbs_ptr, lmc_row_off_ptr, num_planes,
-        num_layers, lmc_chunk_last_dim_bytes, num_tokens_lmc_chunk,
-        singlePerLoopBuffer, maxTokensPerLoop, direction);
+  cmd.SetCustomHandler([launch]() -> int {
+    kvcache_ops::multi_layer_kv_transfer_multi_plane_kernel_v2(launch);
     return 0;
   });
   cmd.Run();

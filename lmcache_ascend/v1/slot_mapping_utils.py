@@ -75,64 +75,6 @@ def dense_bounds_from_prefix(
     return dense_start, dense_count
 
 
-def compute_mp_plane_launch_ptrs(
-    sched_groups: Sequence[int],
-    filtered_slot_mappings_npu: Sequence[torch.Tensor],
-) -> torch.Tensor:
-    """Per-plane NPU pointers into dense filtered slot-mapping tensors.
-
-    One int64 pointer per entry in ``sched_groups``, indexing
-    ``filtered_slot_mappings_npu[g]``. Passed to the multi-plane KV transfer
-    kernel so each plane reads its own compacted slot list.
-    """
-    return torch.tensor(
-        [int(filtered_slot_mappings_npu[g].data_ptr()) for g in sched_groups],
-        dtype=torch.int64,
-        pin_memory=True,
-    )
-
-
-def compute_mp_plane_launch_row(
-    g_start: int,
-    g_end: int,
-    sched_groups: Sequence[int],
-    *,
-    slot_mappings_by_group: Sequence[torch.Tensor],
-    prefixes_by_group: Sequence[torch.Tensor],
-    compress_ratios: Sequence[int],
-) -> tuple[torch.Tensor, torch.Tensor, bool]:
-    """Per-plane dense offsets for one token chunk in a multi-plane transfer.
-
-    For each plane's scheduler group, maps a logical range to physical slot range
-    and produces pinned CPU tensors ``starts`` and ``counts`` that are used by
-    transfer kernel to index into each plane's filtered slot-mapping buffer.
-
-    Returns:
-        ``starts``, ``counts``, and ``has_work`` — the last is ``True`` when at
-        least one plane has a non-zero dense slot count for this chunk.
-    """
-    starts: list[int] = []
-    counts: list[int] = []
-    has_work = False
-    for sched_g in sched_groups:
-        sm_len = int(slot_mappings_by_group[sched_g].shape[0])
-        s0, s1 = multi_plane_slot_slice_bounds(
-            g_start, g_end, sched_g, compress_ratios, sm_len
-        )
-        dense_start, dense_count = dense_bounds_from_prefix(
-            prefixes_by_group[sched_g], s0, s1
-        )
-        starts.append(dense_start)
-        counts.append(dense_count)
-        if dense_count > 0:
-            has_work = True
-    return (
-        torch.tensor(starts, dtype=torch.int32, pin_memory=True),
-        torch.tensor(counts, dtype=torch.int32, pin_memory=True),
-        has_work,
-    )
-
-
 def build_filtered_slot_mappings(
     slot_mappings_by_group: tuple[torch.Tensor, ...] | list[torch.Tensor],
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:

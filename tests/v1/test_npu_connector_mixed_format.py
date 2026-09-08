@@ -12,10 +12,8 @@ import torch
 from lmcache_ascend.v1.kv_format import KVCacheFormat
 from lmcache_ascend.v1.npu_connector.npu_connectors import (
     VLLMPagedMemNPUConnectorV2,
-    _build_multi_plane_group_params,
     _derive_group_params,
     _is_kernel_compatible_entry,
-    _materialize_mp_device_params,
 )
 
 # Local
@@ -398,26 +396,10 @@ def test_initialize_pointers_skips_detect_on_warm_path() -> None:
     assert detect_calls == after_first
 
 
-def test_materialize_mp_device_params_idempotent() -> None:
-    """Repeated materialize must reuse the same mp_device tensors."""
-    params = _build_multi_plane_group_params(
-        kv_format=KVCacheFormat.DSA_C8_KV,
-        plane_hidden_bytes=(512, 64, 128, 1),
-        block_size=128,
-        page_buffer_size=1280,
-    )
-    device = torch.device("cpu")
-    _materialize_mp_device_params(params, device)
-    assert params.get("mp_device") is not None
-    pbs_first = params["mp_device"]["pbs"]
-
-    _materialize_mp_device_params(params, device)
-    assert params["mp_device"]["pbs"] is pbs_first
-
-
-def test_mp_device_materialized_at_pointer_init() -> None:
-    """mp_device tensors are created at per-group
-    pointer init, not on first transfer."""
+def test_invoke_passes_slot_tensors_not_launch_rows() -> None:
+    """Kernel is called with NPU slot/prefix tensors and per-plane scalar lists."""
+    if not npu_available():
+        pytest.skip("NPU not available")
     connector, metadata, kv_caches, dev = make_ds4_setup()
     num_tokens = 64
     mem_obj = allocate_multi_group_memory_obj(metadata, num_tokens)
@@ -429,15 +411,13 @@ def test_mp_device_materialized_at_pointer_init() -> None:
     ):
         connector._initialize_pointers(kv_caches)
 
-    materialized = [
-        p for p in connector.per_group_params if p.get("mp_device") is not None
-    ]
-    assert materialized
+    assert connector.per_group_params is not None
+    assert all(p.get("mp_device") is None for p in connector.per_group_params)
 
     with patch(
         "lmcache_ascend.v1.npu_connector.npu_connectors.lmc_ops."
         "multi_layer_kv_transfer_multi_plane"
-    ):
+    ) as mock_mp:
         connector._multi_group_kv_transfer(
             mem_obj,
             0,
@@ -445,11 +425,17 @@ def test_mp_device_materialized_at_pointer_init() -> None:
             slot_mappings,
             is_store=True,
             stream=connector.store_stream,
-            **make_slot_transfer_kwargs(
-                slot_mappings,
-                connector=connector,
-                chunk_ranges=[(0, num_tokens)],
-            ),
+            **make_slot_transfer_kwargs(slot_mappings),
         )
 
-    assert all(p.get("mp_device") is not None for p in materialized)
+    assert mock_mp.call_count >= 1
+    args = mock_mp.call_args.args
+    # mem, group_ptrs, slot_maps, prefixes, hd, bs, pbs, lmc_off, ratios, ...
+    slot_maps = args[2]
+    prefixes = args[3]
+    assert isinstance(slot_maps, list)
+    assert isinstance(prefixes, list)
+    assert all(t.device.type != "cpu" for t in slot_maps)
+    assert all(t.device.type != "cpu" for t in prefixes)
+    assert isinstance(args[4], list)
+    assert "pin_memory" not in mock_mp.call_args.kwargs
