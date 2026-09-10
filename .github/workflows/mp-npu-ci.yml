@@ -1,0 +1,133 @@
+name: MP NPU tests (910B3)
+
+# Self-hosted on 910B3-03. Does not use the Huawei-lab 910b4/910c jobs.
+on:
+  push:
+    branches: [MP_dsv4_3_split]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  statuses: write
+
+concurrency:
+  group: mp-npu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-910b3:
+    name: Unit tests on 910B3
+    runs-on: [self-hosted, Linux, ARM64, 910b3]
+    timeout-minutes: 45
+
+    container:
+      image: quay.io/ascend/vllm-ascend:v0.23.0
+      env:
+        SOC_VERSION: Ascend910B3
+        PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple
+        LMCACHE_TRACK_USAGE: "false"
+        NO_GPU_EXT: "1"
+        BUILD_WITH_ASCEND: "1"
+        ENABLE_CXX11_ABI: "1"
+        ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.1.0
+        LMCACHE_LOG_LEVEL: INFO
+        PYTHONHASHSEED: "0"
+      options: >-
+        --device /dev/davinci0
+        --device /dev/davinci1
+        --device /dev/davinci_manager
+        --device /dev/devmm_svm
+        --device /dev/hisi_hdc
+        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+        -v /usr/local/dcmi:/usr/local/dcmi:ro
+        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+        --user root
+        --cap-add=SYS_PTRACE
+
+    steps:
+      - name: Fail if NPUs are occupied
+        run: |
+          npu-smi info
+          python3 -c '
+          import re, subprocess, sys
+          out = subprocess.check_output(["npu-smi", "info"], text=True)
+          hbms = []
+          for line in out.splitlines():
+              m = re.search(r"(\d+)\s*/\s*(\d+)", line)
+              if m and int(m.group(2)) > 1024:
+                  hbms.append((int(m.group(1)), int(m.group(2))))
+          print("parsed HBM (used, total):", hbms[:8])
+          if any(u > 8 * 1024 for u, _ in hbms[:2]):
+              sys.exit("NPUs 0/1 have HBM in use %s. Stop serving on this host, then re-run." % (hbms[:2],))
+          '
+
+      - name: Checkout LMCache-Ascend
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Checkout LMCache MP branch
+        uses: actions/checkout@v4
+        with:
+          repository: marcobarlo/LMCache
+          ref: MP_dsv4_3_split
+          path: _lmcache_mp
+          fetch-depth: 0
+
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install LMCache-MP and LMCache-Ascend-MP
+        run: |
+          set -euo pipefail
+          if [[ -d /usr/local/Ascend/cann-9.1.0/aarch64-linux/pkg_inc ]]; then
+            export CPLUS_INCLUDE_PATH="/usr/local/Ascend/cann-9.1.0/aarch64-linux/pkg_inc:${CPLUS_INCLUDE_PATH:-}"
+            export C_INCLUDE_PATH="/usr/local/Ascend/cann-9.1.0/aarch64-linux/pkg_inc:${C_INCLUDE_PATH:-}"
+          fi
+          export BUILD_WITH_ASCEND=1
+          export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-9.1.0}"
+          export ENABLE_CXX11_ABI=1
+          export NO_GPU_EXT=1
+          unset NO_NATIVE_EXT NO_CUDA_EXT
+          rm -f _lmcache_mp/lmcache/lmcache_native*.so
+          rm -rf _lmcache_mp/build build
+          pip install -v --no-build-isolation -e _lmcache_mp
+          pip install -v --no-build-isolation -e .
+          pip install pytest pytest-benchmark pytest-cov
+          python3 -c "import lmcache, lmcache_ascend; from lmcache.lmcache_native import EngineKVFormat; assert hasattr(EngineKVFormat, 'NL_X_TWO_X_NB_BS_HS')"
+
+      - name: Pytest tests/v1
+        id: test-step
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib"
+          set +e
+          python3 -u -m pytest -v tests/v1 \
+            --tb=short \
+            --junit-xml=test-results.xml \
+            --log-cli-level=CRITICAL \
+            --log-file=debug_logs.txt \
+            --log-file-level=INFO
+          EXIT_CODE=$?
+          set -e
+          echo "pytest exit=$EXIT_CODE"
+          exit "$EXIT_CODE"
+
+      - name: Publish JUnit summary
+        if: always()
+        uses: ./.github/actions/junit-summary
+        with:
+          junit-path: test-results.xml
+          ignore-missing: "true"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp-npu-910b3-logs
+          path: |
+            debug_logs.txt
+            test-results.xml
+          if-no-files-found: ignore
