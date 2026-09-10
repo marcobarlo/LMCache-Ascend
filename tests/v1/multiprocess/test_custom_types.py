@@ -25,11 +25,10 @@ from lmcache_tests.v1.multiprocess.test_custom_types import (  # noqa: F401, E40
     test_ipc_cache_engine_key_serialization,
 )
 
-# First Party
-# LMC-A: upstream moved wrapper dispatch to DeviceSpec.ipc_wrapper_cls
-# (lmcache #4077-era refactor); the NPU wrapper now lives only in the plugin,
-# so import it directly instead of the vanished custom_types.CudaIPCWrapper.
-from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper  # noqa: E402
+# LMC-A: upstream moved wrapper dispatch to DeviceSpec.ipc_wrapper_cls and
+# the plane-aggregating NPU wrapper itself upstream (npu/ipc_wrapper.py); the
+# plugin no longer ships its own wrapper class.
+from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 
 
 def _worker_process_deserialize_and_reconstruct(
@@ -37,26 +36,29 @@ def _worker_process_deserialize_and_reconstruct(
 ):
     """
     Worker function that runs in a separate process.
-    Deserializes AscendIPCWrapper list and reconstructs tensors.
+    Deserializes NpuIPCWrapper list and reconstructs layers (tensor or
+    plane tuples), computing a checksum over every reconstructed plane.
     """
     try:
         # Decode the list of wrappers
         torch.npu.init()
-        decoder = get_customized_decoder(type=list[AscendIPCWrapper])
+        decoder = get_customized_decoder(type=list[NpuIPCWrapper])
         decoded_wrappers = decoder.decode(encoded_data)
 
         # Convert each wrapper back to tensor and compute checksum
         checksums = []
         shapes = []
         for wrapper in decoded_wrappers:
-            tensor = wrapper.to_tensor()
-            # Compute checksum as sum of all elements
-            checksum = float(tensor.sum().cpu().item())
+            value = wrapper.to_tensor()
+            planes = (value,) if isinstance(value, torch.Tensor) else value
+            # Checksum over every plane of the layer (in plane order).
+            checksum = float(sum(p.sum().cpu().item() for p in planes))
             checksums.append(checksum)
-            shapes.append(list(tensor.shape))
+            shapes.append([list(p.shape) for p in planes])
 
-            # Do add 1 on the tensor to ensure it's writable
-            tensor.add_(1)
+            # Do add 1 on every plane to ensure they are writable
+            for plane in planes:
+                plane.add_(1)
 
         result_queue.put(("success", checksums, shapes))
     except Exception as e:
@@ -69,37 +71,62 @@ def _worker_process_deserialize_and_reconstruct(
 )
 def test_cudaipc_wrapper_multiprocess_serialization():
     """
-    Test AscendIPCWrapper serialization across processes using spawn method.
-    This verifies that CUDA IPC handles can be properly shared between processes.
+    Test NpuIPCWrapper serialization across processes using spawn method.
+    This verifies that NPU IPC handles can be properly shared between processes,
+    for single-tensor layers as well as per-layer plane tuples.
     """
     # Set multiprocessing start method to spawn
     ctx = mp.get_context("spawn")
 
-    # Create test tensors and wrappers in the main process
-    num_tensors = 3
+    # Create test tensors and wrappers in the main process. Registration
+    # mirrors what vLLM-Ascend hands wrap_kv_caches: one value per layer,
+    # either a bare tensor (layer 0) or a plane tuple (layers 1 and 2).
+    num_layers = 3
     tensors = []
     test_data = []
     wrappers = []
 
-    for i in range(num_tensors):
-        # Create a tensor with known values
-        tensor = torch.full(
-            (2, 3),
-            fill_value=float(i + 1),
-            dtype=torch.float32,
-            device="npu",  # LMC-A: run on npu, not cuda
-        )
-        tensors.append(tensor)
-        wrapper = AscendIPCWrapper(tensor)
-        wrappers.append(wrapper)
+    for i in range(num_layers):
+        if i == 0:
+            # A bare single-tensor layer.
+            tensor = torch.full(
+                (2, 3),
+                fill_value=float(i + 1),
+                dtype=torch.float32,
+                device="npu",  # LMC-A: run on npu, not cuda
+            )
+            tensors.append(tensor)
+            wrapper = NpuIPCWrapper.wrap(tensor)
+            wrappers.append(wrapper)
 
-        # Store expected checksum and shape
-        expected_checksum = float(tensor.sum().cpu().item())
-        expected_shape = list(tensor.shape)
+            expected_checksum = float(tensor.sum().cpu().item())
+            expected_shape = [list(tensor.shape)]
+        else:
+            # A per-layer plane tuple with unequal plane widths (MLA-style).
+            latent = torch.full(
+                (2, 3, 1, 4),
+                fill_value=float(i + 1),
+                dtype=torch.float32,
+                device="npu",
+            )
+            rope = torch.full(
+                (2, 3, 1, 2),
+                fill_value=float(i + 2),
+                dtype=torch.float32,
+                device="npu",
+            )
+            tensors.extend([latent, rope])
+            wrapper = NpuIPCWrapper.wrap((latent, rope))
+            wrappers.append(wrapper)
+
+            expected_checksum = float(
+                latent.sum().cpu().item() + rope.sum().cpu().item()
+            )
+            expected_shape = [list(latent.shape), list(rope.shape)]
         test_data.append((expected_checksum, expected_shape))
 
     # Serialize the wrappers
-    encoder = get_customized_encoder(type=list[AscendIPCWrapper])
+    encoder = get_customized_encoder(type=list[NpuIPCWrapper])
     encoded_data = encoder.encode(wrappers)
 
     # Create a queue for results
@@ -131,32 +158,39 @@ def test_cudaipc_wrapper_multiprocess_serialization():
     status, checksums, shapes = result_queue.get()
 
     assert status == "success", f"Worker process encountered error: {checksums}"
-    assert len(checksums) == num_tensors, "Number of checksums does not match"
-    assert len(shapes) == num_tensors, "Number of shapes does not match"
+    assert len(checksums) == num_layers, "Number of layers does not match"
+    assert len(shapes) == num_layers, "Number of layers does not match"
 
-    # Verify checksums and shapes match
+    # Verify checksums and per-plane shapes match, layer by layer.
     for i, (
-        (expected_checksum, expected_shape),
+        (expected_checksum, expected_shapes),
         actual_checksum,
-        actual_shape,
+        actual_shapes,
     ) in enumerate(zip(test_data, checksums, shapes, strict=False)):
-        assert actual_shape == expected_shape, (
-            f"Tensor {i}: shape mismatch. Expected {expected_shape}, got {actual_shape}"
+        assert actual_shapes == expected_shapes, (
+            f"Layer {i}: plane shape mismatch. Expected {expected_shapes}, "
+            f"got {actual_shapes}"
         )
         assert abs(actual_checksum - expected_checksum) < 1e-5, (
-            f"Tensor {i}: checksum mismatch. Expected {expected_checksum}, "
+            f"Layer {i}: checksum mismatch. Expected {expected_checksum}, "
             f"got {actual_checksum}"
         )
 
-    # Verify that the tensors are being modified in the worker process
-    for i, (tensor, (expected_checksum, _)) in enumerate(
-        zip(tensors, test_data, strict=False)
+    # Verify that the tensors are being modified in the worker process.
+    # After adding 1 to every element of every plane of the layer, the new
+    # checksum should grow by the layer's total element count.
+    layer_tensors: list[list[torch.Tensor]] = []
+    tensor_iter = iter(tensors)
+    for i in range(num_layers):
+        num_planes = len(test_data[i][1])
+        layer_tensors.append([next(tensor_iter) for _ in range(num_planes)])
+    for i, (planes, (expected_checksum, _)) in enumerate(
+        zip(layer_tensors, test_data, strict=False)
     ):
-        # After adding 1 to each element, the new checksum should be:
-        num_elements = tensor.numel()
+        num_elements = sum(p.numel() for p in planes)
         new_expected_checksum = expected_checksum + float(num_elements)
-        actual_checksum = float(tensor.sum().cpu().item())
+        actual_checksum = float(sum(p.sum().cpu().item() for p in planes))
         assert abs(actual_checksum - new_expected_checksum) < 1e-5, (
-            f"Tensor {i}: post-modification checksum mismatch. "
+            f"Layer {i}: post-modification checksum mismatch. "
             f"Expected {new_expected_checksum}, got {actual_checksum}"
         )

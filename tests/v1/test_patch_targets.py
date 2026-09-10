@@ -17,30 +17,30 @@ import pytest
 
 # First Party
 from lmcache_ascend.v1.memory_management import GPUMemoryAllocator__init__
-from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
 from lmcache_ascend.v1.npu_connector.utils import permute_kv_caches_to_contiguous
 import lmcache_ascend
 
 
-def test_npu_ipc_wrapper_registered_on_device_spec():
-    """The KV-cache IPC wrapper must resolve through DeviceSpec.ipc_wrapper_cls.
+def test_npu_ipc_wrapper_bound_upstream_not_patched():
+    """The KV-cache IPC wrapper resolves through the upstream DeviceSpec.
 
-    Upstream dispatches wrapper creation via
-    ``resolve_kv_wrapper_factory(device_type)``; before the 0.5.x sync the
-    plugin rebound the removed ``custom_types.CudaIPCWrapper`` instead, so
-    ``resolve_kv_wrapper_factory("npu")`` raised ``ValueError``.
+    The plane-aggregating ``NpuIPCWrapper`` moved upstream and is bound on
+    ``NpuDeviceSpec.ipc_wrapper_cls`` natively; the plugin no longer patches
+    the binding. Pin that no stale plugin-side override shadows it, so
+    ``resolve_kv_wrapper_factory("npu")`` returns the upstream class.
     """
     # Third Party
     from lmcache.v1.platform import resolve_kv_wrapper_factory
     from lmcache.v1.platform.npu import NpuDeviceSpec
+    from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper
 
-    assert NpuDeviceSpec().ipc_wrapper_cls is AscendIPCWrapper
-    # The wrapper must report the true device type instead of the inherited
-    # CUDA one, so server-side device detection resolves the NPU spec.
-    assert AscendIPCWrapper.device_type == "npu"
+    assert NpuDeviceSpec().ipc_wrapper_cls is NpuIPCWrapper
+    # The wrapper must report the true device type so server-side device
+    # detection resolves the NPU spec.
+    assert NpuIPCWrapper.device_type == "npu"
     # Binding the classmethod gives a bound method whose __self__ is the class
     factory = resolve_kv_wrapper_factory("npu")
-    assert getattr(factory, "__self__", None) is AscendIPCWrapper
+    assert getattr(factory, "__self__", None) is NpuIPCWrapper
 
 
 def test_permute_rebound_only_at_list_call_site():

@@ -749,21 +749,6 @@ def _patch_remote_backend():
     RemoteBackend.batched_get_blocking = new_batched_get_blocking
 
 
-def _patch_multi_process():
-    # Third Party
-    from lmcache.v1.platform.npu import NpuDeviceSpec
-
-    # First Party
-    from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
-
-    # LMC-A: upstream now dispatches KV-cache IPC wrappers through
-    # DeviceSpec.ipc_wrapper_cls (resolve_kv_wrapper_factory) instead of the
-    # removed lmcache.v1.multiprocess.custom_types.CudaIPCWrapper rebind, so
-    # register the Ascend wrapper on the NPU spec; without this the factory
-    # raises ValueError("No KV-cache wrapper factory registered for 'npu'").
-    NpuDeviceSpec.ipc_wrapper_cls = property(lambda self: AscendIPCWrapper)
-
-
 def _patch_mp_transfer_context():
     """Route MP non-GPU gather/scatter through the fused NPU transfer kernel.
 
@@ -1122,7 +1107,6 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_storage_manager()
         _patch_transfer_channel()
         _patch_cacheblend()
-        _patch_multi_process()
         _patch_mp_transfer_context()
         _patch_lookup_client()
         _patch_cache_controller_worker()

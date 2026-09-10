@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """E2E: LMCacheDriven store/retrieve across processes on Ascend NPU.
 
-The worker process owns paged MLA-tuple KV planes, exports them through
-AscendIPCWrapper plus interprocess events; the parent drives the real
-server-side LMCacheDrivenTransferModule (fake storage bus, real cache
-context, real transfers, real events).
+The worker process owns paged MLA-tuple KV planes, exports them through the
+plane-aggregating NpuIPCWrapper (one wrapper per layer) plus interprocess
+events; the parent drives the real server-side LMCacheDrivenTransferModule
+(fake storage bus, real cache context, real transfers, real events).
 """
 
 # Standard
@@ -24,7 +24,7 @@ from tests.bootstrap import prepare_environment
 prepare_environment()
 
 # Third Party
-import lmcache_ascend  # noqa: F401, E402  (registers AscendIPCWrapper)
+import lmcache_ascend  # noqa: F401, E402  (applies plugin patches)
 
 # First Party
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
@@ -36,7 +36,7 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (  # noqa: 
     LMCacheDrivenTransferContext,
     create_transfer_context,
 )
-from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper  # noqa: E402
+from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 from tests.v1.multiprocess.test_custom_types import (  # noqa: E402
     get_customized_decoder,
     get_customized_encoder,
@@ -58,7 +58,7 @@ requires_npu = pytest.mark.skipif(
 def _worker(device_index: int, conn) -> None:
     torch.npu.set_device(device_index)
     device = f"npu:{device_index}"
-    wrappers: list[AscendIPCWrapper] = []
+    wrappers: list[NpuIPCWrapper] = []
     planes: list[torch.Tensor] = []
     for layer in range(NL):
         latent = torch.zeros(NB, BS, 1, W_LATENT, device=device)
@@ -67,7 +67,9 @@ def _worker(device_index: int, conn) -> None:
             latent[block].fill_(float(layer * 1000 + block) % 251.0)
             rope[block].fill_(float((layer * 7 + block) % 13.0))
         planes.extend([latent, rope])
-        wrappers.extend([AscendIPCWrapper(latent), AscendIPCWrapper(rope)])
+        # One plane-aggregating wrapper per layer, exactly what
+        # wrap_kv_caches produces for vLLM-Ascend's tuple registration.
+        wrappers.append(NpuIPCWrapper.wrap((latent, rope)))
     stream = torch.npu.Stream()
     with torch.npu.stream(stream):
         for plane in planes:
@@ -79,7 +81,7 @@ def _worker(device_index: int, conn) -> None:
     producer_a.record(stream)
     producer_b = torch.npu.Event(enable_timing=False, interprocess=True)
     producer_b.record(stream)
-    encoder = get_customized_encoder(type=list[AscendIPCWrapper])
+    encoder = get_customized_encoder(type=list[NpuIPCWrapper])
     conn.send(
         {
             "wrappers": encoder.encode(wrappers),
@@ -212,10 +214,10 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
     process.start()
     try:
         message = parent_conn.recv()
-        decoder = get_customized_decoder(type=list[AscendIPCWrapper])
-        # The flat per-plane wire order (latent, rope per layer); the
-        # planes_per_layer hint regroups it into per-layer tuples upstream,
-        # so discovery classifies the MLA tuple layout.
+        decoder = get_customized_decoder(type=list[NpuIPCWrapper])
+        # One wrapper per layer; to_tensor() yields the (latent, rope)
+        # plane tuple, so discovery classifies the MLA tuple layout from
+        # the in-band structure alone -- no regroup hint involved.
         kv_caches: KVCache = list(decoder.decode(message["wrappers"]))
 
         from lmcache.v1.platform.npu import NpuDeviceSpec
@@ -224,10 +226,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         cache_context = NpuDeviceSpec().create_cache_context(
             kv_caches,
             CHUNK,
-            layout_hints=LayoutHints(
-                kv_layout="NHD",
-                planes_per_layer=[2] * NL,
-            ),
+            layout_hints=LayoutHints(kv_layout="NHD"),
             engine_group_infos=(),
             engine_type=EngineType.VLLM,
         )
