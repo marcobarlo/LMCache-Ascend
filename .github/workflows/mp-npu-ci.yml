@@ -20,6 +20,9 @@ jobs:
     name: Unit tests on 910B3
     runs-on: [self-hosted, Linux, ARM64, 910b3]
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
 
     container:
       image: quay.io/ascend/vllm-ascend:v0.23.0
