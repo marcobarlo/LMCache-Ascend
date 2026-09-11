@@ -810,6 +810,17 @@ def _patch_gpu_connector():
         _manager_mod.CreateGPUConnector = CreateNPUConnector
 
 
+def _patch_logical_block_size():
+    """Expose Ascend physical-page token span as ``spec.logical_block_size``.
+
+    vLLM-Ascend reports ``block_size`` in slots; LMCache core reads an optional
+    ``logical_block_size``. Attach it here so vLLM-Ascend sources stay untouched.
+    """
+    from lmcache_ascend.integration.vllm.logical_block_size import install_overrides
+
+    install_overrides()
+
+
 def _patch_vllm_v1_adapter():
     # Third Party
     from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -1120,6 +1131,7 @@ if not LMCACHE_ASCEND_PATCHED:
 
         _patch_lookup_client_factory()
         _patch_vllm_v1_adapter()
+        _patch_logical_block_size()
 
         _patch_cache_engine()
 
