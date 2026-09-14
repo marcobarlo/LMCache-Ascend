@@ -530,7 +530,7 @@ def _patch_ops():
     _native_block = ascend_c_ops.multi_layer_block_kv_transfer
     _fmt_13 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_BS_NH_CS)
     _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
-    _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_HS)
+    _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
 
     def _paged_arg_to_ptr_tensor(paged, device):
         """NPU cache context returns per-layer tensors; the C++ op wants int64 ptrs."""

@@ -130,7 +130,7 @@ PYBIND11_MODULE(c_ops, m) {
       .value("NL_X_TWO_NB_NH_ONE_BS_HS",
              EngineKVFormat::NL_X_TWO_NB_NH_ONE_BS_HS)
       .value("NL_X_TWO_X_NB_BS_NH_HS", EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS)
-      .value("NL_X_TWO_X_NB_BS_HS", EngineKVFormat::NL_X_TWO_X_NB_BS_HS)
+      .value("NL_X_NP_X_NB_BS_ONE_HS", EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS)
       .export_values();
   m.def("is_cross_layer", [](EngineKVFormat f) { return is_cross_layer(f); },
         py::arg("engine_kv_format"));

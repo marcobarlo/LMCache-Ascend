@@ -50,7 +50,7 @@ struct PackedPlaneSpec {
 PackedPlaneSpec packed_planes(const PageBufferShapeDesc& shape_desc,
                               EngineKVFormat engine_kv_format) {
   PackedPlaneSpec spec;
-  if (engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_HS) {
+  if (engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS) {
     spec.packed = true;
     spec.lmc_row_elems = shape_desc.hs * shape_desc.element_size;
     spec.v_plane_elems = 2;
@@ -77,12 +77,12 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
   const bool separate =
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
   const bool packed =
-      engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_HS;
+      engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
   const bool fused =
       engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS;
   TORCH_CHECK(separate || packed || fused,
               "LMCache-Ascend block-level MP transfer currently supports "
-              "NL_X_TWO_X_NB_BS_NH_HS (16), NL_X_TWO_X_NB_BS_HS (17), and "
+              "NL_X_TWO_X_NB_BS_NH_HS (16), NL_X_NP_X_NB_BS_ONE_HS (17), and "
               "NL_X_NB_BS_NH_CS (13), got ",
               static_cast<int>(engine_kv_format));
   if (separate) {
@@ -189,7 +189,7 @@ struct PackedHostStage {
   size_t nbytes = 0;
 };
 
-// Resolve LMCache object pointers to device VAs. Packed SHM/host objects
+// Resolve LMCache object pointers to device VAs. SHM/host objects
 // that are neither registered aclrtMallocHost nor NPU memory get an on-device
 // staging tensor (PackedHostStage); the caller memcpy-asyncs around the kernel.
 struct PreparedLmcPtrs {
@@ -206,6 +206,14 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptr
   prepared.kernel_obj_ptrs.reserve(lmcache_objects_ptrs.size());
   const auto staging_opts =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
+  const int64_t object_bytes =
+      spec.packed
+          ? static_cast<int64_t>(shape_desc.nl) * lmcache_chunk_size *
+                spec.lmc_row_elems
+          : static_cast<int64_t>(shape_desc.kv_size) * shape_desc.nl *
+                lmcache_chunk_size * shape_desc.nh * shape_desc.hs *
+                shape_desc.element_size;
+  TORCH_CHECK(object_bytes > 0, "LMCache object byte size must be positive");
   for (int64_t p : lmcache_objects_ptrs) {
     void* raw = reinterpret_cast<void*>(static_cast<uintptr_t>(p));
     void* mapped = get_device_ptr(raw);
@@ -213,17 +221,15 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptr
       prepared.kernel_obj_ptrs.push_back(reinterpret_cast<int64_t>(mapped));
       continue;
     }
-    if (!spec.packed || is_npu_memory_ptr(raw)) {
+    if (is_npu_memory_ptr(raw)) {
       prepared.kernel_obj_ptrs.push_back(p);
       continue;
     }
-    const int64_t nbytes = static_cast<int64_t>(shape_desc.nl) *
-                           lmcache_chunk_size * spec.lmc_row_elems;
+    // A torch-pinned host pointer may not have a mapping in our registry.
     PackedHostStage stage;
-    stage.buf = torch::empty(
-        {shape_desc.nl, lmcache_chunk_size, spec.lmc_row_elems}, staging_opts);
+    stage.buf = torch::empty({object_bytes}, staging_opts);
     stage.host_ptr = p;
-    stage.nbytes = static_cast<size_t>(nbytes);
+    stage.nbytes = static_cast<size_t>(object_bytes);
     prepared.kernel_obj_ptrs.push_back(
         reinterpret_cast<int64_t>(stage.buf.data_ptr()));
     prepared.host_stages.push_back(std::move(stage));
@@ -252,7 +258,10 @@ int enqueue_block_transfer(void* stream, uint32_t aiv_num,
                            int lmcache_chunk_size, int skip_prefix_n_blocks,
                            bool lmcache_to_engine, kvcache_ops::AscendType type,
                            const PackedPlaneSpec& spec) {
-  if (lmcache_to_engine) {
+  // For a partial D2H store, preserve the host prefix before the kernel
+  // updates the suffix: the subsequent D2H copy covers the whole object.
+  // Full D2H stores need neither this H2D copy nor zero initialization.
+  if (lmcache_to_engine || skip_prefix_n_blocks > 0) {
     for (const auto& stage : prepared.host_stages) {
       const aclError ret = aclrtMemcpyAsync(
           stage.buf.data_ptr(), stage.nbytes,
@@ -353,6 +362,7 @@ void multi_layer_block_kv_transfer(
   const kvcache_ops::AscendType type = launch_type(shape_desc, spec);
   const bool lmcache_to_engine = (direction == TransferDirection::H2D);
 
+  const c10::OptionalDeviceGuard device_guard(device);
   PreparedLmcPtrs prepared = prepare_lmc_ptrs(
       lmcache_objects_ptrs, device, shape_desc, lmcache_chunk_size, spec);
 
@@ -360,7 +370,6 @@ void multi_layer_block_kv_transfer(
       static_cast<uint8_t*>(paged_buffer_ptrs_tensor.data_ptr());
   int64_t* block_ids_base = block_ids.data_ptr<int64_t>();
 
-  const c10::OptionalDeviceGuard device_guard(device);
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
   at_npu::native::OpCommand cmd;

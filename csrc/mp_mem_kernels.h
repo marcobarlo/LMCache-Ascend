@@ -36,7 +36,7 @@ enum class EngineKVFormat : int {
   NL_X_NB_BSV_BSS = 14,
   NL_X_TWO_NB_NH_ONE_BS_HS = 15,
   NL_X_TWO_X_NB_BS_NH_HS = 16,
-  NL_X_TWO_X_NB_BS_HS = 17,
+  NL_X_NP_X_NB_BS_ONE_HS = 17,
 };
 
 inline constexpr bool is_cross_layer(EngineKVFormat f) {
@@ -63,19 +63,19 @@ inline constexpr bool is_layer_list(EngineKVFormat f) {
          f == EngineKVFormat::NL_X_NB_BSV_BSS ||
          f == EngineKVFormat::NL_X_TWO_NB_NH_ONE_BS_HS ||
          f == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_TWO_X_NB_BS_HS;
+         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
 }
 
 inline constexpr bool is_mla(EngineKVFormat f) {
   return f == EngineKVFormat::NL_X_NB_BS_HS ||
          f == EngineKVFormat::NL_X_NBBS_ONE_HS ||
          f == EngineKVFormat::NL_X_NB_BSV_BSS ||
-         f == EngineKVFormat::NL_X_TWO_X_NB_BS_HS;
+         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
 }
 
 inline constexpr bool is_kv_second_tuple(EngineKVFormat f) {
   return f == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_TWO_X_NB_BS_HS;
+         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
 }
 
 // Compile-time shape descriptor, field-for-field aligned with upstream
