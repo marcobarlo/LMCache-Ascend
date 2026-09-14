@@ -23,7 +23,9 @@ requires_npu = pytest.mark.skipif(
     reason="Ascend NPU required",
 )
 
-KG0_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_HS
+KG0_FMT = getattr(
+    native.EngineKVFormat, "NL_X_TWO_X_NB_BS_HS", None
+) or native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
 NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
 D2H = native.TransferDirection.D2H
@@ -54,6 +56,10 @@ def _shape_desc(
     return desc
 
 
+def _kg0_stride(bs: int) -> int:
+    return bs * 130
+
+
 def _kg0_desc(*, nl: int, nb: int, bs: int) -> object:
     return _shape_desc(
         kv_size=1,
@@ -63,7 +69,7 @@ def _kg0_desc(*, nl: int, nb: int, bs: int) -> object:
         nh=1,
         hs=130,
         dtype=torch.int8,
-        block_stride_elems=4160,
+        block_stride_elems=_kg0_stride(bs),
     )
 
 
@@ -73,8 +79,9 @@ def _kg0_layers(
     pools: list[torch.Tensor] = []
     layers: list[tuple[torch.Tensor, torch.Tensor]] = []
     latent_w = 128
+    stride = _kg0_stride(bs)
     for layer_i in range(nl):
-        pool = torch.zeros(nb, 4160, dtype=torch.uint8, device=device)
+        pool = torch.zeros(nb, stride, dtype=torch.uint8, device=device)
         latent = pool[:, : bs * latent_w].view(nb, bs, latent_w)
         scale = pool[:, bs * latent_w :].view(torch.float16).view(nb, bs, 1)
         latent.copy_(
@@ -331,11 +338,20 @@ def _assert_d2h_object(
                         obj[1, layer, sl].reshape_as(value[bid]), value[bid]
                     )
             else:
-                for layer, (latent, scale) in enumerate(layers):
-                    assert torch.equal(
-                        obj[layer, sl].cpu(),
-                        _kg0_packed_block(latent, scale, bid, bs).cpu(),
-                    )
+                first = layers[0]
+                if isinstance(first, tuple):
+                    for layer, (latent, scale) in enumerate(layers):
+                        assert torch.equal(
+                            obj[layer, sl].cpu(),
+                            _kg0_packed_block(latent, scale, bid, bs).cpu(),
+                        )
+                else:
+                    for layer, tensor in enumerate(layers):
+                        got = obj[layer, sl].cpu().reshape_as(tensor[bid].cpu())
+                        if tensor.dtype in (torch.float16, torch.bfloat16):
+                            torch.testing.assert_close(got, tensor[bid].cpu())
+                        else:
+                            assert torch.equal(got, tensor[bid].cpu())
 
 
 def _assert_h2d_engine(
@@ -380,6 +396,7 @@ def _build_roundtrip_engine(
     padded: bool,
     nl: int,
     device: torch.device,
+    nb: int | None = None,
 ) -> dict[str, Any]:
     if layout == "sep_kv":
         nb, bs, nh, hs = 8, 4, 2, 8
@@ -425,7 +442,24 @@ def _build_roundtrip_engine(
             kv_leading=True,
             bs=bs,
         )
-    nb, bs = 32, 32
+    if layout in ("nh_cs", "nh_cs_fmt17"):
+        nb = nb or 32
+        bs, hs = 32, 512
+        dtype = torch.bfloat16
+        layers = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
+        return dict(
+            # Serving classifies G1 as fmt 17; packed MLA is hs=130 int8 only.
+            fmt=KG0_FMT if layout == "nh_cs_fmt17" else NH_CS_FMT,
+            desc=_shape_desc(kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype),
+            layers=layers,
+            table=_pointer_table(layers, device),
+            obj_dtype=dtype,
+            obj_tail=(nl, hs),
+            kv_leading=False,
+            bs=bs,
+        )
+    nb = nb or 32
+    bs = {"kg0_bs16": 16, "kg0_bs64": 64}.get(layout, 32)
     _pools, layers = _kg0_layers(nl=nl, nb=nb, bs=bs, device=device)
     return dict(
         fmt=KG0_FMT,
@@ -463,6 +497,33 @@ def _roundtrip_cases() -> list[Any]:
                 "kg0", host, False, 0, 21, 1, list(range(32)), id=f"kg0-{host}-live"
             )
         )
+    # Production G0: two 4096-token chunks (32 packed pages each).
+    cases.append(
+        pytest.param(
+            "kg0", "npu", False, 0, 21, 2, list(range(64)), id="kg0-npu-2chunk"
+        )
+    )
+    cases.append(
+        pytest.param(
+            "nh_cs", "npu", False, 0, 21, 1, list(range(32)), id="nh_cs-npu-1chunk"
+        )
+    )
+    cases.append(
+        pytest.param(
+            "nh_cs_fmt17", "npu", False, 0, 2, 1, [0], id="nh_cs-fmt17"
+        )
+    )
+    # Packed MLA page width (bs) and chunk = n_blocks * bs.
+    cases.append(
+        pytest.param(
+            "kg0_bs16", "npu", False, 0, 2, 1, [0], id="kg0-bs16-chunk16"
+        )
+    )
+    cases.append(
+        pytest.param(
+            "kg0_bs64", "npu", False, 0, 2, 1, [0, 1], id="kg0-bs64-chunk128"
+        )
+    )
     return cases
 
 
@@ -481,7 +542,10 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     block_ids: list[int],
 ) -> None:
     device = torch.device("npu:0")
-    spec = _build_roundtrip_engine(layout, padded=padded, nl=nl, device=device)
+    engine_nb = None if layout == "sep_kv" else max(32, max(block_ids) + 1)
+    spec = _build_roundtrip_engine(
+        layout, padded=padded, nl=nl, device=device, nb=engine_nb
+    )
     bs = spec["bs"]
     bpo = len(block_ids) // num_objects
     chunk = bpo * bs
@@ -850,41 +914,66 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
     _assert_engine_equal(layers13_d, layers13_p)
 
 
+
 @requires_npu
 @pytest.mark.parametrize("affinity", [False, True], ids=["main", "affinity"])
-def test_plan_staging_d2h_matches_direct(affinity: bool) -> None:
+@pytest.mark.parametrize("num_objects", [1, 2], ids=["1obj", "2obj"])
+def test_plan_staging_d2h_matches_direct(affinity: bool, num_objects: int) -> None:
     device = torch.device("npu:0")
-    nl, nb, bs, chunk = 2, 4, 32, 32
+    nl, bs, chunk = 2, 32, 32
+    nb = max(4, num_objects)
     desc = _kg0_desc(nl=nl, nb=nb, bs=bs)
     _pools, layers = _kg0_layers(nl=nl, nb=nb, bs=bs, device=device)
     table = _pointer_table(layers, device)
-    golden = torch.zeros((nl, chunk, 130), dtype=torch.uint8, device=device)
-    temp = golden.clone()
-    host = torch.zeros((nl, chunk, 130), dtype=torch.uint8)
-    block_ids = torch.tensor([0], dtype=torch.int64, device=device)
-    _transfer(table, [int(golden.data_ptr())], block_ids, device, D2H, desc, chunk, KG0_FMT)
+    block_ids = torch.arange(num_objects, dtype=torch.int64, device=device)
+    goldens = [
+        torch.zeros((nl, chunk, 130), dtype=torch.uint8, device=device)
+        for _ in range(num_objects)
+    ]
+    temp = goldens[0].clone()
+    hosts = [
+        torch.zeros((nl, chunk, 130), dtype=torch.uint8) for _ in range(num_objects)
+    ]
+    _transfer(
+        table,
+        [int(g.data_ptr()) for g in goldens],
+        block_ids,
+        device,
+        D2H,
+        desc,
+        chunk,
+        KG0_FMT,
+    )
     spec = lmc_ops.KernelGroupSpec(
         table.data_ptr(),
-        [temp.data_ptr()],
+        [int(temp.data_ptr())],
         desc,
         chunk,
         int(KG0_FMT),
         block_ids.data_ptr(),
         block_ids.numel(),
     )
-    staging = [
-        lmc_ops.StagingCopy(int(host.data_ptr()), int(temp.data_ptr()), host.nbytes, 0)
+    steps = [
+        lmc_ops.BatchStep(
+            [
+                lmc_ops.StagingCopy(
+                    int(host.data_ptr()), int(temp.data_ptr()), host.nbytes, 0
+                )
+            ],
+            [lmc_ops.LaunchVar(0, obj_i, 1, 1, 0)],
+        )
+        for obj_i, host in enumerate(hosts)
     ]
-    step = lmc_ops.BatchStep(staging, [lmc_ops.LaunchVar(0, 0, 1, 1, 0)])
 
     def _store() -> None:
         lmc_ops.execute_object_group_transfer(
-            int(D2H), device, 1 << 26, [spec], [step]
+            int(D2H), device, 1 << 26, [spec], steps
         )
         torch.npu.synchronize()
 
     _run(_store, affinity=affinity)
-    assert torch.equal(host, golden.cpu())
+    for host, golden in zip(hosts, goldens, strict=True):
+        assert torch.equal(host, golden.cpu())
 
 
 # ---------------------------------------------------------------------------

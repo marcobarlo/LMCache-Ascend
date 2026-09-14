@@ -31,8 +31,8 @@
 // Layouts:
 //   SEPARATE_KV (format 16): per-layer (K, V) [NB, BS, NH, HS]; LMC 2LTD.
 //   Packed MLA (format 17 / KG0): interleaved [latent, scale] ptr table;
-//     latent 128 B + scale 2 B into a packed LMC row (130 B). Scale uses
-//     DataCopyPad with UB stride AlignUp32(hdBytes)/32 dataBlocks.
+//     UB 160 B rows (128 B latent + 2 B scale + 30 B dummy); four strided
+//     DataCopyPads (two per direction). UB->GM blockLen=130 drops dummy.
 
 #include "multi_layer_block_mem_kernels.h"
 #include "multi_layer_mem_kernels.h"
@@ -100,10 +100,13 @@ public:
                   static_cast<int64_t>(sizeof(scalar_t))
             : kBytes;
         const int64_t maxHdBytes = kBytes > vBytes ? kBytes : vBytes;
+        // Packed MLA stages the whole page at once: rows are AlignUp32(130).
         const int64_t tokenBytes = lmc_row_elems_ > 0
-            ? AlignUp32Bytes(maxHdBytes)
+            ? AlignUp32Bytes(static_cast<int64_t>(lmc_row_elems_) *
+                             static_cast<int64_t>(sizeof(scalar_t)))
             : maxHdBytes;
-        int64_t fit = ubBudgetBytes / (2 * tokenBytes);
+        int64_t fit = lmc_row_elems_ > 0 ? static_cast<int64_t>(bs)
+                                         : ubBudgetBytes / (2 * tokenBytes);
         if (fit < 1) {
             fit = 1;
         }
@@ -119,8 +122,8 @@ public:
     __aicore__ inline void process()
     {
         // Phase 1: single object per launch, so total_blocks is this object's
-        // block count (design doc 4.1). kv_size_ is 2 for packed/separate
-        // pointer tables and 1 for fused NH_CS (CUDA grid x-dim).
+        // block count (design doc 4.1). kv_size_ is 2 for separate K/V, 1 for
+        // packed MLA (both planes on one core) and fused NH_CS.
         const int32_t total_blocks = num_blocks_per_object_;
         const int32_t kv = kv_size_;
         const int32_t total_work = nl_ * kv * total_blocks;
@@ -207,10 +210,113 @@ private:
         AscendC::DataCopyPad(this->pagedTokenGlobalU8_[dstByteOff], srcU8, params);
     }
 
+    // DataCopyPad stride is the GAP between blocks: GM side in bytes, UB side
+    // in 32 B DataBlocks after the block is rounded up to 32 B.
+    __aicore__ inline void CopyGmToUbPad(
+        AscendC::LocalTensor<uint8_t> dst,
+        const AscendC::GlobalTensor<uint8_t> &src, const int64_t srcByteOff,
+        const int32_t nTok, const uint32_t blockLen,
+        const uint32_t srcGapBytes, const uint32_t dstGapBlks) {
+        AscendC::DataCopyExtParams params{
+            static_cast<uint16_t>(nTok), blockLen, srcGapBytes, dstGapBlks, 0u};
+        AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
+        AscendC::DataCopyPad(dst, src[srcByteOff], params, pad);
+    }
+
+    __aicore__ inline void CopyUbToGmPad(
+        const AscendC::GlobalTensor<uint8_t> &dst, const int64_t dstByteOff,
+        AscendC::LocalTensor<uint8_t> src, const int32_t nTok,
+        const uint32_t blockLen, const uint32_t srcGapBlks,
+        const uint32_t dstGapBytes) {
+        AscendC::DataCopyExtParams params{
+            static_cast<uint16_t>(nTok), blockLen, srcGapBlks, dstGapBytes, 0u};
+        AscendC::DataCopyPad(dst[dstByteOff], src, params);
+    }
+
+    // Packed MLA (fmt 17): one AIV moves both planes of one (layer, page).
+    // UB page = bs rows of AlignUp32(130)=160 B: [128 latent][2 scale][30 dummy].
+    __aicore__ inline void process_packed_block(
+        const int32_t layer_idx, const int32_t block_idx_in_object,
+        const int64_t engine_block_idx)
+    {
+        const int64_t kBytes = static_cast<int64_t>(k_plane_elems_) *
+                               static_cast<int64_t>(sizeof(scalar_t));
+        const int64_t vBytes = static_cast<int64_t>(v_plane_elems_) *
+                               static_cast<int64_t>(sizeof(scalar_t));
+        const int64_t rowBytes = static_cast<int64_t>(lmc_row_elems_) *
+                                 static_cast<int64_t>(sizeof(scalar_t));
+        const int64_t ubRowBytes = AlignUp32Bytes(rowBytes);
+        const int32_t nTok = bs_;
+        // Gaps in 32 B DataBlocks so every UB row pitch is ubRowBytes.
+        const uint32_t latentGapBlks =
+            static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(kBytes)) / 32);
+        const uint32_t scaleGapBlks =
+            static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(vBytes)) / 32);
+        const int64_t pagedBlockBytes =
+            engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
+
+        __gm__ uint8_t *latent_base =
+            kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
+                paged_buffer_ptrs_, layer_idx, 0);
+        __gm__ uint8_t *scale_base =
+            kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
+                paged_buffer_ptrs_, layer_idx, 1);
+        pagedTokenGlobalU8_.SetGlobalBuffer(
+            latent_base + engine_block_idx * pagedBlockBytes,
+            static_cast<uint64_t>(nTok) * kBytes);
+        scalePagedGlobalU8_.SetGlobalBuffer(
+            scale_base + engine_block_idx * pagedBlockBytes,
+            static_cast<uint64_t>(nTok) * vBytes);
+        lmcBufferGlobalU8_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ uint8_t *>(lmcache_obj_),
+            static_cast<uint64_t>(nl_) * lmcache_chunk_size_ * rowBytes);
+
+        const int64_t lmcBlockByteOff =
+            static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ * rowBytes +
+            static_cast<int64_t>(block_idx_in_object) * bs_ * rowBytes;
+
+        local_scalar_t page = block_que_.template AllocTensor<scalar_t>();
+        AscendC::LocalTensor<uint8_t> pageU8 =
+            page.template ReinterpretCast<uint8_t>();
+
+        if (lmcache_to_engine_) {
+            CopyGmToUbPad(pageU8, lmcBufferGlobalU8_, lmcBlockByteOff, nTok,
+                          static_cast<uint32_t>(rowBytes), 0u, 0u);
+            block_que_.EnQue(page);
+            page = block_que_.template DeQue<scalar_t>();
+            pageU8 = page.template ReinterpretCast<uint8_t>();
+            CopyUbToGmPad(pagedTokenGlobalU8_, 0, pageU8, nTok,
+                          static_cast<uint32_t>(kBytes), latentGapBlks, 0u);
+            // 32 x 2 B into the dense 64 B scale plane: one instruction owns
+            // both 32 B lines, so the sub-line writes cannot clobber anything.
+            CopyUbToGmPad(scalePagedGlobalU8_, 0,
+                          pageU8[static_cast<int32_t>(kBytes)], nTok,
+                          static_cast<uint32_t>(vBytes), scaleGapBlks, 0u);
+        } else {
+            CopyGmToUbPad(pageU8, pagedTokenGlobalU8_, 0, nTok,
+                          static_cast<uint32_t>(kBytes), 0u, latentGapBlks);
+            CopyGmToUbPad(pageU8[static_cast<int32_t>(kBytes)],
+                          scalePagedGlobalU8_, 0, nTok,
+                          static_cast<uint32_t>(vBytes), 0u, scaleGapBlks);
+            block_que_.EnQue(page);
+            page = block_que_.template DeQue<scalar_t>();
+            pageU8 = page.template ReinterpretCast<uint8_t>();
+            // blockLen=130 drops the 30 B dummy tail of each UB row.
+            CopyUbToGmPad(lmcBufferGlobalU8_, lmcBlockByteOff, pageU8, nTok,
+                          static_cast<uint32_t>(rowBytes), 0u, 0u);
+        }
+        block_que_.FreeTensor(page);
+    }
+
     __aicore__ inline void process_single_block(
         const int32_t layer_idx, const int32_t k_or_v,
         const int32_t block_idx_in_object, const int64_t engine_block_idx)
     {
+        if (lmc_row_elems_ > 0) {
+            process_packed_block(layer_idx, block_idx_in_object, engine_block_idx);
+            return;
+        }
+
         __gm__ uint8_t *paged_layer_base;
         if (kv_size_ == 1) {
             paged_layer_base =
@@ -222,22 +328,10 @@ private:
                     paged_buffer_ptrs_, layer_idx, k_or_v);
         }
 
-        const bool packed = lmc_row_elems_ > 0;
-        const int32_t plane_elems = packed
-            ? (k_or_v == 0 ? k_plane_elems_ : v_plane_elems_)
-            : static_cast<int32_t>(scalars_per_token_);
         const int64_t hdBytes =
-            static_cast<int64_t>(plane_elems) * static_cast<int64_t>(sizeof(scalar_t));
+            scalars_per_token_ * static_cast<int64_t>(sizeof(scalar_t));
 
-        if (packed || hdBytes < 32) {
-            const int64_t plane_row_off = k_or_v == 0
-                ? 0
-                : static_cast<int64_t>(k_plane_elems_) *
-                      static_cast<int64_t>(sizeof(scalar_t));
-            const int64_t lmcRowBytes = packed
-                ? static_cast<int64_t>(lmc_row_elems_) *
-                      static_cast<int64_t>(sizeof(scalar_t))
-                : hdBytes;
+        if (hdBytes < 32) {
             const int64_t pagedBlockBytes =
                 engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
             __gm__ uint8_t *paged_block =
@@ -246,12 +340,11 @@ private:
                 paged_block, static_cast<uint64_t>(pagedBlockBytes));
             lmcBufferGlobalU8_.SetGlobalBuffer(
                 reinterpret_cast<__gm__ uint8_t *>(lmcache_obj_),
-                static_cast<uint64_t>(nl_) * lmcache_chunk_size_ * lmcRowBytes);
+                static_cast<uint64_t>(nl_) * lmcache_chunk_size_ * hdBytes);
 
             const int64_t lmcBlockByteOff =
-                static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ * lmcRowBytes +
-                static_cast<int64_t>(block_idx_in_object) * bs_ * lmcRowBytes +
-                plane_row_off;
+                static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ * hdBytes +
+                static_cast<int64_t>(block_idx_in_object) * bs_ * hdBytes;
 
             const int32_t num_segs =
                 (bs_ + tokens_per_seg_ - 1) / tokens_per_seg_;
@@ -264,11 +357,11 @@ private:
                 const int32_t nTok = static_cast<int32_t>(seg_tokens);
                 const int64_t srcByteOff = seg_start_token * hdBytes;
                 const int64_t lmcByteOff =
-                    lmcBlockByteOff + seg_start_token * lmcRowBytes;
+                    lmcBlockByteOff + seg_start_token * hdBytes;
 
                 local_scalar_t buf = block_que_.template AllocTensor<scalar_t>();
                 if (lmcache_to_engine_) {
-                    CopyLmcBlockToUb(buf, lmcByteOff, nTok, hdBytes, lmcRowBytes);
+                    CopyLmcBlockToUb(buf, lmcByteOff, nTok, hdBytes, hdBytes);
                     block_que_.EnQue(buf);
                     buf = block_que_.template DeQue<scalar_t>();
                     CopyUbToPagedBlock(srcByteOff, buf, nTok, hdBytes);
@@ -276,7 +369,7 @@ private:
                     CopyPagedBlockToUb(buf, srcByteOff, nTok, hdBytes);
                     block_que_.EnQue(buf);
                     buf = block_que_.template DeQue<scalar_t>();
-                    CopyUbToLmcBlock(lmcByteOff, buf, nTok, hdBytes, lmcRowBytes);
+                    CopyUbToLmcBlock(lmcByteOff, buf, nTok, hdBytes, hdBytes);
                 }
                 block_que_.FreeTensor(buf);
             }
@@ -352,6 +445,7 @@ private:
     int32_t tokens_per_seg_;
 
     AscendC::GlobalTensor<uint8_t> pagedTokenGlobalU8_;
+    AscendC::GlobalTensor<uint8_t> scalePagedGlobalU8_;
     AscendC::GlobalTensor<uint8_t> lmcBufferGlobalU8_;
 };
 

@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wrap LMCache ``get_tokens_per_block`` for Ascend compressed-MLA specs.
+"""Wrap LMCache ``get_tokens_per_block`` when Ascend ``block_size`` is physical.
 
-After vllm-ascend #13242, ``spec.block_size`` is already the logical token span
-and ``storage_block_size`` is the physical page. Before that PR, ``block_size``
-is physical slots and the token span is ``block_size * compress_ratio``.
+Pre-#13242 ``spec.block_size`` is physical slots; the logical span is
+``block_size * compress_ratio``. Post-#13242 that field is already logical, so
+LMCache core (``spec.block_size``) is correct and this wrap is skipped.
 
-LMCache core always reads ``spec.block_size``. This module wraps
-``get_tokens_per_block`` so pre-#13242 Ascend specs still report the logical
-span. It does not mutate ``spec.block_size`` (frozen dataclass field; vLLM
-kernels and page-byte math depend on the physical value). GPU
-``MLAAttentionSpec`` is left alone: ``compress_ratio`` there does not scale
-``block_size``.
+Detection is class-level at patch time: pool math
+``max_memory_usage_bytes`` still names ``compress_ratio`` iff ``block_size`` is
+physical. Do not ``getattr`` ``storage_block_size`` (GPU inherited property).
 
-``merge()`` is wrapped to restore ``compress_ratio`` / ``model_version`` dropped
-by some Ascend spec merges.
+``merge()`` is always wrapped to restore ``compress_ratio`` / ``model_version``
+dropped by some Ascend spec merges.
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ import sys
 
 _INSTALLED = False
 _GET_TOKENS_WRAPPED = False
+_UNPATCHED_GET_TOKENS: Any = None
 
 _ASCEND_LEAF_NAMES = frozenset(
     {
@@ -39,6 +37,26 @@ def _is_ascend_leaf(spec: Any) -> bool:
     return any(cls.__name__ in _ASCEND_LEAF_NAMES for cls in type(spec).__mro__)
 
 
+def _block_size_is_physical(cls: Any | None) -> bool:
+    """True when ``cls.max_memory_usage_bytes`` still uses ``compress_ratio``."""
+    if cls is None:
+        return True
+    fn = getattr(cls, "max_memory_usage_bytes", None)
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return True
+    return "compress_ratio" in code.co_names
+
+
+def _ascend_block_size_is_physical() -> bool:
+    """True on pre-#13242 vLLM-Ascend (physical ``block_size``)."""
+    try:
+        from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+    except ImportError:
+        return True
+    return _block_size_is_physical(AscendMLAAttentionSpec)
+
+
 def tokens_per_block_id(spec: Any) -> int:
     """Logical tokens covered by one block id of ``spec`` (no DCP)."""
     inner = getattr(spec, "kv_cache_specs", None)
@@ -52,9 +70,6 @@ def tokens_per_block_id(spec: Any) -> int:
         or getattr(spec, "tokens_per_state", 1)
         or 1
     )
-    storage = getattr(spec, "storage_block_size", None)
-    if storage is not None and int(storage) != block:
-        return block
     return block * ratio
 
 
@@ -120,7 +135,7 @@ def _rebind_get_tokens_per_block(orig: Any, wrapped: Any) -> None:
 
 def _wrap_get_tokens_per_block() -> None:
     """Replace ``get_tokens_per_block`` with the Ascend-aware span (idempotent)."""
-    global _GET_TOKENS_WRAPPED
+    global _GET_TOKENS_WRAPPED, _UNPATCHED_GET_TOKENS
     if _GET_TOKENS_WRAPPED:
         return
     try:
@@ -142,13 +157,24 @@ def _wrap_get_tokens_per_block() -> None:
         return block
 
     get_tokens_per_block._lmcache_ascend_logical_block_size = True  # type: ignore[attr-defined]
+    _UNPATCHED_GET_TOKENS = orig
     _rebind_get_tokens_per_block(orig, get_tokens_per_block)
     _GET_TOKENS_WRAPPED = True
 
 
-def install_overrides() -> None:
-    """Wrap spec ``merge()`` and ``get_tokens_per_block`` (idempotent)."""
-    global _INSTALLED
+def install_overrides(*, scale_physical: bool | None = None) -> None:
+    """Wrap spec ``merge()``; wrap ``get_tokens_per_block`` only if physical.
+
+    ``scale_physical`` overrides the patch-time detector (tests). ``None``
+    means detect from vLLM-Ascend. Idempotent: the first decision sticks.
+    """
+    global _INSTALLED, _GET_TOKENS_WRAPPED
     install_logical_block_size()
-    _wrap_get_tokens_per_block()
+    if not _GET_TOKENS_WRAPPED:
+        if scale_physical is None:
+            scale_physical = _ascend_block_size_is_physical()
+        if scale_physical:
+            _wrap_get_tokens_per_block()
+        else:
+            _GET_TOKENS_WRAPPED = True
     _INSTALLED = True

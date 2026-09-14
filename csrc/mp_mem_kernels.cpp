@@ -50,11 +50,13 @@ struct PackedPlaneSpec {
 PackedPlaneSpec packed_planes(const PageBufferShapeDesc& shape_desc,
                               EngineKVFormat engine_kv_format) {
   PackedPlaneSpec spec;
-  if (engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS) {
+  // Fmt 17 is also dense one-head pages (NH_CS). Packed MLA is 128+2 only.
+  if (engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS &&
+      shape_desc.element_size == 1 && shape_desc.hs == 130) {
     spec.packed = true;
-    spec.lmc_row_elems = shape_desc.hs * shape_desc.element_size;
+    spec.lmc_row_elems = 130;
     spec.v_plane_elems = 2;
-    spec.k_plane_elems = spec.lmc_row_elems - 2;
+    spec.k_plane_elems = 128;
   }
   return spec;
 }
@@ -137,10 +139,15 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
                     spec.k_plane_elems % kGmAlignBytes == 0,
                 "packed latent width (", spec.k_plane_elems,
                 " bytes) must be a positive multiple of ", kGmAlignBytes);
-    const int64_t latent_bytes = spec.k_plane_elems;
-    const int64_t scale_aligned = (2 + 31) & ~31;
-    ub_token_bytes =
-        latent_bytes > scale_aligned ? latent_bytes : scale_aligned;
+    // The kernel stages a whole page as bs rows of AlignUp32(lmc_row) bytes.
+    const int64_t ub_row_bytes = (spec.lmc_row_elems + 31) & ~31;
+    const int64_t lmc_page_bytes =
+        static_cast<int64_t>(shape_desc.bs) * spec.lmc_row_elems;
+    TORCH_CHECK(lmc_page_bytes % kGmAlignBytes == 0,
+                "packed LMC page bytes (", lmc_page_bytes,
+                ") must be a multiple of ", kGmAlignBytes,
+                "; otherwise adjacent pages share a 32 B line");
+    ub_token_bytes = static_cast<int64_t>(shape_desc.bs) * ub_row_bytes;
   } else {
     const int64_t token_bytes = static_cast<int64_t>(shape_desc.nh) *
                                 shape_desc.hs * shape_desc.element_size;
@@ -301,9 +308,10 @@ void launch_block_transfer_objects(
     const PageBufferShapeDesc& shape_desc, int lmcache_chunk_size,
     int skip_prefix_n_blocks, bool lmcache_to_engine,
     const PackedPlaneSpec& spec) {
-  // Packed MLA always has two pointer-table planes (latent+scale) even when
-  // shape_desc.kv_size == 1. Fused NH_CS uses kv_size == 1 (one ptr/layer).
-  const int32_t kv_size = spec.packed ? 2 : shape_desc.kv_size;
+  // Packed MLA keeps a 2-entry pointer table (latent+scale) but launches
+  // kv_size=1: one AIV owns both planes of a page, so no two cores can write
+  // the same 32 B LMC line. Fused NH_CS also uses kv_size == 1.
+  const int32_t kv_size = spec.packed ? 1 : shape_desc.kv_size;
   const int64_t total_work =
       static_cast<int64_t>(shape_desc.nl) * kv_size * total_blocks;
   const uint32_t blockDim =

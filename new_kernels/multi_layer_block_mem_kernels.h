@@ -33,7 +33,7 @@ namespace kvcache_ops {
 // are non-zero (bytes when launched as INT8). Zero keeps the 2LTD DataCopy path.
 //
 // Fused NH_CS (format 13): kv_size=1, one pointer per layer (MERGED_KV).
-// Packed/separate keep kv_size=2 (interleaved [K,V] table).
+// Packed MLA launches kv_size=1 (one core per layer x page) with a 2-ptr table.
 //
 // Params:
 //   paged_buffer_ptrs      device base of the interleaved int64 pointer table
