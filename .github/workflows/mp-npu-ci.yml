@@ -1,10 +1,18 @@
 name: MP NPU tests (910B3)
 
 # Self-hosted on 910B3-03. Does not use the Huawei-lab 910b4/910c jobs.
+# repository_dispatch (mp-npu-ci) is fired by marcobarlo/LMCache on MP_dsv4_3_split pushes.
 on:
   push:
     branches: [MP_dsv4_3_split]
   workflow_dispatch:
+  repository_dispatch:
+    types: [mp-npu-ci]
+
+run-name: >-
+  ${{ github.event_name == 'repository_dispatch'
+      && format('LMCache {0}', github.event.client_payload.sha)
+      || github.event.head_commit.message || github.sha }}
 
 permissions:
   contents: read
@@ -12,7 +20,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: mp-npu-${{ github.ref }}
+  group: mp-npu-910b3
   cancel-in-progress: true
 
 jobs:
@@ -55,14 +63,21 @@ jobs:
           python3 -c '
           import re, subprocess, sys
           out = subprocess.check_output(["npu-smi", "info"], text=True)
+          # Chip rows list Memory-Usage then HBM-Usage as "used / total".
+          # re.search() hits the first pair (often "0 / 0"), so take the last
+          # pair whose total looks like device HBM. Empty parse must fail closed:
+          # npu-smi inside this container also hides host processes.
           hbms = []
           for line in out.splitlines():
-              m = re.search(r"(\d+)\s*/\s*(\d+)", line)
-              if m and int(m.group(2)) > 1024:
-                  hbms.append((int(m.group(1)), int(m.group(2))))
+              pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
+              mem = [(int(u), int(t)) for u, t in pairs if int(t) > 1024]
+              if mem:
+                  hbms.append(mem[-1])
           print("parsed HBM (used, total):", hbms[:8])
-          if any(u > 8 * 1024 for u, _ in hbms[:2]):
-              sys.exit("NPUs 0/1 have HBM in use %s. Stop serving on this host, then re-run." % (hbms[:2],))
+          if not hbms:
+              sys.exit("Could not parse HBM from npu-smi; refusing to run.")
+          if any(u > 8 * 1024 for u, _ in hbms):
+              sys.exit("NPUs have HBM in use %s. Stop serving on this host, then re-run." % (hbms,))
           '
 
       - name: Checkout LMCache-Ascend
@@ -70,12 +85,14 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+          # repository_dispatch checks out the default branch unless ref is set.
+          ref: ${{ github.event_name == 'repository_dispatch' && 'MP_dsv4_3_split' || github.sha }}
 
       - name: Checkout LMCache MP branch
         uses: actions/checkout@v4
         with:
           repository: marcobarlo/LMCache
-          ref: MP_dsv4_3_split
+          ref: ${{ github.event.client_payload.sha || 'MP_dsv4_3_split' }}
           path: _lmcache_mp
           fetch-depth: 0
 
@@ -99,7 +116,15 @@ jobs:
           pip install -v --no-build-isolation -e _lmcache_mp
           pip install -v --no-build-isolation -e .
           pip install pytest pytest-benchmark pytest-cov
-          python3 -c "import lmcache, lmcache_ascend; from lmcache.lmcache_native import EngineKVFormat; assert hasattr(EngineKVFormat, 'NL_X_TWO_X_NB_BS_HS')"
+          python3 -c '
+          from lmcache.lmcache_native import EngineKVFormat
+          assert hasattr(EngineKVFormat, "NL_X_TWO_X_NB_BS_HS"), dir(EngineKVFormat)
+          print("lmcache_native ok")
+          import lmcache
+          print("lmcache ok")
+          import lmcache_ascend
+          print("lmcache_ascend ok")
+          '
 
       - name: Pytest tests/v1
         id: test-step
