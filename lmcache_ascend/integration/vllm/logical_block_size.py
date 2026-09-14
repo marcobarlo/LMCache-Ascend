@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Expose Ascend physical-page token span as ``logical_block_size``.
+"""Wrap LMCache ``get_tokens_per_block`` for Ascend compressed-MLA specs.
 
-vLLM-Ascend stores ``block_size`` in physical slots; the token span is
-``block_size * compress_ratio``. Upstream vLLM already uses logical tokens in
-``block_size``, so LMCache core only does
-``getattr(spec, "logical_block_size", spec.block_size)``.
+After vllm-ascend #13242, ``spec.block_size`` is already the logical token span
+and ``storage_block_size`` is the physical page. Before that PR, ``block_size``
+is physical slots and the token span is ``block_size * compress_ratio``.
 
-This module attaches that property at runtime (no vLLM-Ascend source edits):
-leaf Ascend MLA/SWA specs, ``UniformTypeKVCacheSpecs`` (max of leaves), and a
-``merge()`` wrap so dropped ``compress_ratio`` is restored.
+LMCache core always reads ``spec.block_size``. This module wraps
+``get_tokens_per_block`` so pre-#13242 Ascend specs still report the logical
+span. It does not mutate ``spec.block_size`` (frozen dataclass field; vLLM
+kernels and page-byte math depend on the physical value). GPU
+``MLAAttentionSpec`` is left alone: ``compress_ratio`` there does not scale
+``block_size``.
+
+``merge()`` is wrapped to restore ``compress_ratio`` / ``model_version`` dropped
+by some Ascend spec merges.
 """
 
 from __future__ import annotations
@@ -20,23 +25,37 @@ import sys
 _INSTALLED = False
 _GET_TOKENS_WRAPPED = False
 
+_ASCEND_LEAF_NAMES = frozenset(
+    {
+        "AscendMLAAttentionSpec",
+        "AscendSlidingWindowMLASpec",
+        "AscendSFAIndexerCacheSpec",
+        "AscendIndexerKPoolStateSpec",
+    }
+)
 
-def _leaf_logical_block_size(self: Any) -> int:
-    return int(self.block_size) * int(getattr(self, "compress_ratio", 1) or 1)
+
+def _is_ascend_leaf(spec: Any) -> bool:
+    return any(cls.__name__ in _ASCEND_LEAF_NAMES for cls in type(spec).__mro__)
 
 
-def _uniform_logical_block_size(self: Any) -> int:
-    inner = getattr(self, "kv_cache_specs", None) or {}
-    if not inner:
-        return int(self.block_size)
-    return max(
-        int(getattr(spec, "logical_block_size", spec.block_size))
-        for spec in inner.values()
+def tokens_per_block_id(spec: Any) -> int:
+    """Logical tokens covered by one block id of ``spec`` (no DCP)."""
+    inner = getattr(spec, "kv_cache_specs", None)
+    if isinstance(inner, dict) and inner:
+        return max(tokens_per_block_id(leaf) for leaf in inner.values())
+    block = int(spec.block_size)
+    if not _is_ascend_leaf(spec):
+        return block
+    ratio = int(
+        getattr(spec, "compress_ratio", None)
+        or getattr(spec, "tokens_per_state", 1)
+        or 1
     )
-
-
-def _has_logical_block_size_property(cls: type) -> bool:
-    return isinstance(getattr(cls, "logical_block_size", None), property)
+    storage = getattr(spec, "storage_block_size", None)
+    if storage is not None and int(storage) != block:
+        return block
+    return block * ratio
 
 
 def _restore_dropped_merge_fields(merged: Any, specs: list[Any]) -> Any:
@@ -68,37 +87,39 @@ def install_on(
     leaf_classes: Iterable[type],
     uniform_type_cls: type | None = None,
 ) -> None:
-    """Attach ``logical_block_size`` to the given spec classes (idempotent)."""
+    """Wrap ``merge()`` on the given spec classes (idempotent)."""
+    del uniform_type_cls
     for cls in leaf_classes:
-        if not _has_logical_block_size_property(cls):
-            cls.logical_block_size = property(_leaf_logical_block_size)
         if hasattr(cls, "merge"):
             _wrap_merge(cls)
-    if uniform_type_cls is not None and not _has_logical_block_size_property(
-        uniform_type_cls
-    ):
-        uniform_type_cls.logical_block_size = property(_uniform_logical_block_size)
 
 
 def install_logical_block_size() -> bool:
-    """Patch real vLLM-Ascend / vLLM spec classes if they are importable."""
+    """Wrap real vLLM-Ascend spec ``merge()`` if the classes are importable."""
     try:
-        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
         from vllm_ascend.core.kv_cache_interface import (
             AscendMLAAttentionSpec,
             AscendSlidingWindowMLASpec,
         )
     except ImportError:
         return False
-    install_on(
-        (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec),
-        UniformTypeKVCacheSpecs,
-    )
+    install_on((AscendMLAAttentionSpec, AscendSlidingWindowMLASpec))
     return True
 
 
+def _rebind_get_tokens_per_block(orig: Any, wrapped: Any) -> None:
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        try:
+            if getattr(mod, "get_tokens_per_block", None) is orig:
+                mod.get_tokens_per_block = wrapped
+        except Exception:
+            continue
+
+
 def _wrap_get_tokens_per_block() -> None:
-    """Ensure the spec patch runs before the first ``get_tokens_per_block``."""
+    """Replace ``get_tokens_per_block`` with the Ascend-aware span (idempotent)."""
     global _GET_TOKENS_WRAPPED
     if _GET_TOKENS_WRAPPED:
         return
@@ -113,18 +134,20 @@ def _wrap_get_tokens_per_block() -> None:
 
     def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
         install_logical_block_size()
-        return orig(kv_cache_spec, dcp_size)
+        block = tokens_per_block_id(kv_cache_spec)
+        if dcp_size <= 1:
+            return block
+        if kg._is_attention_spec(kv_cache_spec):
+            return block * dcp_size
+        return block
 
     get_tokens_per_block._lmcache_ascend_logical_block_size = True  # type: ignore[attr-defined]
-    kg.get_tokens_per_block = get_tokens_per_block
-    connector = sys.modules.get("lmcache.integration.vllm.lmcache_mp_connector")
-    if connector is not None and getattr(connector, "get_tokens_per_block", None) is orig:
-        connector.get_tokens_per_block = get_tokens_per_block
+    _rebind_get_tokens_per_block(orig, get_tokens_per_block)
     _GET_TOKENS_WRAPPED = True
 
 
 def install_overrides() -> None:
-    """Install spec properties and wrap ``get_tokens_per_block`` (idempotent)."""
+    """Wrap spec ``merge()`` and ``get_tokens_per_block`` (idempotent)."""
     global _INSTALLED
     install_logical_block_size()
     _wrap_get_tokens_per_block()

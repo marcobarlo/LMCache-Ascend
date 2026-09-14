@@ -796,10 +796,10 @@ def _patch_gpu_connector():
 
 
 def _patch_logical_block_size():
-    """Expose Ascend physical-page token span as ``spec.logical_block_size``.
+    """Wrap LMCache ``get_tokens_per_block`` for pre-/post-#13242 Ascend specs.
 
-    vLLM-Ascend reports ``block_size`` in slots; LMCache core reads an optional
-    ``logical_block_size``. Attach it here so vLLM-Ascend sources stay untouched.
+    Do not mutate ``spec.block_size``: after #13242 it is already the logical
+    token span, and before it vLLM-Ascend still uses it as the physical page.
     """
     from lmcache_ascend.integration.vllm.logical_block_size import install_overrides
 
