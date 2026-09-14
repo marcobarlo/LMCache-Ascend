@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "d8a358e21a66317c5771951cf26916d95e6d396c",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
