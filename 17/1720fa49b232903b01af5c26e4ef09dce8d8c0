@@ -1,0 +1,20 @@
+csrc/pybind.cpp
+  h_dffb05a36fbb51 133
+csrc/mp_mem_kernels.h
+  h_dffb05a36fbb51 39,66,73,78
+csrc/mp_mem_kernels.cpp
+  h_dffb05a36fbb51 53,80,85,192,209-216,224,228,230,232,261-264,365
+lmcache_ascend/__init__.py
+  h_dffb05a36fbb51 533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "171720fa49b232903b01af5c26e4ef09dce8d8c0",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
