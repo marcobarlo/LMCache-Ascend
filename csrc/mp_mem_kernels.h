@@ -91,6 +91,10 @@ struct PageBufferShapeDesc {
   int hs;
   int element_size;
   int block_stride_elems;
+  // Ascend-only: fmt-17 tuple plane count. 0 = unset (do not infer packed
+  // from hs % 32). plane_slot_bytes[i] is payload bytes per token.
+  int32_t num_planes = 0;
+  int32_t plane_slot_bytes[4] = {0, 0, 0, 0};
 
   template <typename ScalarType>
   inline size_t scalars_per_head() const {

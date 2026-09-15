@@ -21,6 +21,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.kv_format import (
     KVCacheFormat,
+    MultiPlaneBundle,
     _get_primary_blob_view,
     _is_shared_storage_blob,
 )
@@ -30,6 +31,7 @@ from lmcache_ascend.v1.kv_layer_groups import (
     build_kv_layer_groups,
 )
 from lmcache_ascend.v1.npu_connector.npu_connectors import _derive_group_params
+from lmcache_ascend.v1.shape_desc import is_packed_two_plane
 import lmcache_ascend  # noqa: F401  — applies get_shapes patch
 
 
@@ -125,6 +127,9 @@ def test_mla_2tuple_classified_as_attention_not_gdn():
     assert g.dtype == torch.bfloat16
     assert g.compress_ratio == 1
     assert g.physical_chunk_size == 256
+    assert g.shape_desc.num_planes == 2
+    assert g.shape_desc.plane_slot_bytes == (1024, 128)
+    assert not is_packed_two_plane(g.shape_desc)
 
 
 def test_dsa_3tuple_classified_as_attention():
@@ -146,6 +151,26 @@ def test_dsa_3tuple_classified_as_attention():
     assert g.hidden_dim_size == kv_lora_rank + qk_rope_head_dim + dsa_head_dim
     assert g.compress_ratio == 1
     assert g.physical_chunk_size == 256
+    assert g.shape_desc.num_planes == 3
+    assert not is_packed_two_plane(g.shape_desc)
+
+
+def test_kg0_int8_fp16_tuple_attaches_plane_slot_bytes() -> None:
+    num_blocks, block_size = 8, 32
+    layer = MultiPlaneBundle(
+        (
+            torch.empty(num_blocks, block_size, 1, 128, dtype=torch.int8),
+            torch.empty(num_blocks, block_size, 1, 1, dtype=torch.float16),
+        )
+    )
+    mgr = _make_ascend_format_manager(
+        [layer],
+        KVCacheFormat.MULTI_PLANE_KV,
+        num_blocks,
+    )
+    g = mgr.kv_layer_groups[0]
+    assert g.shape_desc.num_planes == 2
+    assert g.shape_desc.plane_slot_bytes == (128, 2)
 
 
 def test_dsa_c8_4tuple_classified_as_attention_with_mixed_dtypes():
@@ -167,6 +192,8 @@ def test_dsa_c8_4tuple_classified_as_attention_with_mixed_dtypes():
     assert g.shape_desc.kv_size == 1
     assert g.dtype == torch.uint8
     assert g.multi_plane_hidden_bytes is not None
+    assert g.shape_desc.num_planes == 4
+    assert g.shape_desc.plane_slot_bytes == (1024, 128, 128, 2)
     assert g.shape_desc.hs == _lmc_chunk_hidden_bytes(
         g.multi_plane_hidden_bytes,
         g.physical_chunk_size,
@@ -439,6 +466,7 @@ def test_sliding_window_reduces_physical_chunk_size_and_multi_plane_row_width():
     assert g.compress_ratio == 8
     assert g.physical_chunk_size == 16
     assert g.multi_plane_hidden_bytes is not None
+    assert g.shape_desc.num_planes == 4
     assert g.shape_desc.hs == _lmc_chunk_hidden_bytes(
         g.multi_plane_hidden_bytes,
         g.physical_chunk_size,

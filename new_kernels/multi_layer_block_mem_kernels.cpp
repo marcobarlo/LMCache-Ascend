@@ -30,9 +30,8 @@
 //
 // Layouts:
 //   SEPARATE_KV (format 16): per-layer (K, V) [NB, BS, NH, HS]; LMC 2LTD.
-//   Packed MLA (format 17 / KG0): interleaved [latent, scale] ptr table;
-//     UB 160 B rows (128 B latent + 2 B scale + 30 B dummy); four strided
-//     DataCopyPads (two per direction). UB->GM blockLen=130 drops dummy.
+//   Packed two-plane (format 17): [latent, scale] ptr table; UB rows are
+//     AlignUp32(lmc_row) with four strided DataCopyPads (two per direction).
 
 #include "multi_layer_block_mem_kernels.h"
 #include "multi_layer_mem_kernels.h"
@@ -100,7 +99,7 @@ public:
                   static_cast<int64_t>(sizeof(scalar_t))
             : kBytes;
         const int64_t maxHdBytes = kBytes > vBytes ? kBytes : vBytes;
-        // Packed MLA stages the whole page at once: rows are AlignUp32(130).
+        // Packed path stages the whole page: rows are AlignUp32(lmc_row).
         const int64_t tokenBytes = lmc_row_elems_ > 0
             ? AlignUp32Bytes(static_cast<int64_t>(lmc_row_elems_) *
                              static_cast<int64_t>(sizeof(scalar_t)))
@@ -233,8 +232,8 @@ private:
         AscendC::DataCopyPad(dst[dstByteOff], src, params);
     }
 
-    // Packed MLA (fmt 17): one AIV moves both planes of one (layer, page).
-    // UB page = bs rows of AlignUp32(130)=160 B: [128 latent][2 scale][30 dummy].
+    // Packed two-plane (fmt 17): one AIV moves both planes of one (layer, page).
+    // UB page = bs rows of AlignUp32(lmc_row): [k latent | v scale | dummy].
     __aicore__ inline void process_packed_block(
         const int32_t layer_idx, const int32_t block_idx_in_object,
         const int64_t engine_block_idx)
@@ -287,8 +286,7 @@ private:
             pageU8 = page.template ReinterpretCast<uint8_t>();
             CopyUbToGmPad(pagedTokenGlobalU8_, 0, pageU8, nTok,
                           static_cast<uint32_t>(kBytes), latentGapBlks, 0u);
-            // 32 x 2 B into the dense 64 B scale plane: one instruction owns
-            // both 32 B lines, so the sub-line writes cannot clobber anything.
+            // Dense scale plane: one instruction owns whole 32 B GM lines.
             CopyUbToGmPad(scalePagedGlobalU8_, 0,
                           pageU8[static_cast<int32_t>(kBytes)], nTok,
                           static_cast<uint32_t>(vBytes), scaleGapBlks, 0u);
@@ -301,7 +299,7 @@ private:
             block_que_.EnQue(page);
             page = block_que_.template DeQue<scalar_t>();
             pageU8 = page.template ReinterpretCast<uint8_t>();
-            // blockLen=130 drops the 30 B dummy tail of each UB row.
+            // blockLen=rowBytes drops the UB dummy tail of each row.
             CopyUbToGmPad(lmcBufferGlobalU8_, lmcBlockByteOff, pageU8, nTok,
                           static_cast<uint32_t>(rowBytes), 0u, 0u);
         }

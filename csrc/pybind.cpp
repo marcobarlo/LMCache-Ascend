@@ -10,6 +10,7 @@
 #include "mp_mem_kernels.h"
 #include "pac_kernels.h"
 #include "pos_kernels.h"
+#include <cstdint>
 #include <iostream>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -27,6 +28,68 @@ std::vector<torch::Tensor> normalize_kv_caches(const py::object &input) {
     throw std::runtime_error(
         "vllm_kv_caches must be a Tensor or a tuple of Tensors");
   }
+}
+
+// Duck-type lmcache_native.PageBufferShapeDesc (or the Ascend Python
+// subclass). Do not py::isinstance the local C++ struct.
+PageBufferShapeDesc shape_desc_from_py(const py::object& shape_desc) {
+  PageBufferShapeDesc sd{};
+  sd.kv_size = shape_desc.attr("kv_size").cast<int>();
+  sd.nl = shape_desc.attr("nl").cast<int>();
+  sd.nb = shape_desc.attr("nb").cast<int>();
+  sd.bs = shape_desc.attr("bs").cast<int>();
+  sd.nh = shape_desc.attr("nh").cast<int>();
+  sd.hs = shape_desc.attr("hs").cast<int>();
+  sd.element_size = shape_desc.attr("element_size").cast<int>();
+  sd.block_stride_elems = shape_desc.attr("block_stride_elems").cast<int>();
+  sd.num_planes = 0;
+  if (py::hasattr(shape_desc, "num_planes")) {
+    sd.num_planes = shape_desc.attr("num_planes").cast<int>();
+  }
+  if (py::hasattr(shape_desc, "plane_slot_bytes")) {
+    const py::object raw = shape_desc.attr("plane_slot_bytes");
+    if (!raw.is_none()) {
+      const auto slots = raw.cast<std::vector<int32_t>>();
+      TORCH_CHECK(slots.size() <= 4, "plane_slot_bytes length (", slots.size(),
+                  ") exceeds max 4");
+      for (size_t i = 0; i < slots.size(); ++i) {
+        sd.plane_slot_bytes[i] = slots[i];
+      }
+      if (sd.num_planes == 0) {
+        sd.num_planes = static_cast<int32_t>(slots.size());
+      }
+    }
+  }
+  // MP make_page_buffer_shape_desc sets plane_widths / plane_dtypes for
+  // fmt 17 but not plane_slot_bytes. Derive bytes so packed G0 does not
+  // fail-close on the generic 2LTD path.
+  if (sd.num_planes == 0 && py::hasattr(shape_desc, "plane_widths")) {
+    const py::object raw_w = shape_desc.attr("plane_widths");
+    if (!raw_w.is_none()) {
+      const auto widths = raw_w.cast<std::vector<int32_t>>();
+      TORCH_CHECK(widths.size() <= 4, "plane_widths length (", widths.size(),
+                  ") exceeds max 4");
+      std::vector<int32_t> itemsizes(widths.size(), sd.element_size);
+      if (py::hasattr(shape_desc, "plane_dtypes")) {
+        const py::object raw_dt = shape_desc.attr("plane_dtypes");
+        if (!raw_dt.is_none()) {
+          const py::sequence dts = raw_dt.cast<py::sequence>();
+          const size_t n =
+              widths.size() < dts.size() ? widths.size() : dts.size();
+          for (size_t i = 0; i < n; ++i) {
+            itemsizes[i] = dts[i].attr("itemsize").cast<int32_t>();
+          }
+        }
+      }
+      for (size_t i = 0; i < widths.size(); ++i) {
+        sd.plane_slot_bytes[i] = widths[i] * itemsizes[i];
+      }
+      sd.num_planes = static_cast<int32_t>(widths.size());
+    }
+  }
+  TORCH_CHECK(sd.num_planes >= 0 && sd.num_planes <= 4,
+              "num_planes must be 0-4, got ", sd.num_planes);
+  return sd;
 }
 
 void single_layer_kv_transfer_wrapper(torch::Tensor &lmc_key_value_cache,
@@ -195,16 +258,7 @@ PYBIND11_MODULE(c_ops, m) {
         // PageBufferShapeDesc: MP passes lmcache_native's class (different
         // module, not module_local). Cross-module isinstance SIGSEGVs on
         // AffinityThreadPool workers.
-        PageBufferShapeDesc sd;
-        sd.kv_size = shape_desc.attr("kv_size").cast<int>();
-        sd.nl = shape_desc.attr("nl").cast<int>();
-        sd.nb = shape_desc.attr("nb").cast<int>();
-        sd.bs = shape_desc.attr("bs").cast<int>();
-        sd.nh = shape_desc.attr("nh").cast<int>();
-        sd.hs = shape_desc.attr("hs").cast<int>();
-        sd.element_size = shape_desc.attr("element_size").cast<int>();
-        sd.block_stride_elems =
-            shape_desc.attr("block_stride_elems").cast<int>();
+        const PageBufferShapeDesc sd = shape_desc_from_py(shape_desc);
         // Keep the GIL through TORCH_CHECK so failures surface as Python
         // exceptions instead of aborting the lmcache server.
         multi_layer_block_kv_transfer(
@@ -247,16 +301,7 @@ PYBIND11_MODULE(c_ops, m) {
                        int64_t block_ids_capacity) {
              // Duck-type lmcache_native.PageBufferShapeDesc. Do not
              // py::isinstance the local C++ struct (cross-module SIGSEGV).
-             PageBufferShapeDesc sd;
-             sd.kv_size = shape_desc.attr("kv_size").cast<int>();
-             sd.nl = shape_desc.attr("nl").cast<int>();
-             sd.nb = shape_desc.attr("nb").cast<int>();
-             sd.bs = shape_desc.attr("bs").cast<int>();
-             sd.nh = shape_desc.attr("nh").cast<int>();
-             sd.hs = shape_desc.attr("hs").cast<int>();
-             sd.element_size = shape_desc.attr("element_size").cast<int>();
-             sd.block_stride_elems =
-                 shape_desc.attr("block_stride_elems").cast<int>();
+             PageBufferShapeDesc sd = shape_desc_from_py(shape_desc);
              return KernelGroupSpec{
                  paged_buffer_ptrs,
                  std::move(lmcache_objects_ptrs),

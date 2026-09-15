@@ -519,11 +519,37 @@ def _patch_ops():
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
     # MP's make_page_buffer_shape_desc sets desc.dtype (torch dtype side
-    # channel). Keep lmcache_native's dynamic_attr class on c_ops/device_ops
-    # so bind_native cannot pin the C++ struct (no dtype field).
-    from lmcache.lmcache_native import PageBufferShapeDesc as _NativeShapeDesc
+    # channel). Use the Ascend subclass (native + num_planes/plane_slot_bytes)
+    # so bind_native cannot pin the C++ struct (no dtype / plane fields).
+    from lmcache_ascend.v1.shape_desc import (
+        AscendPageBufferShapeDesc,
+        is_packed_two_plane,
+    )
 
-    ascend_c_ops.PageBufferShapeDesc = _NativeShapeDesc
+    ascend_c_ops.PageBufferShapeDesc = AscendPageBufferShapeDesc
+
+    # Serving builds shape_desc via MP make_page_buffer_shape_desc, which
+    # sets plane_widths/dtypes but not plane_slot_bytes. Attach so packed
+    # G0 does not fail-close.
+    from lmcache.v1.gpu_connector import utils as _gcu
+    from lmcache_ascend.v1.shape_desc import attach_tuple_planes_from_shape_desc
+
+    _orig_make_desc = _gcu.make_page_buffer_shape_desc
+
+    def _make_page_buffer_shape_desc(*args, **kwargs):
+        desc = _orig_make_desc(*args, **kwargs)
+        attach_tuple_planes_from_shape_desc(desc)
+        return desc
+
+    _gcu.make_page_buffer_shape_desc = _make_page_buffer_shape_desc
+    for _mod in list(sys.modules.values()):
+        if _mod is None:
+            continue
+        try:
+            if getattr(_mod, "make_page_buffer_shape_desc", None) is _orig_make_desc:
+                _mod.make_page_buffer_shape_desc = _make_page_buffer_shape_desc
+        except Exception:
+            continue
 
     # Block kernel: 16 equal K/V, 17 packed MLA (KG0), 13 fused NH_CS.
     # Annotation has no Tensor so MP stays in ptr mode.
@@ -557,6 +583,26 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
+        # Fmt 17: packed 2-plane thin-scale on a shared padded pool is
+        # native. Independently allocated 2-plane (stride 0) and NP>1
+        # non-packed tuples stay on torch_ops. NP<=1 dense (G1-as-17)
+        # uses the generic 2LTD kernel.
+        if int(engine_kv_format) == _fmt_17:
+            packed = is_packed_two_plane(shape_desc)
+            n_planes = int(getattr(shape_desc, "num_planes", 0) or 0)
+            stride = int(getattr(shape_desc, "block_stride_elems", 0) or 0)
+            if (packed and not stride) or (not packed and n_planes > 1):
+                return python_ops_fallback.multi_layer_block_kv_transfer(
+                    paged_buffer_ptrs_tensor,
+                    lmcache_objects_ptrs,
+                    block_ids,
+                    device,
+                    direction,
+                    shape_desc,
+                    lmcache_chunk_size,
+                    engine_kv_format,
+                    skip_prefix_n_blocks,
+                )
         if int(engine_kv_format) in (_fmt_13, _fmt_16, _fmt_17):
             import torch
 
@@ -590,7 +636,7 @@ def _patch_ops():
     dop = getattr(sys.modules.get("lmcache"), "device_ops", None)
     if dop is not None:
         dop.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
-        dop.PageBufferShapeDesc = _NativeShapeDesc
+        dop.PageBufferShapeDesc = AscendPageBufferShapeDesc
         # bind_native may have run before this wrap; re-bind the CUDA plan
         # surface so hasattr(device_ops, "execute_object_group_transfer")
         # matches a CUDA build.

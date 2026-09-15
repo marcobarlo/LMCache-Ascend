@@ -17,6 +17,10 @@ import torch
 
 import lmcache.lmcache_native as native
 import lmcache_ascend.c_ops as lmc_ops
+from lmcache_ascend.v1.shape_desc import (
+    AscendPageBufferShapeDesc,
+    attach_tuple_planes,
+)
 
 requires_npu = pytest.mark.skipif(
     not (hasattr(torch, "npu") and torch.npu.is_available()),
@@ -42,8 +46,9 @@ def _shape_desc(
     hs: int,
     dtype: torch.dtype,
     block_stride_elems: int = 0,
+    plane_slot_bytes: tuple[int, ...] | None = None,
 ) -> object:
-    desc = native.PageBufferShapeDesc()
+    desc = AscendPageBufferShapeDesc()
     desc.kv_size = kv_size
     desc.nl = nl
     desc.nb = nb
@@ -53,6 +58,8 @@ def _shape_desc(
     desc.element_size = torch.empty((), dtype=dtype).element_size()
     desc.block_stride_elems = block_stride_elems
     desc.dtype = dtype
+    if plane_slot_bytes is not None:
+        attach_tuple_planes(desc, plane_slot_bytes)
     return desc
 
 
@@ -70,6 +77,7 @@ def _kg0_desc(*, nl: int, nb: int, bs: int) -> object:
         hs=130,
         dtype=torch.int8,
         block_stride_elems=_kg0_stride(bs),
+        plane_slot_bytes=(128, 2),
     )
 
 
@@ -448,9 +456,19 @@ def _build_roundtrip_engine(
         dtype = torch.bfloat16
         layers = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
         return dict(
-            # Serving classifies G1 as fmt 17; packed MLA is hs=130 int8 only.
+            # Serving classifies G1 as fmt 17; dense 32 B-aligned rows are
+            # not packed (latent+scale tail).
             fmt=KG0_FMT if layout == "nh_cs_fmt17" else NH_CS_FMT,
-            desc=_shape_desc(kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype),
+            desc=_shape_desc(
+                kv_size=1,
+                nl=nl,
+                nb=nb,
+                bs=bs,
+                nh=1,
+                hs=hs,
+                dtype=dtype,
+                plane_slot_bytes=(hs * 2,),
+            ),
             layers=layers,
             table=_pointer_table(layers, device),
             obj_dtype=dtype,
@@ -821,7 +839,8 @@ def test_torch_check_raises_python_exception() -> None:
 @requires_npu
 @pytest.mark.parametrize("direction_d2h", [True, False], ids=["d2h", "h2d"])
 def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
-    assert lmc_ops.PageBufferShapeDesc is native.PageBufferShapeDesc
+    assert lmc_ops.PageBufferShapeDesc is AscendPageBufferShapeDesc
+    assert issubclass(lmc_ops.PageBufferShapeDesc, native.PageBufferShapeDesc)
     device = torch.device("npu:0")
     nl, nb, bs, chunk = 2, 4, 32, 32
     desc17 = _kg0_desc(nl=nl, nb=nb, bs=bs)

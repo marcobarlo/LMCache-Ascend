@@ -50,13 +50,26 @@ struct PackedPlaneSpec {
 PackedPlaneSpec packed_planes(const PageBufferShapeDesc& shape_desc,
                               EngineKVFormat engine_kv_format) {
   PackedPlaneSpec spec;
-  // Fmt 17 is also dense one-head pages (NH_CS). Packed MLA is 128+2 only.
-  if (engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS &&
-      shape_desc.element_size == 1 && shape_desc.hs == 130) {
+  // Fmt 17 is any [NB, BS, 1, HS] page tuple (NP>=1). Packed two-plane
+  // (latent + thin scale) is a layout, not the format. Fail closed when
+  // plane_slot_bytes is unset — do not infer K/V from hs % 32.
+  if (engine_kv_format != EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS) {
+    return spec;
+  }
+  if (shape_desc.num_planes != 2) {
+    return spec;
+  }
+  const int32_t p0 = shape_desc.plane_slot_bytes[0];
+  const int32_t p1 = shape_desc.plane_slot_bytes[1];
+  const int32_t row = shape_desc.hs * shape_desc.element_size;
+  if (p0 > 0 && p0 % static_cast<int32_t>(kGmAlignBytes) == 0 && p1 > 0 &&
+      p1 < static_cast<int32_t>(kGmAlignBytes) &&
+      (static_cast<int64_t>(p1) * shape_desc.bs) % kGmAlignBytes == 0 &&
+      row == p0 + p1) {
     spec.packed = true;
-    spec.lmc_row_elems = 130;
-    spec.v_plane_elems = 2;
-    spec.k_plane_elems = 128;
+    spec.lmc_row_elems = row;
+    spec.k_plane_elems = p0;
+    spec.v_plane_elems = p1;
   }
   return spec;
 }
@@ -78,11 +91,11 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
                             int skip_prefix_n_blocks) {
   const bool separate =
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
-  const bool packed =
+  const bool fmt17 =
       engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
   const bool fused =
       engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS;
-  TORCH_CHECK(separate || packed || fused,
+  TORCH_CHECK(separate || fmt17 || fused,
               "LMCache-Ascend block-level MP transfer currently supports "
               "NL_X_TWO_X_NB_BS_NH_HS (16), NL_X_NP_X_NB_BS_ONE_HS (17), and "
               "NL_X_NB_BS_NH_CS (13), got ",
@@ -95,7 +108,8 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
                 "got ", shape_desc.kv_size);
   } else {
     TORCH_CHECK(shape_desc.kv_size == 1 || shape_desc.kv_size == 2,
-                "packed MLA requires kv_size 1 or 2, got ", shape_desc.kv_size);
+                "NL_X_NP_X_NB_BS_ONE_HS requires kv_size 1 or 2, got ",
+                shape_desc.kv_size);
   }
   TORCH_CHECK(skip_prefix_n_blocks >= 0, "skip_prefix_n_blocks must be >= 0, ",
               "got ", skip_prefix_n_blocks);
@@ -139,6 +153,11 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
                     spec.k_plane_elems % kGmAlignBytes == 0,
                 "packed latent width (", spec.k_plane_elems,
                 " bytes) must be a positive multiple of ", kGmAlignBytes);
+    TORCH_CHECK((static_cast<int64_t>(spec.v_plane_elems) * shape_desc.bs) %
+                        kGmAlignBytes == 0,
+                "packed scale plane (", spec.v_plane_elems, " B x ",
+                shape_desc.bs, " tokens) must be a multiple of ",
+                kGmAlignBytes);
     // The kernel stages a whole page as bs rows of AlignUp32(lmc_row) bytes.
     const int64_t ub_row_bytes = (spec.lmc_row_elems + 31) & ~31;
     const int64_t lmc_page_bytes =
@@ -352,12 +371,14 @@ void multi_layer_block_kv_transfer(
               "paged_buffer_ptrs_tensor must be one-dimensional");
   const PackedPlaneSpec spec =
       packed_planes(shape_desc, engine_kv_format);
+  const int32_t ptrs_per_layer =
+      shape_desc.num_planes > 0 ? shape_desc.num_planes : shape_desc.kv_size;
   const int64_t expected_ptrs =
-      static_cast<int64_t>(spec.packed ? 2 : shape_desc.kv_size) *
-      shape_desc.nl;
+      static_cast<int64_t>(ptrs_per_layer) * shape_desc.nl;
   TORCH_CHECK(paged_buffer_ptrs_tensor.numel() == expected_ptrs,
-              "paged_buffer_ptrs_tensor must contain kv_size * nl pointers: "
-              "expected ", expected_ptrs, ", got ",
+              "paged_buffer_ptrs_tensor must contain num_planes * nl "
+              "pointers (num_planes unset: kv_size * nl): expected ",
+              expected_ptrs, ", got ",
               paged_buffer_ptrs_tensor.numel());
   TORCH_CHECK(paged_buffer_ptrs_tensor.is_contiguous(),
               "paged_buffer_ptrs_tensor must be contiguous");

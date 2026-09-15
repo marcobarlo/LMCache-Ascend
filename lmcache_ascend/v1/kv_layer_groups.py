@@ -23,6 +23,7 @@ from lmcache_ascend.v1.kv_format import (
     _plane_block_size,
     _uses_packed_multi_plane_row,
 )
+from lmcache_ascend.v1.shape_desc import attach_tuple_planes
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -367,11 +368,16 @@ def build_kv_layer_groups(
             shape_desc.hs = _lmc_chunk_hidden_bytes(
                 plane_slot_bytes, physical_chunk_size
             )
+            attach_tuple_planes(shape_desc, plane_slot_bytes)
             multi_plane_hidden_bytes = tuple(plane_slot_bytes)
         elif isinstance(rep, (tuple, list)) and _is_shared_storage_blob(rep):
             rep_dtype = _get_primary_blob_view(rep).dtype
         elif isinstance(rep, (tuple, list)):
             rep_dtype = rep[0].dtype
+            if all(isinstance(t, torch.Tensor) and t.ndim >= 3 for t in rep):
+                attach_tuple_planes(
+                    shape_desc, _plane_slot_bytes(rep, is_310p=is_310p)
+                )
         else:
             rep_dtype = rep.dtype
         group_info = KVLayerGroupInfo(
