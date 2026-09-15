@@ -56,7 +56,9 @@ public:
         const int32_t nh, const int32_t hs, const int32_t block_stride_elems,
         const int32_t lmcache_chunk_size, const bool lmcache_to_engine,
         const int32_t k_plane_elems, const int32_t v_plane_elems,
-        const int32_t lmc_row_elems, const int32_t kv_size, AscendC::TPipe *pipe)
+        const int32_t lmc_row_elems, const int32_t kv_size,
+        const int32_t k_block_stride_bytes, const int32_t v_block_stride_bytes,
+        AscendC::TPipe *pipe)
     {
         paged_buffer_ptrs_ = paged_buffer_ptrs;
         lmcache_obj_ = lmcache_obj;
@@ -80,6 +82,15 @@ public:
         engine_block_stride_ = block_stride_elems > 0
             ? static_cast<int64_t>(block_stride_elems)
             : static_cast<int64_t>(bs) * scalars_per_token_;
+
+        const int64_t sharedPagedBlockBytes =
+            engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
+        k_block_stride_bytes_ = k_block_stride_bytes > 0
+            ? static_cast<int64_t>(k_block_stride_bytes)
+            : sharedPagedBlockBytes;
+        v_block_stride_bytes_ = v_block_stride_bytes > 0
+            ? static_cast<int64_t>(v_block_stride_bytes)
+            : sharedPagedBlockBytes;
 
         // Contiguous data extent per block (trailing padding is never moved).
         data_elems_per_block_ = static_cast<int64_t>(bs) * scalars_per_token_;
@@ -251,8 +262,6 @@ private:
             static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(kBytes)) / 32);
         const uint32_t scaleGapBlks =
             static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(vBytes)) / 32);
-        const int64_t pagedBlockBytes =
-            engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
 
         __gm__ uint8_t *latent_base =
             kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
@@ -261,10 +270,10 @@ private:
             kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
                 paged_buffer_ptrs_, layer_idx, 1);
         pagedTokenGlobalU8_.SetGlobalBuffer(
-            latent_base + engine_block_idx * pagedBlockBytes,
+            latent_base + engine_block_idx * k_block_stride_bytes_,
             static_cast<uint64_t>(nTok) * kBytes);
         scalePagedGlobalU8_.SetGlobalBuffer(
-            scale_base + engine_block_idx * pagedBlockBytes,
+            scale_base + engine_block_idx * v_block_stride_bytes_,
             static_cast<uint64_t>(nTok) * vBytes);
         lmcBufferGlobalU8_.SetGlobalBuffer(
             reinterpret_cast<__gm__ uint8_t *>(lmcache_obj_),
@@ -439,6 +448,8 @@ private:
 
     int64_t scalars_per_token_;
     int64_t engine_block_stride_;
+    int64_t k_block_stride_bytes_;
+    int64_t v_block_stride_bytes_;
     int64_t data_elems_per_block_;
     int32_t tokens_per_seg_;
 
@@ -460,14 +471,16 @@ private:
         const int32_t block_stride_elems, const int32_t lmcache_chunk_size,    \
         const bool lmcache_to_engine, const int32_t k_plane_elems,             \
         const int32_t v_plane_elems, const int32_t lmc_row_elems,              \
-        const int32_t kv_size)                                                 \
+        const int32_t kv_size, const int32_t k_block_stride_bytes,             \
+        const int32_t v_block_stride_bytes)                                    \
     {                                                                          \
         AscendC::TPipe pipe;                                                   \
         MultiLayerBlockTransfer<TYPE, SLOTTYPE> op{};                          \
         op.init(paged_buffer_ptrs, lmcache_obj, engine_block_ids,              \
                 num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,   \
                 block_stride_elems, lmcache_chunk_size, lmcache_to_engine,     \
-                k_plane_elems, v_plane_elems, lmc_row_elems, kv_size, &pipe);  \
+                k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,          \
+                k_block_stride_bytes, v_block_stride_bytes, &pipe);            \
         op.process();                                                          \
     }
 
@@ -489,7 +502,8 @@ void multi_layer_block_transfer_kernel(
     int32_t nl, int32_t bs, int32_t nh, int32_t hs,
     int32_t block_stride_elems, int32_t lmcache_chunk_size,
     bool lmcache_to_engine, int32_t k_plane_elems, int32_t v_plane_elems,
-    int32_t lmc_row_elems, int32_t kv_size)
+    int32_t lmc_row_elems, int32_t kv_size, int32_t k_block_stride_bytes,
+    int32_t v_block_stride_bytes)
 {
     switch (type) {
         case AscendType::FP16:
@@ -498,7 +512,8 @@ void multi_layer_block_transfer_kernel(
                     paged_buffer_ptrs, lmcache_obj, engine_block_ids,
                     num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
                     block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size);
+                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
+                    k_block_stride_bytes, v_block_stride_bytes);
             break;
         case AscendType::FP32:
             MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(float, int64_t)
@@ -506,7 +521,8 @@ void multi_layer_block_transfer_kernel(
                     paged_buffer_ptrs, lmcache_obj, engine_block_ids,
                     num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
                     block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size);
+                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
+                    k_block_stride_bytes, v_block_stride_bytes);
             break;
         case AscendType::INT8:
             MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(int8_t, int64_t)
@@ -514,7 +530,8 @@ void multi_layer_block_transfer_kernel(
                     paged_buffer_ptrs, lmcache_obj, engine_block_ids,
                     num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
                     block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size);
+                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
+                    k_block_stride_bytes, v_block_stride_bytes);
             break;
 #if (ASCEND_AICORE_ARCH >= 220)
         case AscendType::BF16:
@@ -523,7 +540,8 @@ void multi_layer_block_transfer_kernel(
                     paged_buffer_ptrs, lmcache_obj, engine_block_ids,
                     num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
                     block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size);
+                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
+                    k_block_stride_bytes, v_block_stride_bytes);
             break;
 #else
         case AscendType::BF16:
@@ -534,7 +552,8 @@ void multi_layer_block_transfer_kernel(
                     paged_buffer_ptrs, lmcache_obj, engine_block_ids,
                     num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
                     block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size);
+                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
+                    k_block_stride_bytes, v_block_stride_bytes);
             break;
 #endif
         default:

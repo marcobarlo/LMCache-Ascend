@@ -49,6 +49,8 @@ namespace kvcache_ops {
 //   v_plane_elems          packed scale plane width (0 = 2LTD)
 //   lmc_row_elems          packed LMC token row (0 = 2LTD)
 //   kv_size                pointer-table planes per layer (1 or 2)
+//   k_block_stride_bytes   packed latent dim-0 byte stride (0 = shared)
+//   v_block_stride_bytes   packed scale dim-0 byte stride (0 = shared)
 void multi_layer_block_transfer_kernel(
     AscendType type, uint32_t blockDim, void *stream,
     uint8_t *paged_buffer_ptrs, uint8_t *lmcache_obj, uint8_t *engine_block_ids,
@@ -56,7 +58,8 @@ void multi_layer_block_transfer_kernel(
     int32_t nl, int32_t bs, int32_t nh, int32_t hs,
     int32_t block_stride_elems, int32_t lmcache_chunk_size,
     bool lmcache_to_engine, int32_t k_plane_elems, int32_t v_plane_elems,
-    int32_t lmc_row_elems, int32_t kv_size);
+    int32_t lmc_row_elems, int32_t kv_size, int32_t k_block_stride_bytes,
+    int32_t v_block_stride_bytes);
 
 } // namespace kvcache_ops
 

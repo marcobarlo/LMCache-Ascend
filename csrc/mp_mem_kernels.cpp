@@ -166,6 +166,14 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
                 "packed LMC page bytes (", lmc_page_bytes,
                 ") must be a multiple of ", kGmAlignBytes,
                 "; otherwise adjacent pages share a 32 B line");
+    for (int i = 0; i < 2; ++i) {
+      const int32_t plane_stride = shape_desc.plane_block_stride_bytes[i];
+      if (plane_stride > 0) {
+        TORCH_CHECK(plane_stride % kGmAlignBytes == 0,
+                    "packed plane ", i, " block stride (", plane_stride,
+                    " bytes) must be a multiple of ", kGmAlignBytes);
+      }
+    }
     ub_token_bytes = static_cast<int64_t>(shape_desc.bs) * ub_row_bytes;
   } else {
     const int64_t token_bytes = static_cast<int64_t>(shape_desc.nh) *
@@ -344,7 +352,9 @@ void launch_block_transfer_objects(
         engine_block_ids, num_blocks_per_object, skip_prefix_n_blocks,
         shape_desc.nl, shape_desc.bs, shape_desc.nh, shape_desc.hs,
         shape_desc.block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-        spec.k_plane_elems, spec.v_plane_elems, spec.lmc_row_elems, kv_size);
+        spec.k_plane_elems, spec.v_plane_elems, spec.lmc_row_elems, kv_size,
+        shape_desc.plane_block_stride_bytes[0],
+        shape_desc.plane_block_stride_bytes[1]);
   }
 }
 

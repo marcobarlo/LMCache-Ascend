@@ -9,7 +9,9 @@ import torch
 import lmcache.lmcache_native as native
 from lmcache_ascend.v1.shape_desc import (
     AscendPageBufferShapeDesc,
+    attach_tuple_block_strides,
     attach_tuple_planes,
+    has_packed_engine_strides,
     is_packed_two_plane,
 )
 
@@ -32,7 +34,9 @@ def test_subclass_defaults_and_native_base() -> None:
     assert isinstance(desc, native.PageBufferShapeDesc)
     assert desc.num_planes == 0
     assert desc.plane_slot_bytes == ()
+    assert desc.plane_block_stride_bytes == ()
     assert not is_packed_two_plane(desc)
+    assert not has_packed_engine_strides(desc)
 
 
 def test_g0_128_plus_2_is_packed() -> None:
@@ -80,6 +84,15 @@ def test_plane_widths_side_channel_is_packed() -> None:
     desc.plane_widths = (128, 1)
     desc.plane_dtypes = (torch.int8, torch.float16)
     assert is_packed_two_plane(desc)
+
+
+def test_attach_unequal_block_strides_is_packed_native() -> None:
+    desc = _desc(hs=130, element_size=1)
+    attach_tuple_planes(desc, (128, 2))
+    attach_tuple_block_strides(desc, (4160, 96))
+    assert desc.plane_block_stride_bytes == (4160, 96)
+    assert is_packed_two_plane(desc)
+    assert has_packed_engine_strides(desc)
 
 
 def test_attach_rejects_more_than_four_planes() -> None:

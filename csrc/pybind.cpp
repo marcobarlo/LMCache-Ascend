@@ -87,6 +87,17 @@ PageBufferShapeDesc shape_desc_from_py(const py::object& shape_desc) {
       sd.num_planes = static_cast<int32_t>(widths.size());
     }
   }
+  if (py::hasattr(shape_desc, "plane_block_stride_bytes")) {
+    const py::object raw_s = shape_desc.attr("plane_block_stride_bytes");
+    if (!raw_s.is_none()) {
+      const auto strides = raw_s.cast<std::vector<int32_t>>();
+      TORCH_CHECK(strides.size() <= 4, "plane_block_stride_bytes length (",
+                  strides.size(), ") exceeds max 4");
+      for (size_t i = 0; i < strides.size(); ++i) {
+        sd.plane_block_stride_bytes[i] = strides[i];
+      }
+    }
+  }
   TORCH_CHECK(sd.num_planes >= 0 && sd.num_planes <= 4,
               "num_planes must be 0-4, got ", sd.num_planes);
   return sd;

@@ -26,6 +26,7 @@ class AscendPageBufferShapeDesc(lmcache_native.PageBufferShapeDesc):
         super().__init__()
         self.num_planes: int = 0
         self.plane_slot_bytes: tuple[int, ...] = ()
+        self.plane_block_stride_bytes: tuple[int, ...] = ()
 
 
 def plane_slot_bytes_of(desc: object) -> tuple[int, ...]:
@@ -89,6 +90,36 @@ def attach_tuple_planes(
         )
     desc.num_planes = len(slots)
     desc.plane_slot_bytes = slots
+
+
+def attach_tuple_block_strides(
+    desc: object,
+    plane_block_stride_bytes: Sequence[int],
+) -> None:
+    """Record per-block dim-0 byte strides on ``desc``.
+
+    ``plane_block_stride_bytes[i]`` is ``stride(0) * itemsize`` for plane
+    ``i``. Packed native uses plane 0/1; 0 means fall back to the shared
+    ``block_stride_elems``.
+    """
+    strides = tuple(int(b) for b in plane_block_stride_bytes)
+    if len(strides) > _MAX_PLANES:
+        raise ValueError(
+            "attach_tuple_block_strides: "
+            f"{len(strides)} planes exceeds max {_MAX_PLANES}"
+        )
+    desc.plane_block_stride_bytes = strides
+
+
+def has_packed_engine_strides(desc: object) -> bool:
+    """True when packed native can address engine pages.
+
+    Shared ``block_stride_elems`` or both packed-plane byte strides.
+    """
+    if int(getattr(desc, "block_stride_elems", 0) or 0) > 0:
+        return True
+    strides = tuple(getattr(desc, "plane_block_stride_bytes", ()) or ())
+    return len(strides) >= 2 and int(strides[0]) > 0 and int(strides[1]) > 0
 
 
 def attach_tuple_planes_from_shape_desc(desc: object) -> None:

@@ -171,6 +171,7 @@ def test_kg0_int8_fp16_tuple_attaches_plane_slot_bytes() -> None:
     g = mgr.kv_layer_groups[0]
     assert g.shape_desc.num_planes == 2
     assert g.shape_desc.plane_slot_bytes == (128, 2)
+    assert g.shape_desc.plane_block_stride_bytes == (4096, 64)
 
 
 def test_dsa_c8_4tuple_classified_as_attention_with_mixed_dtypes():

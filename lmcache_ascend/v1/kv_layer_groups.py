@@ -23,7 +23,10 @@ from lmcache_ascend.v1.kv_format import (
     _plane_block_size,
     _uses_packed_multi_plane_row,
 )
-from lmcache_ascend.v1.shape_desc import attach_tuple_planes
+from lmcache_ascend.v1.shape_desc import (
+    attach_tuple_block_strides,
+    attach_tuple_planes,
+)
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
@@ -64,6 +67,13 @@ def _plane_slot_bytes(
             continue
         out.append(int(t.numel() * t.element_size()) // slots)
     return out
+
+
+def _plane_block_stride_bytes(
+    kv_cache: Sequence[torch.Tensor],
+) -> list[int]:
+    """Return per-plane dim-0 byte stride (``stride(0) * itemsize``)."""
+    return [int(t.stride(0)) * int(t.element_size()) for t in kv_cache]
 
 
 def _lmc_chunk_hidden_bytes(plane_slot_bytes: Sequence[int], num_tokens: int) -> int:
@@ -369,6 +379,7 @@ def build_kv_layer_groups(
                 plane_slot_bytes, physical_chunk_size
             )
             attach_tuple_planes(shape_desc, plane_slot_bytes)
+            attach_tuple_block_strides(shape_desc, _plane_block_stride_bytes(rep))
             multi_plane_hidden_bytes = tuple(plane_slot_bytes)
         elif isinstance(rep, (tuple, list)) and _is_shared_storage_blob(rep):
             rep_dtype = _get_primary_blob_view(rep).dtype
@@ -377,6 +388,9 @@ def build_kv_layer_groups(
             if all(isinstance(t, torch.Tensor) and t.ndim >= 3 for t in rep):
                 attach_tuple_planes(
                     shape_desc, _plane_slot_bytes(rep, is_310p=is_310p)
+                )
+                attach_tuple_block_strides(
+                    shape_desc, _plane_block_stride_bytes(rep)
                 )
         else:
             rep_dtype = rep.dtype

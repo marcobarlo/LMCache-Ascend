@@ -95,6 +95,9 @@ struct PageBufferShapeDesc {
   // from hs % 32). plane_slot_bytes[i] is payload bytes per token.
   int32_t num_planes = 0;
   int32_t plane_slot_bytes[4] = {0, 0, 0, 0};
+  // Per-block dim-0 step in bytes (stride(0) * itemsize). Packed kernel
+  // uses [0]/[1]; 0 falls back to block_stride_elems * element_size.
+  int32_t plane_block_stride_bytes[4] = {0, 0, 0, 0};
 
   template <typename ScalarType>
   inline size_t scalars_per_head() const {

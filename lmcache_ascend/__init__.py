@@ -523,6 +523,7 @@ def _patch_ops():
     # so bind_native cannot pin the C++ struct (no dtype / plane fields).
     from lmcache_ascend.v1.shape_desc import (
         AscendPageBufferShapeDesc,
+        has_packed_engine_strides,
         is_packed_two_plane,
     )
 
@@ -583,15 +584,16 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
-        # Fmt 17: packed 2-plane thin-scale on a shared padded pool is
-        # native. Independently allocated 2-plane (stride 0) and NP>1
+        # Fmt 17: packed 2-plane thin-scale is native when a shared pool
+        # stride or both per-plane block byte strides are set. NP>1
         # non-packed tuples stay on torch_ops. NP<=1 dense (G1-as-17)
         # uses the generic 2LTD kernel.
         if int(engine_kv_format) == _fmt_17:
             packed = is_packed_two_plane(shape_desc)
             n_planes = int(getattr(shape_desc, "num_planes", 0) or 0)
-            stride = int(getattr(shape_desc, "block_stride_elems", 0) or 0)
-            if (packed and not stride) or (not packed and n_planes > 1):
+            if (packed and not has_packed_engine_strides(shape_desc)) or (
+                not packed and n_planes > 1
+            ):
                 return python_ops_fallback.multi_layer_block_kv_transfer(
                     paged_buffer_ptrs_tensor,
                     lmcache_objects_ptrs,

@@ -19,6 +19,7 @@ import lmcache.lmcache_native as native
 import lmcache_ascend.c_ops as lmc_ops
 from lmcache_ascend.v1.shape_desc import (
     AscendPageBufferShapeDesc,
+    attach_tuple_block_strides,
     attach_tuple_planes,
 )
 
@@ -47,6 +48,7 @@ def _shape_desc(
     dtype: torch.dtype,
     block_stride_elems: int = 0,
     plane_slot_bytes: tuple[int, ...] | None = None,
+    plane_block_stride_bytes: tuple[int, ...] | None = None,
 ) -> object:
     desc = AscendPageBufferShapeDesc()
     desc.kv_size = kv_size
@@ -60,6 +62,8 @@ def _shape_desc(
     desc.dtype = dtype
     if plane_slot_bytes is not None:
         attach_tuple_planes(desc, plane_slot_bytes)
+    if plane_block_stride_bytes is not None:
+        attach_tuple_block_strides(desc, plane_block_stride_bytes)
     return desc
 
 
@@ -78,6 +82,7 @@ def _kg0_desc(*, nl: int, nb: int, bs: int) -> object:
         dtype=torch.int8,
         block_stride_elems=_kg0_stride(bs),
         plane_slot_bytes=(128, 2),
+        plane_block_stride_bytes=(_kg0_stride(bs), _kg0_stride(bs)),
     )
 
 
@@ -105,6 +110,50 @@ def _kg0_layers(
         pools.append(pool)
         layers.append((latent, scale))
     return pools, layers
+
+
+def _kg0_independent_layers(
+    *, nl: int, nb: int, bs: int, device: torch.device
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """G0-shaped planes on separate pools with unequal dim-0 padding."""
+    latent_w = 128
+    k_row = bs * latent_w + 64
+    v_row = bs * 2 + 32
+    layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_i in range(nl):
+        k_pool = torch.zeros(nb, k_row, dtype=torch.uint8, device=device)
+        v_pool = torch.zeros(nb, v_row, dtype=torch.uint8, device=device)
+        latent = k_pool[:, : bs * latent_w].view(nb, bs, latent_w)
+        scale = v_pool[:, : bs * 2].view(torch.float16).view(nb, bs, 1)
+        latent.copy_(
+            (torch.arange(nb * bs * latent_w, device=device, dtype=torch.int32) % 251)
+            .to(torch.uint8)
+            .view(nb, bs, latent_w)
+            + layer_i
+        )
+        scale.copy_(
+            torch.arange(nb * bs, device=device, dtype=torch.float16).view(nb, bs, 1)
+            + layer_i
+        )
+        layers.append((latent, scale))
+    return layers
+
+
+def _kg0_independent_desc(*, nl: int, nb: int, bs: int) -> object:
+    k_row = bs * 128 + 64
+    v_row = bs * 2 + 32
+    return _shape_desc(
+        kv_size=1,
+        nl=nl,
+        nb=nb,
+        bs=bs,
+        nh=1,
+        hs=130,
+        dtype=torch.int8,
+        block_stride_elems=0,
+        plane_slot_bytes=(128, 2),
+        plane_block_stride_bytes=(k_row, v_row),
+    )
 
 
 def _kg0_packed_object(
@@ -476,6 +525,20 @@ def _build_roundtrip_engine(
             kv_leading=False,
             bs=bs,
         )
+    if layout == "kg0_indep":
+        nb = nb or 32
+        bs = 32
+        layers = _kg0_independent_layers(nl=nl, nb=nb, bs=bs, device=device)
+        return dict(
+            fmt=KG0_FMT,
+            desc=_kg0_independent_desc(nl=nl, nb=nb, bs=bs),
+            layers=layers,
+            table=_pointer_table(layers, device),
+            obj_dtype=torch.uint8,
+            obj_tail=(nl, 130),
+            kv_leading=False,
+            bs=bs,
+        )
     nb = nb or 32
     bs = {"kg0_bs16": 16, "kg0_bs64": 64}.get(layout, 32)
     _pools, layers = _kg0_layers(nl=nl, nb=nb, bs=bs, device=device)
@@ -529,6 +592,11 @@ def _roundtrip_cases() -> list[Any]:
     cases.append(
         pytest.param(
             "nh_cs_fmt17", "npu", False, 0, 2, 1, [0], id="nh_cs-fmt17"
+        )
+    )
+    cases.append(
+        pytest.param(
+            "kg0_indep", "npu", False, 0, 2, 1, [0], id="kg0-indep-mini"
         )
     )
     # Packed MLA page width (bs) and chunk = n_blocks * bs.
