@@ -16,7 +16,6 @@ import pytest
 import torch
 
 import lmcache.lmcache_native as native
-from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
 import lmcache_ascend.c_ops as lmc_ops
 from lmcache_ascend.v1.shape_desc import (
     attach_tuple_block_strides,
@@ -50,7 +49,7 @@ def _shape_desc(
     plane_slot_bytes: tuple[int, ...] | None = None,
     plane_block_stride_bytes: tuple[int, ...] | None = None,
 ) -> object:
-    desc = NpuPageBufferShapeDesc()
+    desc = lmc_ops.PageBufferShapeDesc()
     desc.kv_size = kv_size
     desc.nl = nl
     desc.nb = nb

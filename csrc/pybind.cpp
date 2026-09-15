@@ -12,6 +12,7 @@
 #include "pos_kernels.h"
 #include <cstdint>
 #include <iostream>
+#include <string>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/csrc/autograd/python_variable.h>
@@ -30,78 +31,32 @@ std::vector<torch::Tensor> normalize_kv_caches(const py::object &input) {
   }
 }
 
-// Duck-type lmcache_native.PageBufferShapeDesc (or the Ascend Python
-// subclass). Do not py::isinstance the local C++ struct.
-PageBufferShapeDesc shape_desc_from_py(const py::object& shape_desc) {
-  PageBufferShapeDesc sd{};
-  sd.kv_size = shape_desc.attr("kv_size").cast<int>();
-  sd.nl = shape_desc.attr("nl").cast<int>();
-  sd.nb = shape_desc.attr("nb").cast<int>();
-  sd.bs = shape_desc.attr("bs").cast<int>();
-  sd.nh = shape_desc.attr("nh").cast<int>();
-  sd.hs = shape_desc.attr("hs").cast<int>();
-  sd.element_size = shape_desc.attr("element_size").cast<int>();
-  sd.block_stride_elems = shape_desc.attr("block_stride_elems").cast<int>();
-  sd.num_planes = 0;
-  if (py::hasattr(shape_desc, "num_planes")) {
-    sd.num_planes = shape_desc.attr("num_planes").cast<int>();
+namespace {
+constexpr size_t kMaxPlanes = 4;
+
+py::tuple plane_array_get(const int32_t* arr, int32_t n) {
+  if (n <= 0) {
+    return py::tuple();
   }
-  if (py::hasattr(shape_desc, "plane_slot_bytes")) {
-    const py::object raw = shape_desc.attr("plane_slot_bytes");
-    if (!raw.is_none()) {
-      const auto slots = raw.cast<std::vector<int32_t>>();
-      TORCH_CHECK(slots.size() <= 4, "plane_slot_bytes length (", slots.size(),
-                  ") exceeds max 4");
-      for (size_t i = 0; i < slots.size(); ++i) {
-        sd.plane_slot_bytes[i] = slots[i];
-      }
-      if (sd.num_planes == 0) {
-        sd.num_planes = static_cast<int32_t>(slots.size());
-      }
-    }
+  const size_t len =
+      static_cast<size_t>(n) < kMaxPlanes ? static_cast<size_t>(n) : kMaxPlanes;
+  py::tuple out(len);
+  for (size_t i = 0; i < len; ++i) {
+    out[i] = arr[i];
   }
-  // MP make_page_buffer_shape_desc sets plane_widths / plane_dtypes for
-  // fmt 17 but not plane_slot_bytes. Derive bytes so packed G0 does not
-  // fail-close on the generic 2LTD path.
-  if (sd.num_planes == 0 && py::hasattr(shape_desc, "plane_widths")) {
-    const py::object raw_w = shape_desc.attr("plane_widths");
-    if (!raw_w.is_none()) {
-      const auto widths = raw_w.cast<std::vector<int32_t>>();
-      TORCH_CHECK(widths.size() <= 4, "plane_widths length (", widths.size(),
-                  ") exceeds max 4");
-      std::vector<int32_t> itemsizes(widths.size(), sd.element_size);
-      if (py::hasattr(shape_desc, "plane_dtypes")) {
-        const py::object raw_dt = shape_desc.attr("plane_dtypes");
-        if (!raw_dt.is_none()) {
-          const py::sequence dts = raw_dt.cast<py::sequence>();
-          const size_t n =
-              widths.size() < dts.size() ? widths.size() : dts.size();
-          for (size_t i = 0; i < n; ++i) {
-            itemsizes[i] = dts[i].attr("itemsize").cast<int32_t>();
-          }
-        }
-      }
-      for (size_t i = 0; i < widths.size(); ++i) {
-        sd.plane_slot_bytes[i] = widths[i] * itemsizes[i];
-      }
-      sd.num_planes = static_cast<int32_t>(widths.size());
-    }
-  }
-  if (py::hasattr(shape_desc, "plane_block_stride_bytes")) {
-    const py::object raw_s = shape_desc.attr("plane_block_stride_bytes");
-    if (!raw_s.is_none()) {
-      const auto strides = raw_s.cast<std::vector<int32_t>>();
-      TORCH_CHECK(strides.size() <= 4, "plane_block_stride_bytes length (",
-                  strides.size(), ") exceeds max 4");
-      for (size_t i = 0; i < strides.size(); ++i) {
-        sd.plane_block_stride_bytes[i] = strides[i];
-      }
-    }
-  }
-  TORCH_CHECK(sd.num_planes >= 0 && sd.num_planes <= 4,
-              "num_planes must be 0-4, got ", sd.num_planes);
-  return sd;
+  return out;
 }
+
+void plane_array_set(int32_t* arr, const std::vector<int32_t>& v,
+                     const char* name) {
+  if (v.size() > kMaxPlanes) {
+    throw py::value_error(std::string(name) + " length exceeds max 4");
+  }
+  for (size_t i = 0; i < kMaxPlanes; ++i) {
+    arr[i] = i < v.size() ? v[i] : 0;
+  }
+}
+}  // namespace
 
 void single_layer_kv_transfer_wrapper(torch::Tensor &lmc_key_value_cache,
                                       const py::object &vllm_kv_caches_obj,
@@ -239,8 +194,10 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("is_kv_second_tuple",
         [](EngineKVFormat f) { return is_kv_second_tuple(f); },
         py::arg("engine_kv_format"));
-  // dynamic_attr: MP stores torch dtype as a Python-only side channel
-  // (make_page_buffer_shape_desc). Same flag as lmcache_native.
+  // Factory constructs this class via device_ops.PageBufferShapeDesc()
+  // after NpuDeviceOps.bind_native. Kernels take it by value (same as CUDA
+  // + lmcache_native). dynamic_attr keeps torch dtype / plane_widths for
+  // the Python torch_ops fallback.
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc",
                                   py::module_local(), py::dynamic_attr())
       .def(py::init<>())
@@ -252,29 +209,42 @@ PYBIND11_MODULE(c_ops, m) {
       .def_readwrite("hs", &PageBufferShapeDesc::hs)
       .def_readwrite("element_size", &PageBufferShapeDesc::element_size)
       .def_readwrite("block_stride_elems",
-                     &PageBufferShapeDesc::block_stride_elems);
+                     &PageBufferShapeDesc::block_stride_elems)
+      .def_readwrite("num_planes", &PageBufferShapeDesc::num_planes)
+      .def_property(
+          "plane_slot_bytes",
+          [](const PageBufferShapeDesc& s) {
+            return plane_array_get(s.plane_slot_bytes, s.num_planes);
+          },
+          [](PageBufferShapeDesc& s, const std::vector<int32_t>& v) {
+            plane_array_set(s.plane_slot_bytes, v, "plane_slot_bytes");
+          })
+      .def_property(
+          "plane_block_stride_bytes",
+          [](const PageBufferShapeDesc& s) {
+            return plane_array_get(s.plane_block_stride_bytes, s.num_planes);
+          },
+          [](PageBufferShapeDesc& s, const std::vector<int32_t>& v) {
+            plane_array_set(s.plane_block_stride_bytes, v,
+                            "plane_block_stride_bytes");
+          });
   m.def(
       "multi_layer_block_kv_transfer",
       [](const torch::Tensor& paged_buffer_ptrs_tensor,
          std::vector<int64_t> lmcache_objects_ptrs,
          const torch::Tensor& block_ids, const torch::Device& device,
-         const py::object& direction, const py::object& shape_desc,
+         const py::object& direction, PageBufferShapeDesc shape_desc,
          int lmcache_chunk_size, const py::object& engine_kv_format,
          int skip_prefix_n_blocks) {
         const auto dir = static_cast<TransferDirection>(
             py::int_(direction).cast<int>());
         const auto fmt = static_cast<EngineKVFormat>(
             py::int_(engine_kv_format).cast<int>());
-        // Duck-type attrs. Do not isinstance-check the local C++
-        // PageBufferShapeDesc: MP passes lmcache_native's class (different
-        // module, not module_local). Cross-module isinstance SIGSEGVs on
-        // AffinityThreadPool workers.
-        const PageBufferShapeDesc sd = shape_desc_from_py(shape_desc);
         // Keep the GIL through TORCH_CHECK so failures surface as Python
         // exceptions instead of aborting the lmcache server.
         multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs),
-            block_ids, device, dir, sd, lmcache_chunk_size, fmt,
+            block_ids, device, dir, shape_desc, lmcache_chunk_size, fmt,
             skip_prefix_n_blocks);
       },
       py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
@@ -307,16 +277,13 @@ PYBIND11_MODULE(c_ops, m) {
   py::class_<KernelGroupSpec>(m, "KernelGroupSpec", py::module_local())
       .def(py::init([](uintptr_t paged_buffer_ptrs,
                        std::vector<int64_t> lmcache_objects_ptrs,
-                       const py::object& shape_desc, int lmcache_chunk_size,
+                       PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
                        int engine_kv_format, uintptr_t block_ids_base,
                        int64_t block_ids_capacity) {
-             // Duck-type lmcache_native.PageBufferShapeDesc. Do not
-             // py::isinstance the local C++ struct (cross-module SIGSEGV).
-             PageBufferShapeDesc sd = shape_desc_from_py(shape_desc);
              return KernelGroupSpec{
                  paged_buffer_ptrs,
                  std::move(lmcache_objects_ptrs),
-                 sd,
+                 std::move(shape_desc),
                  lmcache_chunk_size,
                  static_cast<EngineKVFormat>(engine_kv_format),
                  block_ids_base,

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NpuPageBufferShapeDesc plane-slot contract (no NPU)."""
+"""Plugin PageBufferShapeDesc plane-slot contract (no NPU device)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
+import lmcache_ascend.c_ops as lmc_ops
 from lmcache_ascend.v1.shape_desc import (
     attach_tuple_block_strides,
     attach_tuple_planes,
@@ -15,8 +15,8 @@ from lmcache_ascend.v1.shape_desc import (
 )
 
 
-def _desc(*, hs: int, element_size: int, bs: int = 32) -> NpuPageBufferShapeDesc:
-    desc = NpuPageBufferShapeDesc()
+def _desc(*, hs: int, element_size: int, bs: int = 32) -> object:
+    desc = lmc_ops.PageBufferShapeDesc()
     desc.kv_size = 1
     desc.nl = 1
     desc.nb = 4
@@ -29,7 +29,7 @@ def _desc(*, hs: int, element_size: int, bs: int = 32) -> NpuPageBufferShapeDesc
 
 
 def test_unset_planes_are_not_packed() -> None:
-    desc = NpuPageBufferShapeDesc()
+    desc = lmc_ops.PageBufferShapeDesc()
     desc.hs = 130
     desc.element_size = 1
     desc.bs = 32
@@ -98,6 +98,6 @@ def test_attach_unequal_block_strides_is_packed_native() -> None:
 
 
 def test_attach_rejects_more_than_four_planes() -> None:
-    desc = NpuPageBufferShapeDesc()
+    desc = lmc_ops.PageBufferShapeDesc()
     with pytest.raises(ValueError, match="exceeds max"):
         attach_tuple_planes(desc, (1, 2, 3, 4, 5))

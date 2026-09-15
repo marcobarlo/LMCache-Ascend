@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend helpers for fmt-17 extras on NpuPageBufferShapeDesc.
+"""Ascend helpers for fmt-17 extras on the plugin PageBufferShapeDesc.
 
-CUDA's compiled struct is unchanged. This module classifies and attaches
-plane extras; Ascend pybind duck-types the same attributes off py::object.
+CUDA's compiled struct is unchanged. After bind_native, factory/grouping
+construct ``device_ops.PageBufferShapeDesc()`` (``c_ops``). NPU kernels
+take that class by value.
 """
 
 from __future__ import annotations
