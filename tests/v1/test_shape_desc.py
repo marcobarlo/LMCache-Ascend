@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AscendPageBufferShapeDesc plane-slot contract (no NPU)."""
+"""NpuPageBufferShapeDesc plane-slot contract (no NPU)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-import lmcache.lmcache_native as native
+from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
 from lmcache_ascend.v1.shape_desc import (
-    AscendPageBufferShapeDesc,
     attach_tuple_block_strides,
     attach_tuple_planes,
     has_packed_engine_strides,
@@ -16,8 +15,8 @@ from lmcache_ascend.v1.shape_desc import (
 )
 
 
-def _desc(*, hs: int, element_size: int, bs: int = 32) -> AscendPageBufferShapeDesc:
-    desc = AscendPageBufferShapeDesc()
+def _desc(*, hs: int, element_size: int, bs: int = 32) -> NpuPageBufferShapeDesc:
+    desc = NpuPageBufferShapeDesc()
     desc.kv_size = 1
     desc.nl = 1
     desc.nb = 4
@@ -29,9 +28,12 @@ def _desc(*, hs: int, element_size: int, bs: int = 32) -> AscendPageBufferShapeD
     return desc
 
 
-def test_subclass_defaults_and_native_base() -> None:
-    desc = AscendPageBufferShapeDesc()
-    assert isinstance(desc, native.PageBufferShapeDesc)
+def test_unset_planes_are_not_packed() -> None:
+    desc = NpuPageBufferShapeDesc()
+    desc.hs = 130
+    desc.element_size = 1
+    desc.bs = 32
+    desc.block_stride_elems = 0
     assert desc.num_planes == 0
     assert desc.plane_slot_bytes == ()
     assert desc.plane_block_stride_bytes == ()
@@ -96,6 +98,6 @@ def test_attach_unequal_block_strides_is_packed_native() -> None:
 
 
 def test_attach_rejects_more_than_four_planes() -> None:
-    desc = AscendPageBufferShapeDesc()
+    desc = NpuPageBufferShapeDesc()
     with pytest.raises(ValueError, match="exceeds max"):
         attach_tuple_planes(desc, (1, 2, 3, 4, 5))

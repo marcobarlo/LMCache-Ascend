@@ -5,6 +5,7 @@ import contextlib
 import threading
 
 # Third Party
+from lmcache import device_ops
 from lmcache.integration.vllm.utils import ENGINE_NAME
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
@@ -1383,7 +1384,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         assert caches is not None
         entry = caches[0]
         k_cache = entry[0]
-        shape_desc = lmc_ops.PageBufferShapeDesc()
+        shape_desc = device_ops.PageBufferShapeDesc()
         shape_desc.nb = int(k_cache.shape[0])
         shape_desc.bs = int(k_cache.shape[1])
         shape_desc.block_stride_elems = 0

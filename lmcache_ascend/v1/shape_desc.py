@@ -1,32 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend-only ``PageBufferShapeDesc`` fields for fmt-17 tuple planes.
+"""Ascend helpers for fmt-17 extras on NpuPageBufferShapeDesc.
 
-CUDA's native struct is unchanged. These attributes live on a Python
-subclass of ``lmcache_native.PageBufferShapeDesc`` (``dynamic_attr``);
-Ascend's pybind duck-types them off a generic ``py::object``.
+CUDA's compiled struct is unchanged. This module classifies and attaches
+plane extras; Ascend pybind duck-types the same attributes off py::object.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-import lmcache.lmcache_native as lmcache_native
-
 _MAX_PLANES = 4
-
-
-class AscendPageBufferShapeDesc(lmcache_native.PageBufferShapeDesc):
-    """Native shape desc plus per-plane slot widths for the packed-MLA path.
-
-    ``num_planes == 0`` and empty ``plane_slot_bytes`` mean "unset": the
-    Ascend host must not infer packed K/V from ``hs % 32``.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.num_planes: int = 0
-        self.plane_slot_bytes: tuple[int, ...] = ()
-        self.plane_block_stride_bytes: tuple[int, ...] = ()
 
 
 def plane_slot_bytes_of(desc: object) -> tuple[int, ...]:
@@ -120,12 +103,3 @@ def has_packed_engine_strides(desc: object) -> bool:
         return True
     strides = tuple(getattr(desc, "plane_block_stride_bytes", ()) or ())
     return len(strides) >= 2 and int(strides[0]) > 0 and int(strides[1]) > 0
-
-
-def attach_tuple_planes_from_shape_desc(desc: object) -> None:
-    """Fill ``num_planes`` / ``plane_slot_bytes`` from fmt-17 plane side channels."""
-    if int(getattr(desc, "num_planes", 0) or 0) > 0:
-        return
-    slots = plane_slot_bytes_of(desc)
-    if slots:
-        attach_tuple_planes(desc, slots)

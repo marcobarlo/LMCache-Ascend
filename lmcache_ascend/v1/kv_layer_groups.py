@@ -8,6 +8,7 @@ from collections import defaultdict
 from typing import Any, NamedTuple, Optional, Sequence, Union
 
 # Third Party
+from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.v1.kv_layer_groups import (
     KVLayerGroupInfo,
@@ -27,7 +28,6 @@ from lmcache_ascend.v1.shape_desc import (
     attach_tuple_block_strides,
     attach_tuple_planes,
 )
-import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -319,7 +319,7 @@ def build_kv_layer_groups(
         indices = groups_dict[key]
         rep = kv_caches[indices[0]]
 
-        shape_desc = lmc_ops.PageBufferShapeDesc()
+        shape_desc = device_ops.PageBufferShapeDesc()
         shape_desc.kv_size = kv_size
         shape_desc.nl = len(indices)
         shape_desc.nb = num_blocks

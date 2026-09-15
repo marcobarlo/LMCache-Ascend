@@ -16,9 +16,9 @@ import pytest
 import torch
 
 import lmcache.lmcache_native as native
+from lmcache.v1.platform.npu.shape_desc import NpuPageBufferShapeDesc
 import lmcache_ascend.c_ops as lmc_ops
 from lmcache_ascend.v1.shape_desc import (
-    AscendPageBufferShapeDesc,
     attach_tuple_block_strides,
     attach_tuple_planes,
 )
@@ -50,7 +50,7 @@ def _shape_desc(
     plane_slot_bytes: tuple[int, ...] | None = None,
     plane_block_stride_bytes: tuple[int, ...] | None = None,
 ) -> object:
-    desc = AscendPageBufferShapeDesc()
+    desc = NpuPageBufferShapeDesc()
     desc.kv_size = kv_size
     desc.nl = nl
     desc.nb = nb
@@ -907,8 +907,6 @@ def test_torch_check_raises_python_exception() -> None:
 @requires_npu
 @pytest.mark.parametrize("direction_d2h", [True, False], ids=["d2h", "h2d"])
 def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
-    assert lmc_ops.PageBufferShapeDesc is AscendPageBufferShapeDesc
-    assert issubclass(lmc_ops.PageBufferShapeDesc, native.PageBufferShapeDesc)
     device = torch.device("npu:0")
     nl, nb, bs, chunk = 2, 4, 32, 32
     desc17 = _kg0_desc(nl=nl, nb=nb, bs=bs)
