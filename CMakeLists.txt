@@ -38,6 +38,7 @@ endif()
 file(COPY
   ${CMAKE_CURRENT_SOURCE_DIR}/new_kernels/multi_layer_block_mem_kernels.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/new_kernels/multi_layer_block_mem_kernels.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/new_kernels/block_transfer_layout.h
   DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/kvcache-ops/kernels/multi_layer)
 
 add_subdirectory(third_party/kvcache-ops)

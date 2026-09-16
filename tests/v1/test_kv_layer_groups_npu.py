@@ -31,7 +31,6 @@ from lmcache_ascend.v1.kv_layer_groups import (
     build_kv_layer_groups,
 )
 from lmcache_ascend.v1.npu_connector.npu_connectors import _derive_group_params
-from lmcache_ascend.v1.shape_desc import is_packed_two_plane
 import lmcache_ascend  # noqa: F401  — applies get_shapes patch
 
 
@@ -129,7 +128,6 @@ def test_mla_2tuple_classified_as_attention_not_gdn():
     assert g.physical_chunk_size == 256
     assert g.shape_desc.num_planes == 2
     assert g.shape_desc.plane_slot_bytes == (1024, 128)
-    assert not is_packed_two_plane(g.shape_desc)
 
 
 def test_dsa_3tuple_classified_as_attention():
@@ -152,7 +150,6 @@ def test_dsa_3tuple_classified_as_attention():
     assert g.compress_ratio == 1
     assert g.physical_chunk_size == 256
     assert g.shape_desc.num_planes == 3
-    assert not is_packed_two_plane(g.shape_desc)
 
 
 def test_kg0_int8_fp16_tuple_attaches_plane_slot_bytes() -> None:
@@ -418,7 +415,6 @@ def test_block_stride_elems_inferred_from_dim0_stride():
 def test_upstream_init_with_engine_kv_format():
     """Upstream manager accepts ``EngineKVFormat`` directly (MP / V3 path)."""
     # Third Party
-    import lmcache.c_ops as lmc_ops
     import lmcache.c_ops as lmc_ops
 
     if not hasattr(lmc_ops, "EngineKVFormat"):

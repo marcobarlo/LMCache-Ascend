@@ -518,13 +518,12 @@ def _patch_ops():
 
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
-    # Block kernel: 16 equal K/V, 17 packed MLA (KG0), 13 fused NH_CS.
-    # Annotation has no Tensor so MP stays in ptr mode.
-    from lmcache_ascend.v1.shape_desc import (
-        has_packed_engine_strides,
-        is_packed_two_plane,
-        plane_slot_bytes_of,
-    )
+    # Block kernel: 16 separate K/V, 17 packed multi-plane (MLA/DSA/DSv4),
+    # 13 fused NH_CS. Annotation has no Tensor so MP stays in ptr mode.
+    # The host prepare_group/validate_launch pair is the SINGLE authority on
+    # which geometries launch natively: this wrapper only does
+    # tensor/descriptor conversion and lifetime management — no narrow-tail
+    # admission checks here.
     _native_block = ascend_c_ops.multi_layer_block_kv_transfer
     _fmt_13 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_BS_NH_CS)
     _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
@@ -555,29 +554,6 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
-        # Fmt 17: packed 2-plane thin-scale is native when a shared pool
-        # stride or both per-plane block byte strides are set. NP>1
-        # non-packed tuples stay on torch_ops. NP<=1 dense (G1-as-17)
-        # uses the generic 2LTD kernel.
-        if int(engine_kv_format) == _fmt_17:
-            packed = is_packed_two_plane(shape_desc)
-            n_planes = int(getattr(shape_desc, "num_planes", 0) or 0) or len(
-                plane_slot_bytes_of(shape_desc)
-            )
-            if (packed and not has_packed_engine_strides(shape_desc)) or (
-                not packed and n_planes > 1
-            ):
-                return python_ops_fallback.multi_layer_block_kv_transfer(
-                    paged_buffer_ptrs_tensor,
-                    lmcache_objects_ptrs,
-                    block_ids,
-                    device,
-                    direction,
-                    shape_desc,
-                    lmcache_chunk_size,
-                    engine_kv_format,
-                    skip_prefix_n_blocks,
-                )
         if int(engine_kv_format) in (_fmt_13, _fmt_16, _fmt_17):
             import torch
 

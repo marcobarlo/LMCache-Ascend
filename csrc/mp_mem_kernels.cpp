@@ -12,83 +12,78 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 namespace {
 
 // DataCopy granularity on the GM side: segment base addresses and segment
 // byte lengths must both be multiples of 32B.
 constexpr int64_t kGmAlignBytes = 32;
-// UB budget assumed by the device kernel: the depth-2 queue must fit two
-// token segments, so a single token's bytes may not exceed half of it.
-constexpr int64_t kUbBudgetBytes = 128 * 1024;
+// Single UB segment budget: the total UB budget is split across the queue
+// slots (one in-flight segment per slot).
+constexpr int64_t kUbSegmentBytes = kvcache_ops::kBlockTransferUbBytes /
+                                    kvcache_ops::kBlockTransferQueueDepth;
+// DataCopyPad GM-side gap fields are uint32.
+constexpr int64_t kCopyGmGapMax =
+    static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
 
-// The kernel is a pure byte mover, so fp16 and bf16 share the 2-byte
-// instantiation (mirrors the upstream uint16/uint32/uint4 granularity
-// dispatch in multi_layer_block_kv_transfer).
-kvcache_ops::AscendType ascend_type_from_element_size(int element_size) {
-  switch (element_size) {
-    case 1:
-      return kvcache_ops::AscendType::INT8;
-    case 2:
-      return kvcache_ops::AscendType::FP16;
-    case 4:
-      return kvcache_ops::AscendType::FP32;
-    default:
-      TORCH_CHECK(false, "Unsupported element_size: ", element_size,
-                  " (expected 1, 2 or 4)");
+int64_t align_up32(int64_t v) { return (v + 31) & ~int64_t(31); }
+
+int64_t checked_mul(int64_t a, int64_t b, const char* what) {
+  TORCH_CHECK(a >= 0 && b >= 0, what, " must be non-negative, got ", a, " * ",
+              b);
+  if (a != 0) {
+    TORCH_CHECK(b <= std::numeric_limits<int64_t>::max() / a, what,
+                " overflows int64: ", a, " * ", b);
   }
-  return kvcache_ops::AscendType::FP16;  // unreachable
+  return a * b;
 }
 
-struct PackedPlaneSpec {
-  bool packed = false;
-  int32_t k_plane_elems = 0;
-  int32_t v_plane_elems = 0;
-  int32_t lmc_row_elems = 0;
+int64_t checked_add(int64_t a, int64_t b, const char* what) {
+  TORCH_CHECK(a >= 0 && b >= 0 && b <= std::numeric_limits<int64_t>::max() - a,
+              what, " overflows int64: ", a, " + ", b);
+  return a + b;
+}
+
+// ---------------------------------------------------------------------------
+// prepare_group: static geometry, resolved once per group.
+// ---------------------------------------------------------------------------
+
+struct PreparedGroup {
+  kvcache_ops::BlockTransferLayout layout{};
+  bool separate_plane = false;  // format 16: (layer, plane, block) work items
+  int32_t nl = 0;
+  int32_t nb = 0;
+  int32_t bs = 0;
+  int64_t slots_per_object = 0;
 };
 
-PackedPlaneSpec packed_planes(const PageBufferShapeDesc& shape_desc,
-                              EngineKVFormat engine_kv_format) {
-  PackedPlaneSpec spec;
-  // Fmt 17 is any [NB, BS, 1, HS] page tuple (NP>=1). Packed two-plane
-  // (latent + thin scale) is a layout, not the format. Fail closed when
-  // plane_slot_bytes is unset — do not infer K/V from hs % 32.
-  if (engine_kv_format != EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS) {
-    return spec;
+// num_planes == 0 is the "unfilled" sentinel: only legacy 16/13 inputs may be
+// derived (dense token rows, per-plane byte geometry from the scalar fields).
+// Format 17 must carry explicit validated geometry from registration.
+PageBufferShapeDesc describe_legacy_dense_token_rows(PageBufferShapeDesc sd,
+                                                     EngineKVFormat fmt) {
+  const int64_t row = checked_mul(
+      checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
+      "legacy scalar row bytes");
+  // Legacy block_stride_elems is in ELEMENTS of the original dtype.
+  const int64_t block_stride =
+      sd.block_stride_elems > 0
+          ? checked_mul(sd.block_stride_elems, sd.element_size,
+                        "legacy block stride bytes")
+          : checked_mul(sd.bs, row, "legacy tight block stride bytes");
+  sd.num_planes = fmt == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ? 2 : 1;
+  for (int32_t p = 0; p < sd.num_planes; ++p) {
+    sd.plane_slot_bytes[p] = row;
+    sd.plane_block_stride_bytes[p] = block_stride;
   }
-  if (shape_desc.num_planes != 2) {
-    return spec;
-  }
-  const int32_t p0 = shape_desc.plane_slot_bytes[0];
-  const int32_t p1 = shape_desc.plane_slot_bytes[1];
-  const int32_t row = shape_desc.hs * shape_desc.element_size;
-  if (p0 > 0 && p0 % static_cast<int32_t>(kGmAlignBytes) == 0 && p1 > 0 &&
-      p1 < static_cast<int32_t>(kGmAlignBytes) &&
-      (static_cast<int64_t>(p1) * shape_desc.bs) % kGmAlignBytes == 0 &&
-      row == p0 + p1) {
-    spec.packed = true;
-    spec.lmc_row_elems = row;
-    spec.k_plane_elems = p0;
-    spec.v_plane_elems = p1;
-  }
-  return spec;
+  return sd;
 }
 
-kvcache_ops::AscendType launch_type(const PageBufferShapeDesc& shape_desc,
-                                    const PackedPlaneSpec& spec) {
-  if (spec.packed) {
-    return kvcache_ops::AscendType::INT8;
-  }
-  return ascend_type_from_element_size(shape_desc.element_size);
-}
-
-// Shared validation for both entry points. All TORCH_CHECKs fire before any
-// stream work is enqueued; returns blocks per object.
-int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
-                            int64_t total_blocks, int num_objects,
-                            int lmcache_chunk_size,
+PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
                             EngineKVFormat engine_kv_format,
-                            int skip_prefix_n_blocks) {
+                            int64_t slots_per_object) {
+  PageBufferShapeDesc sd = shape_desc;
   const bool separate =
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
   const bool fmt17 =
@@ -100,98 +95,205 @@ int validate_block_transfer(const PageBufferShapeDesc& shape_desc,
               "NL_X_TWO_X_NB_BS_NH_HS (16), NL_X_NP_X_NB_BS_ONE_HS (17), and "
               "NL_X_NB_BS_NH_CS (13), got ",
               static_cast<int>(engine_kv_format));
-  if (separate) {
-    TORCH_CHECK(shape_desc.kv_size == 2, "SEPARATE_KV requires kv_size == 2, ",
-                "got ", shape_desc.kv_size);
-  } else if (fused) {
-    TORCH_CHECK(shape_desc.kv_size == 1, "NH_CS fused requires kv_size == 1, ",
-                "got ", shape_desc.kv_size);
-  } else {
-    TORCH_CHECK(shape_desc.kv_size == 1 || shape_desc.kv_size == 2,
-                "NL_X_NP_X_NB_BS_ONE_HS requires kv_size 1 or 2, got ",
-                shape_desc.kv_size);
-  }
-  TORCH_CHECK(skip_prefix_n_blocks >= 0, "skip_prefix_n_blocks must be >= 0, ",
-              "got ", skip_prefix_n_blocks);
+  TORCH_CHECK(sd.nl > 0 && sd.nb > 0 && sd.bs > 0 && sd.nh > 0 && sd.hs > 0,
+              "shape descriptor dims must be positive, got nl=", sd.nl,
+              " nb=", sd.nb, " bs=", sd.bs, " nh=", sd.nh, " hs=", sd.hs);
+  TORCH_CHECK(sd.element_size == 1 || sd.element_size == 2 ||
+                  sd.element_size == 4,
+              "element_size must be 1, 2 or 4, got ", sd.element_size);
+  TORCH_CHECK(sd.kv_size == (separate ? 2 : 1),
+              "kv_size must be ", (separate ? 2 : 1), " for format ",
+              static_cast<int>(engine_kv_format), ", got ", sd.kv_size);
 
+  if (sd.num_planes == 0) {
+    TORCH_CHECK(!fmt17,
+                "format 17 requires explicit plane geometry (num_planes > "
+                "0); regenerate metadata from the real tensors");
+    sd = describe_legacy_dense_token_rows(sd, engine_kv_format);
+  }
+  TORCH_CHECK(sd.num_planes >= 1 &&
+                  sd.num_planes <= kvcache_ops::kMaxPlanes,
+              "num_planes must be in [1, ", kvcache_ops::kMaxPlanes,
+              "], got ", sd.num_planes);
+  if (separate) {
+    TORCH_CHECK(sd.num_planes == 2,
+                "format 16 requires exactly 2 physical planes, got ",
+                sd.num_planes);
+  }
+  if (fused) {
+    TORCH_CHECK(sd.num_planes == 1,
+                "format 13 requires exactly 1 physical plane, got ",
+                sd.num_planes);
+  }
+  if (fmt17) {
+    TORCH_CHECK(sd.nh == 1, "format 17 requires one head per plane, got nh=",
+                sd.nh);
+  }
+  TORCH_CHECK(slots_per_object > 0,
+              "slots per object must be positive, got ", slots_per_object);
+
+  PreparedGroup group;
+  group.layout.num_planes = sd.num_planes;
+  const int64_t scalar_row = checked_mul(
+      checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
+      "LMC scalar row bytes");
+  int64_t prefix = 0;
+  for (int32_t p = 0; p < sd.num_planes; ++p) {
+    const int64_t payload = sd.plane_slot_bytes[p];
+    const int64_t block_stride = sd.plane_block_stride_bytes[p];
+    TORCH_CHECK(payload > 0, "plane ", p, " payload must be positive, got ",
+                payload);
+    TORCH_CHECK(align_up32(payload) <= kUbSegmentBytes, "plane ", p,
+                " aligned row (", align_up32(payload),
+                " bytes) exceeds the per-segment UB budget (", kUbSegmentBytes,
+                ")");
+    const int64_t span = checked_mul(sd.bs, payload, "plane block span");
+    TORCH_CHECK(block_stride >= span, "plane ", p,
+                " block stride (", block_stride,
+                ") is below the dense block span (", span,
+                "); blocks would overlap");
+    TORCH_CHECK(block_stride % kGmAlignBytes == 0, "plane ", p,
+                " engine block stride (", block_stride,
+                " bytes) must be a multiple of ", kGmAlignBytes,
+                " for DataCopy alignment");
+    // Address-range overflow probe: (nb - 1) * stride + span must stay
+    // inside int64.
+    checked_add(checked_mul(sd.nb - 1, block_stride, "plane address range"),
+                span, "plane address range");
+    if (!fmt17) {
+      TORCH_CHECK(payload == scalar_row, "plane ", p,
+                  " payload (", payload,
+                  ") must equal the full scalar row (", scalar_row,
+                  ") for format ", static_cast<int>(engine_kv_format));
+    }
+    // LMC packed-row gap = bytes of the OTHER planes in the row; it feeds a
+    // uint32 DataCopyPad field (engine-side gap is always 0: dense rows).
+    TORCH_CHECK(scalar_row >= payload &&
+                    scalar_row - payload <= kCopyGmGapMax,
+                "plane ", p, " LMC row gap (", scalar_row - payload,
+                ") exceeds the DataCopyPad GM gap range");
+    group.layout.planes[p] = kvcache_ops::PlaneLayout{
+        payload, block_stride, fmt17 ? prefix : 0};
+    prefix = checked_add(prefix, payload, "LMC row prefix sum");
+  }
+  if (fmt17) {
+    TORCH_CHECK(prefix == scalar_row,
+                "sum of plane payloads (", prefix,
+                ") must equal nh * hs * element_size (", scalar_row,
+                ") for format 17");
+  }
+
+  group.layout.lmc_token_stride_bytes = scalar_row;
+  group.layout.lmc_layer_stride_bytes =
+      checked_mul(slots_per_object, scalar_row, "LMC layer stride bytes");
+  const int64_t slab =
+      checked_mul(sd.nl, group.layout.lmc_layer_stride_bytes, "LMC slab bytes");
+  group.layout.lmc_object_bytes =
+      checked_mul(separate ? 2 : 1, slab, "LMC object bytes");
+  if (separate) {
+    // 2LTD: K slab first, V slab after (planes[1] base = one full slab).
+    group.layout.planes[1].lmc_base_offset_bytes = slab;
+  }
+  // LMC pages must not share 32B lines.
+  TORCH_CHECK(checked_mul(sd.bs, scalar_row, "LMC page bytes") %
+                      kGmAlignBytes ==
+                  0,
+              "BS * LMC row bytes (", sd.bs * scalar_row,
+              ") must be a multiple of ", kGmAlignBytes,
+              "; otherwise adjacent LMC pages share a 32B line");
+
+  group.separate_plane = separate;
+  group.nl = sd.nl;
+  group.nb = sd.nb;
+  group.bs = sd.bs;
+  group.slots_per_object = slots_per_object;
+  return group;
+}
+
+// ---------------------------------------------------------------------------
+// validate_launch: per-transfer dynamic variables.
+// ---------------------------------------------------------------------------
+
+struct CheckedLaunch {
+  int32_t total_blocks = 0;
+  int32_t num_objects = 0;
+  int32_t blocks_per_object = 0;
+  int32_t skip_prefix_n_blocks = 0;
+};
+
+CheckedLaunch validate_launch(const PreparedGroup& group, int64_t total_blocks,
+                              int num_objects, int64_t block_ids_offset,
+                              int64_t block_ids_capacity,
+                              int skip_prefix_n_blocks) {
   TORCH_CHECK(num_objects >= 1 && num_objects <= 4,
               "Expected 1-4 LMCache objects, got ", num_objects);
+  TORCH_CHECK(total_blocks >= 0, "total_blocks must be non-negative, got ",
+              total_blocks);
   TORCH_CHECK(total_blocks % num_objects == 0, "block_ids length (",
               total_blocks, ") must be divisible by num_objects (",
               num_objects, ")");
-  const int num_blocks_per_object =
-      static_cast<int>(total_blocks / num_objects);
-
-  TORCH_CHECK(num_blocks_per_object * shape_desc.bs == lmcache_chunk_size,
-              "blocks_per_object * block_size (",
-              num_blocks_per_object * shape_desc.bs,
-              ") must equal lmcache_chunk_size (", lmcache_chunk_size, ")");
-  TORCH_CHECK(skip_prefix_n_blocks <= num_blocks_per_object,
+  const int64_t blocks = total_blocks / num_objects;
+  TORCH_CHECK(checked_mul(blocks, group.bs, "blocks * bs") ==
+                  group.slots_per_object,
+              "blocks_per_object * block_size (", blocks * group.bs,
+              ") must equal slots per object (", group.slots_per_object, ")");
+  TORCH_CHECK(skip_prefix_n_blocks >= 0 &&
+                  skip_prefix_n_blocks <= blocks,
               "skip_prefix_n_blocks (", skip_prefix_n_blocks,
-              ") cannot exceed blocks per object (", num_blocks_per_object,
-              ")");
+              ") must be within [0, ", blocks, "]");
+  // Subtraction form: offset + length itself may not overflow.
+  TORCH_CHECK(block_ids_offset >= 0 && block_ids_offset <= block_ids_capacity,
+              "block_ids_offset (", block_ids_offset,
+              ") must be within [0, ", block_ids_capacity, "]");
+  TORCH_CHECK(total_blocks <= block_ids_capacity - block_ids_offset,
+              "block_ids slice [", block_ids_offset, ", ",
+              block_ids_offset + total_blocks, ") exceeds block_ids capacity ",
+              block_ids_capacity);
+  TORCH_CHECK(total_blocks <= std::numeric_limits<int32_t>::max() &&
+                  blocks <= std::numeric_limits<int32_t>::max(),
+              "block counts exceed the kernel's int32 launch arguments");
 
-  const PackedPlaneSpec spec = packed_planes(shape_desc, engine_kv_format);
-  const int64_t engine_block_stride =
-      shape_desc.block_stride_elems > 0
-          ? static_cast<int64_t>(shape_desc.block_stride_elems)
-          : static_cast<int64_t>(shape_desc.bs) * shape_desc.nh *
-                shape_desc.hs;
-  const int64_t stride_bytes =
-      spec.packed ? engine_block_stride
-                  : engine_block_stride * shape_desc.element_size;
-  TORCH_CHECK(stride_bytes % kGmAlignBytes == 0,
-              "engine block stride (", stride_bytes,
-              " bytes) must be a multiple of ", kGmAlignBytes,
-              " for DataCopy alignment");
-
-  int64_t ub_token_bytes;
-  if (spec.packed) {
-    TORCH_CHECK(spec.lmc_row_elems > 2, "packed LMC row must exceed 2 B, got ",
-                spec.lmc_row_elems);
-    TORCH_CHECK(spec.k_plane_elems > 0 &&
-                    spec.k_plane_elems % kGmAlignBytes == 0,
-                "packed latent width (", spec.k_plane_elems,
-                " bytes) must be a positive multiple of ", kGmAlignBytes);
-    TORCH_CHECK((static_cast<int64_t>(spec.v_plane_elems) * shape_desc.bs) %
-                        kGmAlignBytes == 0,
-                "packed scale plane (", spec.v_plane_elems, " B x ",
-                shape_desc.bs, " tokens) must be a multiple of ",
-                kGmAlignBytes);
-    // The kernel stages a whole page as bs rows of AlignUp32(lmc_row) bytes.
-    const int64_t ub_row_bytes = (spec.lmc_row_elems + 31) & ~31;
-    const int64_t lmc_page_bytes =
-        static_cast<int64_t>(shape_desc.bs) * spec.lmc_row_elems;
-    TORCH_CHECK(lmc_page_bytes % kGmAlignBytes == 0,
-                "packed LMC page bytes (", lmc_page_bytes,
-                ") must be a multiple of ", kGmAlignBytes,
-                "; otherwise adjacent pages share a 32 B line");
-    for (int i = 0; i < 2; ++i) {
-      const int32_t plane_stride = shape_desc.plane_block_stride_bytes[i];
-      if (plane_stride > 0) {
-        TORCH_CHECK(plane_stride % kGmAlignBytes == 0,
-                    "packed plane ", i, " block stride (", plane_stride,
-                    " bytes) must be a multiple of ", kGmAlignBytes);
-      }
-    }
-    ub_token_bytes = static_cast<int64_t>(shape_desc.bs) * ub_row_bytes;
-  } else {
-    const int64_t token_bytes = static_cast<int64_t>(shape_desc.nh) *
-                                shape_desc.hs * shape_desc.element_size;
-    TORCH_CHECK(token_bytes > 0, "nh * hs * element_size must be positive");
-    TORCH_CHECK(token_bytes % kGmAlignBytes == 0,
-                "scalars_per_token * element_size (", token_bytes,
-                " bytes) must be a multiple of ", kGmAlignBytes,
-                " for DataCopy alignment");
-    ub_token_bytes = token_bytes;
-  }
-
-  TORCH_CHECK(ub_token_bytes <= kUbBudgetBytes / 2, "token bytes (",
-              ub_token_bytes, ") exceed the per-segment UB budget (",
-              kUbBudgetBytes / 2, "); token-level segmentation cannot fit");
-
-  return num_blocks_per_object;
+  CheckedLaunch out;
+  out.total_blocks = static_cast<int32_t>(total_blocks);
+  out.num_objects = num_objects;
+  out.blocks_per_object = static_cast<int32_t>(blocks);
+  out.skip_prefix_n_blocks = skip_prefix_n_blocks;
+  return out;
 }
+
+// ---------------------------------------------------------------------------
+// Launch: one kernel launch per object.
+// ---------------------------------------------------------------------------
+
+void launch_prepared_objects(uint32_t aiv_num, void* stream,
+                             const PreparedGroup& group,
+                             uint8_t* paged_buffer_ptrs,
+                             const std::vector<int64_t>& obj_device_ptrs,
+                             int64_t* block_ids_base,
+                             const CheckedLaunch& launch, bool to_engine) {
+  // blockDim is clamped to the work-item count so tiny transfers do not spin
+  // idle cores. blocks_per_object >= 1 is guaranteed by validate_launch
+  // (blocks * bs == slots_per_object > 0).
+  const int32_t plane_slots =
+      group.separate_plane ? group.layout.num_planes : 1;
+  const int64_t work = static_cast<int64_t>(group.nl) * plane_slots *
+                       launch.blocks_per_object;
+  const uint32_t blockDim =
+      static_cast<uint32_t>(std::min<int64_t>(aiv_num, work));
+  for (int32_t i = 0; i < launch.num_objects; ++i) {
+    uint8_t* engine_block_ids = reinterpret_cast<uint8_t*>(
+        block_ids_base + static_cast<int64_t>(i) * launch.blocks_per_object);
+    kvcache_ops::multi_layer_block_transfer_kernel(
+        blockDim, stream, paged_buffer_ptrs,
+        reinterpret_cast<uint8_t*>(obj_device_ptrs[i]), engine_block_ids,
+        launch.blocks_per_object, launch.skip_prefix_n_blocks, group.nl,
+        group.nb, group.bs, group.separate_plane, group.layout, to_engine);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LMC object device-VA resolution and staging (direct entry).
+// ---------------------------------------------------------------------------
 
 // CUDA UVA lets the kernel consume host data_ptr()s. Ascend DataCopy needs a
 // device VA: registered aclrtMallocHost (get_device_ptr) or a true NPU
@@ -217,36 +319,30 @@ std::vector<int64_t> device_lmc_ptrs(const std::vector<int64_t>& ptrs) {
   return out;
 }
 
-struct PackedHostStage {
+struct HostStage {
   torch::Tensor buf;
   int64_t host_ptr = 0;
   size_t nbytes = 0;
 };
 
-// Resolve LMCache object pointers to device VAs. SHM/host objects
-// that are neither registered aclrtMallocHost nor NPU memory get an on-device
-// staging tensor (PackedHostStage); the caller memcpy-asyncs around the kernel.
+// Resolve LMCache object pointers to device VAs. SHM/host objects that are
+// neither registered aclrtMallocHost nor NPU memory get an on-device staging
+// tensor (HostStage); the caller memcpy-asyncs around the kernel. Allocations
+// happen BEFORE the OpCommand so the tensors can be captured by value.
 struct PreparedLmcPtrs {
   std::vector<int64_t> kernel_obj_ptrs;
-  std::vector<PackedHostStage> host_stages;
+  std::vector<HostStage> host_stages;
 };
 
 PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptrs,
                                  const torch::Device& device,
-                                 const PageBufferShapeDesc& shape_desc,
-                                 int lmcache_chunk_size,
-                                 const PackedPlaneSpec& spec) {
+                                 const PreparedGroup& group) {
   PreparedLmcPtrs prepared;
   prepared.kernel_obj_ptrs.reserve(lmcache_objects_ptrs.size());
   const auto staging_opts =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
-  const int64_t object_bytes =
-      spec.packed
-          ? static_cast<int64_t>(shape_desc.nl) * lmcache_chunk_size *
-                spec.lmc_row_elems
-          : static_cast<int64_t>(shape_desc.kv_size) * shape_desc.nl *
-                lmcache_chunk_size * shape_desc.nh * shape_desc.hs *
-                shape_desc.element_size;
+  // One capacity formula for every layout.
+  const int64_t object_bytes = group.layout.lmc_object_bytes;
   TORCH_CHECK(object_bytes > 0, "LMCache object byte size must be positive");
   for (int64_t p : lmcache_objects_ptrs) {
     void* raw = reinterpret_cast<void*>(static_cast<uintptr_t>(p));
@@ -260,7 +356,7 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptr
       continue;
     }
     // A torch-pinned host pointer may not have a mapping in our registry.
-    PackedHostStage stage;
+    HostStage stage;
     stage.buf = torch::empty({object_bytes}, staging_opts);
     stage.host_ptr = p;
     stage.nbytes = static_cast<size_t>(object_bytes);
@@ -271,31 +367,17 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptr
   return prepared;
 }
 
-void launch_block_transfer_objects(
-    kvcache_ops::AscendType type, uint32_t aiv_num, void* stream,
-    uint8_t* paged_buffer_ptrs,
-    const std::vector<int64_t>& lmcache_objects_ptrs, int64_t* block_ids_base,
-    int64_t total_blocks, int num_blocks_per_object,
-    const PageBufferShapeDesc& shape_desc, int lmcache_chunk_size,
-    int skip_prefix_n_blocks, bool lmcache_to_engine,
-    const PackedPlaneSpec& spec);
-
-// Enqueue PackedHostStage memcpys + the block kernel(s) on ``stream``.
-// No OpCommand: the caller wraps this in one Run() (direct API) or folds it
-// into the object-group plan's single Run(). Returns 0 or an ACL error.
+// Enqueue HostStage memcpys + the block kernel(s) on ``stream``: H2D stages
+// before the kernel, D2H stages after, and a partial D2H store first reads
+// the host object into staging so the untouched prefix is preserved when
+// the whole object is written back.
 int enqueue_block_transfer(void* stream, uint32_t aiv_num,
                            uint8_t* paged_buffer_ptrs,
+                           const PreparedGroup& group,
                            const PreparedLmcPtrs& prepared,
-                           int64_t* block_ids_base, int64_t total_blocks,
-                           int num_blocks_per_object,
-                           const PageBufferShapeDesc& shape_desc,
-                           int lmcache_chunk_size, int skip_prefix_n_blocks,
-                           bool lmcache_to_engine, kvcache_ops::AscendType type,
-                           const PackedPlaneSpec& spec) {
-  // For a partial D2H store, preserve the host prefix before the kernel
-  // updates the suffix: the subsequent D2H copy covers the whole object.
-  // Full D2H stores need neither this H2D copy nor zero initialization.
-  if (lmcache_to_engine || skip_prefix_n_blocks > 0) {
+                           int64_t* block_ids_base,
+                           const CheckedLaunch& launch, bool to_engine) {
+  if (to_engine || launch.skip_prefix_n_blocks > 0) {
     for (const auto& stage : prepared.host_stages) {
       const aclError ret = aclrtMemcpyAsync(
           stage.buf.data_ptr(), stage.nbytes,
@@ -306,11 +388,10 @@ int enqueue_block_transfer(void* stream, uint32_t aiv_num,
       }
     }
   }
-  launch_block_transfer_objects(
-      type, aiv_num, stream, paged_buffer_ptrs, prepared.kernel_obj_ptrs,
-      block_ids_base, total_blocks, num_blocks_per_object, shape_desc,
-      lmcache_chunk_size, skip_prefix_n_blocks, lmcache_to_engine, spec);
-  if (!lmcache_to_engine) {
+  launch_prepared_objects(aiv_num, stream, group, paged_buffer_ptrs,
+                          prepared.kernel_obj_ptrs, block_ids_base, launch,
+                          to_engine);
+  if (!to_engine) {
     for (const auto& stage : prepared.host_stages) {
       const aclError ret = aclrtMemcpyAsync(
           reinterpret_cast<void*>(static_cast<uintptr_t>(stage.host_ptr)),
@@ -324,40 +405,6 @@ int enqueue_block_transfer(void* stream, uint32_t aiv_num,
   return 0;
 }
 
-// Phase-1 launch loop: one object + one block_ids slice per kernel launch
-// (design doc 4.5). blockDim is clamped to the work-item count so tiny
-// transfers do not spin idle cores.
-void launch_block_transfer_objects(
-    kvcache_ops::AscendType type, uint32_t aiv_num, void* stream,
-    uint8_t* paged_buffer_ptrs,
-    const std::vector<int64_t>& lmcache_objects_ptrs, int64_t* block_ids_base,
-    int64_t total_blocks, int num_blocks_per_object,
-    const PageBufferShapeDesc& shape_desc, int lmcache_chunk_size,
-    int skip_prefix_n_blocks, bool lmcache_to_engine,
-    const PackedPlaneSpec& spec) {
-  // Packed MLA keeps a 2-entry pointer table (latent+scale) but launches
-  // kv_size=1: one AIV owns both planes of a page, so no two cores can write
-  // the same 32 B LMC line. Fused NH_CS also uses kv_size == 1.
-  const int32_t kv_size = spec.packed ? 1 : shape_desc.kv_size;
-  const int64_t total_work =
-      static_cast<int64_t>(shape_desc.nl) * kv_size * total_blocks;
-  const uint32_t blockDim =
-      static_cast<uint32_t>(std::min<int64_t>(aiv_num, total_work));
-  for (int i = 0; i < static_cast<int>(lmcache_objects_ptrs.size()); ++i) {
-    uint8_t* engine_block_ids = reinterpret_cast<uint8_t*>(
-        block_ids_base + static_cast<int64_t>(i) * num_blocks_per_object);
-    kvcache_ops::multi_layer_block_transfer_kernel(
-        type, blockDim, stream, paged_buffer_ptrs,
-        reinterpret_cast<uint8_t*>(lmcache_objects_ptrs[i]),
-        engine_block_ids, num_blocks_per_object, skip_prefix_n_blocks,
-        shape_desc.nl, shape_desc.bs, shape_desc.nh, shape_desc.hs,
-        shape_desc.block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-        spec.k_plane_elems, spec.v_plane_elems, spec.lmc_row_elems, kv_size,
-        shape_desc.plane_block_stride_bytes[0],
-        shape_desc.plane_block_stride_bytes[1]);
-  }
-}
-
 }  // namespace
 
 void multi_layer_block_kv_transfer(
@@ -366,12 +413,16 @@ void multi_layer_block_kv_transfer(
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
-  // --- Validation ---
+  // --- Static geometry (prepare_group) + dynamic variables (validate_launch)
+  const PreparedGroup group =
+      prepare_group(shape_desc, engine_kv_format, lmcache_chunk_size);
   const int num_objects = static_cast<int>(lmcache_objects_ptrs.size());
   const int64_t total_blocks = block_ids.size(0);
-  const int num_blocks_per_object = validate_block_transfer(
-      shape_desc, total_blocks, num_objects, lmcache_chunk_size,
-      engine_kv_format, skip_prefix_n_blocks);
+  const CheckedLaunch launch =
+      validate_launch(group, total_blocks, num_objects,
+                      /*block_ids_offset=*/0,
+                      /*block_ids_capacity=*/total_blocks,
+                      skip_prefix_n_blocks);
 
   TORCH_CHECK(paged_buffer_ptrs_tensor.scalar_type() == at::kLong,
               "paged_buffer_ptrs_tensor must be int64");
@@ -379,31 +430,25 @@ void multi_layer_block_kv_transfer(
               "paged_buffer_ptrs_tensor must live on the NPU");
   TORCH_CHECK(paged_buffer_ptrs_tensor.dim() == 1,
               "paged_buffer_ptrs_tensor must be one-dimensional");
-  const PackedPlaneSpec spec =
-      packed_planes(shape_desc, engine_kv_format);
-  const int32_t ptrs_per_layer =
-      shape_desc.num_planes > 0 ? shape_desc.num_planes : shape_desc.kv_size;
-  const int64_t expected_ptrs =
-      static_cast<int64_t>(ptrs_per_layer) * shape_desc.nl;
-  TORCH_CHECK(paged_buffer_ptrs_tensor.numel() == expected_ptrs,
-              "paged_buffer_ptrs_tensor must contain num_planes * nl "
-              "pointers (num_planes unset: kv_size * nl): expected ",
-              expected_ptrs, ", got ",
-              paged_buffer_ptrs_tensor.numel());
   TORCH_CHECK(paged_buffer_ptrs_tensor.is_contiguous(),
               "paged_buffer_ptrs_tensor must be contiguous");
+  // Pointer table: one device pointer per (layer, physical plane).
+  const int64_t expected_ptrs =
+      static_cast<int64_t>(group.layout.num_planes) * group.nl;
+  TORCH_CHECK(paged_buffer_ptrs_tensor.numel() == expected_ptrs,
+              "paged_buffer_ptrs_tensor must contain num_planes * nl "
+              "pointers: expected ",
+              expected_ptrs, ", got ", paged_buffer_ptrs_tensor.numel());
   TORCH_CHECK(block_ids.is_privateuseone(), "block_ids must live on the NPU");
   TORCH_CHECK(block_ids.scalar_type() == at::kLong,
               "block_ids must have dtype int64");
   TORCH_CHECK(block_ids.dim() == 1, "block_ids must be one-dimensional");
   TORCH_CHECK(block_ids.is_contiguous(), "block_ids must be contiguous");
 
-  const kvcache_ops::AscendType type = launch_type(shape_desc, spec);
-  const bool lmcache_to_engine = (direction == TransferDirection::H2D);
+  const bool to_engine = (direction == TransferDirection::H2D);
 
   const c10::OptionalDeviceGuard device_guard(device);
-  PreparedLmcPtrs prepared = prepare_lmc_ptrs(
-      lmcache_objects_ptrs, device, shape_desc, lmcache_chunk_size, spec);
+  PreparedLmcPtrs prepared = prepare_lmc_ptrs(lmcache_objects_ptrs, device, group);
 
   uint8_t* paged_buffer_ptrs =
       static_cast<uint8_t*>(paged_buffer_ptrs_tensor.data_ptr());
@@ -413,129 +458,14 @@ void multi_layer_block_kv_transfer(
 
   at_npu::native::OpCommand cmd;
   cmd.Name("multi_layer_block_transfer_kernel");
-  cmd.SetCustomHandler([type, stream, paged_buffer_ptrs, prepared,
-                        block_ids_base, total_blocks, num_blocks_per_object,
-                        shape_desc, lmcache_chunk_size, skip_prefix_n_blocks,
-                        lmcache_to_engine, spec]() -> int {
+  cmd.SetCustomHandler([stream, paged_buffer_ptrs, group, prepared,
+                        block_ids_base, launch, to_engine]() -> int {
     const char* socName = aclrtGetSocName();
     auto ascendcPlatform =
         platform_ascendc::PlatformAscendCManager::GetInstance(socName);
     const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
-    return enqueue_block_transfer(
-        stream, aiv_num, paged_buffer_ptrs, prepared, block_ids_base,
-        total_blocks, num_blocks_per_object, shape_desc, lmcache_chunk_size,
-        skip_prefix_n_blocks, lmcache_to_engine, type, spec);
-  });
-  cmd.Run();
-}
-
-void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes,
-                                    TransferDirection direction,
-                                    size_t host_buffer_offset,
-                                    size_t host_buffer_alignments,
-                                    aclrtStream stream);
-
-void execute_object_group_transfer(
-    TransferDirection direction, const torch::Device& device,
-    size_t host_buffer_alignment,
-    const std::vector<KernelGroupSpec>& kernel_group_specs,
-    const std::vector<BatchStep>& batch_steps) {
-  // Set the device guard once for the whole plan so every staging copy and
-  // kernel launch below is enqueued on this device's current stream, in
-  // order (mirrors upstream execute_object_group_transfer).
-  const c10::OptionalDeviceGuard device_guard(device);
-  const bool is_h2d = (direction == TransferDirection::H2D);
-  TORCH_CHECK(device.is_privateuseone(), "device must be an NPU device");
-
-  // --- Validate the whole plan up front, before any stream work ---
-  // Bounds-check every launch's block_ids slice before the kernel
-  // dereferences it on device: an out-of-range offset/length would
-  // otherwise be a silent out-of-bounds device read, not a clean error.
-  for (const auto& step : batch_steps) {
-    for (const auto& launch : step.launches) {
-      TORCH_CHECK(launch.group_idx >= 0 &&
-                      launch.group_idx <
-                          static_cast<int>(kernel_group_specs.size()),
-                  "LaunchVar.group_idx out of range: ", launch.group_idx);
-      const KernelGroupSpec& group = kernel_group_specs[launch.group_idx];
-      TORCH_CHECK(launch.num_objects >= 1 &&
-                      launch.num_objects <=
-                          static_cast<int>(group.lmcache_objects_ptrs.size()),
-                  "LaunchVar.num_objects (", launch.num_objects,
-                  ") exceeds available temp buffers (",
-                  group.lmcache_objects_ptrs.size(), ")");
-      TORCH_CHECK(launch.block_ids_offset >= 0,
-                  "LaunchVar.block_ids_offset must be non-negative, got ",
-                  launch.block_ids_offset);
-      TORCH_CHECK(launch.total_blocks >= 0,
-                  "LaunchVar.total_blocks must be non-negative, got ",
-                  launch.total_blocks);
-      TORCH_CHECK(launch.block_ids_offset + launch.total_blocks <=
-                      group.block_ids_capacity,
-                  "LaunchVar block_ids slice [", launch.block_ids_offset, ", ",
-                  launch.block_ids_offset + launch.total_blocks,
-                  ") exceeds block_ids capacity ", group.block_ids_capacity);
-      // Full per-launch validation (format, shape, alignment) through the
-      // shared checker so the plan path rejects bad launches exactly like
-      // the direct entry point would.
-      validate_block_transfer(group.shape_desc, launch.total_blocks,
-                              launch.num_objects, group.lmcache_chunk_size,
-                              group.engine_kv_format,
-                              launch.skip_prefix_n_blocks);
-    }
-  }
-
-  const char* socName = aclrtGetSocName();
-  auto ascendcPlatform =
-      platform_ascendc::PlatformAscendCManager::GetInstance(socName);
-  const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
-  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
-  at_npu::native::OpCommand cmd;
-  cmd.Name("multi_layer_block_transfer_kernel");
-  // Capture by value like multi_layer_block_kv_transfer: OpCommand may run
-  // the handler on a worker thread; [&] deadlocks torch_npu's task queue.
-  cmd.SetCustomHandler([direction, is_h2d, host_buffer_alignment, aiv_num,
-                        stream, kernel_group_specs, batch_steps]() -> int {
-    const auto do_staging = [&](const std::vector<StagingCopy>& staging) {
-      for (const auto& copy : staging) {
-        lmcache_memcpy_async_on_stream(copy.dest, copy.src, copy.nbytes,
-                                       direction, copy.host_offset,
-                                       host_buffer_alignment, stream);
-      }
-    };
-
-    for (const auto& step : batch_steps) {
-      // H2D stages CPU->NPU temp buffers before the kernel reads them; D2H
-      // stages NPU->CPU after the kernel writes them. The per-step ordering
-      // must be preserved because temp buffers are reused across steps.
-      if (is_h2d) {
-        do_staging(step.staging);
-      }
-      for (const auto& launch : step.launches) {
-        const KernelGroupSpec& group = kernel_group_specs[launch.group_idx];
-        std::vector<int64_t> lmcache_objects_ptrs = device_lmc_ptrs(
-            std::vector<int64_t>(
-                group.lmcache_objects_ptrs.begin(),
-                group.lmcache_objects_ptrs.begin() + launch.num_objects));
-        int64_t* block_ids_base = reinterpret_cast<int64_t*>(
-            group.block_ids_base +
-            static_cast<uintptr_t>(launch.block_ids_offset) * sizeof(int64_t));
-        const PackedPlaneSpec spec =
-            packed_planes(group.shape_desc, group.engine_kv_format);
-        launch_block_transfer_objects(
-            launch_type(group.shape_desc, spec), aiv_num, stream,
-            reinterpret_cast<uint8_t*>(group.paged_buffer_ptrs),
-            lmcache_objects_ptrs, block_ids_base, launch.total_blocks,
-            static_cast<int>(launch.total_blocks / launch.num_objects),
-            group.shape_desc, group.lmcache_chunk_size,
-            launch.skip_prefix_n_blocks, is_h2d, spec);
-      }
-      if (!is_h2d) {
-        do_staging(step.staging);
-      }
-    }
-    return 0;
+    return enqueue_block_transfer(stream, aiv_num, paged_buffer_ptrs, group,
+                                  prepared, block_ids_base, launch, to_engine);
   });
   cmd.Run();
 }
@@ -572,6 +502,129 @@ void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes
 
     offset += max_nbytes;
   }
+}
+
+void execute_object_group_transfer(
+    TransferDirection direction, const torch::Device& device,
+    size_t host_buffer_alignment,
+    const std::vector<KernelGroupSpec>& kernel_group_specs,
+    const std::vector<BatchStep>& batch_steps) {
+  // Set the device guard once for the whole plan so every staging copy and
+  // kernel launch below is enqueued on this device's current stream, in
+  // order (mirrors upstream execute_object_group_transfer).
+  const c10::OptionalDeviceGuard device_guard(device);
+  const bool is_h2d = (direction == TransferDirection::H2D);
+  TORCH_CHECK(device.is_privateuseone(), "device must be an NPU device");
+  TORCH_CHECK(host_buffer_alignment > 0 &&
+                  (host_buffer_alignment & (host_buffer_alignment - 1)) == 0,
+              "host_buffer_alignment must be a non-zero power of two, got ",
+              host_buffer_alignment);
+
+  // --- Whole-plan pre-validation: every group is prepared and
+  // every launch is validated before ANY staging copy or kernel launch is
+  // enqueued. A failure here means "nothing started".
+  std::vector<PreparedGroup> groups;
+  groups.reserve(kernel_group_specs.size());
+  for (const auto& spec : kernel_group_specs) {
+    groups.push_back(prepare_group(spec.shape_desc, spec.engine_kv_format,
+                                   spec.lmcache_chunk_size));
+  }
+
+  struct PreparedLaunch {
+    int32_t group_idx;
+    CheckedLaunch checked;
+    int64_t block_ids_offset;
+  };
+  std::vector<std::vector<PreparedLaunch>> prepared_steps;
+  prepared_steps.reserve(batch_steps.size());
+  for (const auto& step : batch_steps) {
+    for (const auto& copy : step.staging) {
+      // Raw external pointers carry no derivable allocation capacity; the
+      // plan builder owns pointer/size validity. What can be
+      // checked cheaply here is checked.
+      TORCH_CHECK(copy.nbytes > 0, "StagingCopy nbytes must be positive");
+      TORCH_CHECK(copy.dest != 0 && copy.src != 0,
+                  "StagingCopy pointers must be non-null");
+    }
+    std::vector<PreparedLaunch> launches;
+    launches.reserve(step.launches.size());
+    for (const auto& launch : step.launches) {
+      TORCH_CHECK(launch.group_idx >= 0 &&
+                      launch.group_idx <
+                          static_cast<int>(kernel_group_specs.size()),
+                  "LaunchVar.group_idx out of range: ", launch.group_idx);
+      const KernelGroupSpec& spec = kernel_group_specs[launch.group_idx];
+      TORCH_CHECK(launch.num_objects <=
+                      static_cast<int>(spec.lmcache_objects_ptrs.size()),
+                  "LaunchVar.num_objects (", launch.num_objects,
+                  ") exceeds available temp buffers (",
+                  spec.lmcache_objects_ptrs.size(), ")");
+      PreparedLaunch prepared;
+      prepared.group_idx = launch.group_idx;
+      prepared.checked =
+          validate_launch(groups[launch.group_idx], launch.total_blocks,
+                          launch.num_objects, launch.block_ids_offset,
+                          spec.block_ids_capacity, launch.skip_prefix_n_blocks);
+      prepared.block_ids_offset = launch.block_ids_offset;
+      launches.push_back(prepared);
+    }
+    prepared_steps.push_back(std::move(launches));
+  }
+
+  const char* socName = aclrtGetSocName();
+  auto ascendcPlatform =
+      platform_ascendc::PlatformAscendCManager::GetInstance(socName);
+  const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("multi_layer_block_transfer_kernel");
+  // Capture by value like multi_layer_block_kv_transfer: OpCommand may run
+  // the handler on a worker thread; [&] deadlocks torch_npu's task queue.
+  // The pointer table, block IDs, staging buffers and engine plane views are
+  // owned by the caller's cache context, which synchronizes the stream before
+  // releasing them, so the captured raw pointers stay valid.
+  cmd.SetCustomHandler([direction, is_h2d, host_buffer_alignment, aiv_num,
+                        stream, kernel_group_specs, batch_steps, groups,
+                        prepared_steps]() -> int {
+    const auto do_staging = [&](const std::vector<StagingCopy>& staging) {
+      for (const auto& copy : staging) {
+        lmcache_memcpy_async_on_stream(copy.dest, copy.src, copy.nbytes,
+                                       direction, copy.host_offset,
+                                       host_buffer_alignment, stream);
+      }
+    };
+
+    for (size_t step_idx = 0; step_idx < batch_steps.size(); ++step_idx) {
+      // H2D stages CPU->NPU temp buffers before the kernel reads them; D2H
+      // stages NPU->CPU after the kernel writes them. The per-step ordering
+      // must be preserved because temp buffers are reused across steps.
+      if (is_h2d) {
+        do_staging(batch_steps[step_idx].staging);
+      }
+      for (const auto& launch : prepared_steps[step_idx]) {
+        const KernelGroupSpec& spec = kernel_group_specs[launch.group_idx];
+        const PreparedGroup& group = groups[launch.group_idx];
+        std::vector<int64_t> obj_device_ptrs = device_lmc_ptrs(
+            std::vector<int64_t>(
+                spec.lmcache_objects_ptrs.begin(),
+                spec.lmcache_objects_ptrs.begin() +
+                    launch.checked.num_objects));
+        int64_t* block_ids_base = reinterpret_cast<int64_t*>(
+            spec.block_ids_base +
+            static_cast<uintptr_t>(launch.block_ids_offset) * sizeof(int64_t));
+        launch_prepared_objects(
+            aiv_num, stream, group,
+            reinterpret_cast<uint8_t*>(spec.paged_buffer_ptrs),
+            obj_device_ptrs, block_ids_base, launch.checked, is_h2d);
+      }
+      if (!is_h2d) {
+        do_staging(batch_steps[step_idx].staging);
+      }
+    }
+    return 0;
+  });
+  cmd.Run();
 }
 
 void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,

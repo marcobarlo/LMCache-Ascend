@@ -1,65 +1,48 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef MULTI_LAYER_BLOCK_MEM_KERNELS_H
 #define MULTI_LAYER_BLOCK_MEM_KERNELS_H
 
-#include "../types.h"
+#include "block_transfer_layout.h"
 
 namespace kvcache_ops {
 
-// Host-side launcher for the block-level multi-layer KV transfer kernel
-// (device entries multi_layer_block_transfer_kernel_<TYPE>_<SLOTTYPE> below).
+// Host-side launcher for the block-level multi-layer KV transfer kernel.
+// One launch moves one LMCache memory object (phase-1 semantics: the C++
+// boundary in csrc/mp_mem_kernels.cpp loops over the object batch).
 //
-// Phase 1: one LMCache memory object per launch (the C++ boundary in
-// csrc/mp_mem_kernels.cpp loops over the object batch), engine side is
-// SEPARATE_KV — per-layer (K, V) paged tensors selected through the
-// interleaved [K_0, V_0, K_1, V_1, ...] device pointer table.
+// Layout semantics per engine KV format:
+//   16 (NL_X_TWO_X_NB_BS_NH_HS): per-layer (K, V) equal-width NHD tensors
+//       -> LMC [2, L, T, NH*HS] (2LTD: K slab first, V slab after); work
+//       items are (layer, plane, block) since K/V live in disjoint slabs.
+//   17 (NL_X_NP_X_NB_BS_ONE_HS): per-layer tuple of 1..4 single-head planes
+//       (MLA/DSA/DSv4) -> LMC [L, T, sum(payload)] packed byte rows; work
+//       items are (layer, block) and one AIV core moves every plane of the
+//       page, so no two cores ever share a 32B LMC line.
+//   13 (NL_X_NB_BS_NH_CS): one fused plane per layer -> LMC [1, L, T, NH*CS].
 //
-// Packed MLA (format 17 / KG0): k_plane_elems / v_plane_elems / lmc_row_elems
-// are non-zero (bytes when launched as INT8). Zero keeps the 2LTD DataCopy path.
+// Pointer table layout: ptrs[layer * num_planes + plane], each entry the
+// plane tensor view's data_ptr() (storage_offset already included; planes
+// may be independently allocated or views into one shared pool).
 //
-// Fused NH_CS (format 13): kv_size=1, one pointer per layer (MERGED_KV).
-// Packed MLA launches kv_size=1 (one core per layer x page) with a 2-ptr table.
-//
-// Params:
-//   paged_buffer_ptrs      device base of the interleaved int64 pointer table
-//   lmcache_obj            device address of the single LMCache object
-//   engine_block_ids       device int64 array, [num_blocks_per_object] entries
-//   num_blocks_per_object  blocks in this object (== lmcache_chunk_size / bs)
-//   skip_prefix_n_blocks   leading blocks to skip (upstream same-name param)
-//   nl / bs / nh / hs      PageBufferShapeDesc fields
-//   block_stride_elems     engine per-block dim-0 stride, 0 = tight
-//   lmcache_chunk_size     tokens per LMCache object (upstream same-name param)
-//   lmcache_to_engine      true: H2D (LMCache -> engine), false: D2H
-//   k_plane_elems          packed latent plane width (0 = 2LTD nh*hs)
-//   v_plane_elems          packed scale plane width (0 = 2LTD)
-//   lmc_row_elems          packed LMC token row (0 = 2LTD)
-//   kv_size                pointer-table planes per layer (1 or 2)
-//   k_block_stride_bytes   packed latent dim-0 byte stride (0 = shared)
-//   v_block_stride_bytes   packed scale dim-0 byte stride (0 = shared)
+// The kernel is a pure byte mover: no dtype conversion, no HND transpose,
+// no model-name dispatch. All geometry (payload/block stride/offsets) is
+// derived and validated by the host-side prepare_group and passed in
+// through the layout POD.
 void multi_layer_block_transfer_kernel(
-    AscendType type, uint32_t blockDim, void *stream,
-    uint8_t *paged_buffer_ptrs, uint8_t *lmcache_obj, uint8_t *engine_block_ids,
-    int32_t num_blocks_per_object, int32_t skip_prefix_n_blocks,
-    int32_t nl, int32_t bs, int32_t nh, int32_t hs,
-    int32_t block_stride_elems, int32_t lmcache_chunk_size,
-    bool lmcache_to_engine, int32_t k_plane_elems, int32_t v_plane_elems,
-    int32_t lmc_row_elems, int32_t kv_size, int32_t k_block_stride_bytes,
-    int32_t v_block_stride_bytes);
+    uint32_t block_dim,            // min(AIV cores, total work items)
+    void* stream,                  // aclrtStream (current NPU stream)
+    uint8_t* paged_buffer_ptrs,    // interleaved pointer table (see above)
+    uint8_t* lmcache_obj,          // LMC object device VA (maybe staged)
+    uint8_t* engine_block_ids,     // int64 array: logical -> engine block
+    int32_t num_blocks_per_object, // == lmcache_chunk_size / bs (host-checked)
+    int32_t skip_prefix_n_blocks,  // leading blocks to skip (prefix dedup)
+    int32_t nl,                    // layers in this group
+    int32_t nb,                    // engine pool block count (ID upper bound)
+    int32_t bs,                    // tokens/slots per block
+    bool separate_plane,           // true: (layer, plane, block) work items
+    BlockTransferLayout layout,    // full byte layout (block_transfer_layout.h)
+    bool to_engine);               // true = H2D (retrieve), false = D2H (store)
 
 } // namespace kvcache_ops
 

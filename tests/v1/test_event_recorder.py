@@ -148,12 +148,8 @@ class TestRecordAndDrain:
         s1 = _make_stream()
         s2 = _make_stream()
         for i in range(5):
-            np_ops.record_event_on_stream(
-                s1.ptr, "mp.test", "sess-1", {}, {"i": i}
-            )
-            np_ops.record_event_on_stream(
-                s2.ptr, "mp.test", "sess-2", {}, {"i": i}
-            )
+            np_ops.record_event_on_stream(s1.ptr, "mp.test", "sess-1", {}, {"i": i})
+            np_ops.record_event_on_stream(s2.ptr, "mp.test", "sess-2", {}, {"i": i})
         s1.synchronize()
         s2.synchronize()
 

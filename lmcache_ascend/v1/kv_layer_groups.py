@@ -386,12 +386,8 @@ def build_kv_layer_groups(
         elif isinstance(rep, (tuple, list)):
             rep_dtype = rep[0].dtype
             if all(isinstance(t, torch.Tensor) and t.ndim >= 3 for t in rep):
-                attach_tuple_planes(
-                    shape_desc, _plane_slot_bytes(rep, is_310p=is_310p)
-                )
-                attach_tuple_block_strides(
-                    shape_desc, _plane_block_stride_bytes(rep)
-                )
+                attach_tuple_planes(shape_desc, _plane_slot_bytes(rep, is_310p=is_310p))
+                attach_tuple_block_strides(shape_desc, _plane_block_stride_bytes(rep))
         else:
             rep_dtype = rep.dtype
         group_info = KVLayerGroupInfo(

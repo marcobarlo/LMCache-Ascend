@@ -34,7 +34,7 @@ std::vector<torch::Tensor> normalize_kv_caches(const py::object &input) {
 namespace {
 constexpr size_t kMaxPlanes = 4;
 
-py::tuple plane_array_get(const int32_t* arr, int32_t n) {
+py::tuple plane_array_get(const int64_t* arr, int32_t n) {
   if (n <= 0) {
     return py::tuple();
   }
@@ -47,7 +47,7 @@ py::tuple plane_array_get(const int32_t* arr, int32_t n) {
   return out;
 }
 
-void plane_array_set(int32_t* arr, const std::vector<int32_t>& v,
+void plane_array_set(int64_t* arr, const std::vector<int64_t>& v,
                      const char* name) {
   if (v.size() > kMaxPlanes) {
     throw py::value_error(std::string(name) + " length exceeds max 4");
@@ -183,21 +183,10 @@ PYBIND11_MODULE(c_ops, m) {
       .value("NL_X_TWO_X_NB_BS_NH_HS", EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS)
       .value("NL_X_NP_X_NB_BS_ONE_HS", EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS)
       .export_values();
-  m.def("is_cross_layer", [](EngineKVFormat f) { return is_cross_layer(f); },
-        py::arg("engine_kv_format"));
-  m.def("is_kv_list", [](EngineKVFormat f) { return is_kv_list(f); },
-        py::arg("engine_kv_format"));
-  m.def("is_layer_list", [](EngineKVFormat f) { return is_layer_list(f); },
-        py::arg("engine_kv_format"));
-  m.def("is_mla", [](EngineKVFormat f) { return is_mla(f); },
-        py::arg("engine_kv_format"));
-  m.def("is_kv_second_tuple",
-        [](EngineKVFormat f) { return is_kv_second_tuple(f); },
-        py::arg("engine_kv_format"));
   // Factory constructs this class via device_ops.PageBufferShapeDesc()
   // after NpuDeviceOps.bind_native. Kernels take it by value (same as CUDA
-  // + lmcache_native). dynamic_attr keeps torch dtype / plane_widths for
-  // the Python torch_ops fallback.
+  // + lmcache_native). dynamic_attr keeps torch dtype for the Python
+  // torch_ops fallback.
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc",
                                   py::module_local(), py::dynamic_attr())
       .def(py::init<>())
@@ -216,7 +205,7 @@ PYBIND11_MODULE(c_ops, m) {
           [](const PageBufferShapeDesc& s) {
             return plane_array_get(s.plane_slot_bytes, s.num_planes);
           },
-          [](PageBufferShapeDesc& s, const std::vector<int32_t>& v) {
+          [](PageBufferShapeDesc& s, const std::vector<int64_t>& v) {
             plane_array_set(s.plane_slot_bytes, v, "plane_slot_bytes");
           })
       .def_property(
@@ -224,7 +213,7 @@ PYBIND11_MODULE(c_ops, m) {
           [](const PageBufferShapeDesc& s) {
             return plane_array_get(s.plane_block_stride_bytes, s.num_planes);
           },
-          [](PageBufferShapeDesc& s, const std::vector<int32_t>& v) {
+          [](PageBufferShapeDesc& s, const std::vector<int64_t>& v) {
             plane_array_set(s.plane_block_stride_bytes, v,
                             "plane_block_stride_bytes");
           });

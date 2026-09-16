@@ -115,12 +115,8 @@ class TestRecordAndDrain:
         s1 = _make_stream()
         s2 = _make_stream()
         for i in range(5):
-            np_ops.record_completion_on_stream(
-                s1.ptr, "s1", msgspec.msgpack.encode(i)
-            )
-            np_ops.record_completion_on_stream(
-                s2.ptr, "s2", msgspec.msgpack.encode(i)
-            )
+            np_ops.record_completion_on_stream(s1.ptr, "s1", msgspec.msgpack.encode(i))
+            np_ops.record_completion_on_stream(s2.ptr, "s2", msgspec.msgpack.encode(i))
         s1.synchronize()
         s2.synchronize()
 

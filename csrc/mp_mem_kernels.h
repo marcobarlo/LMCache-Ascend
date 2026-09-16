@@ -39,45 +39,6 @@ enum class EngineKVFormat : int {
   NL_X_NP_X_NB_BS_ONE_HS = 17,
 };
 
-inline constexpr bool is_cross_layer(EngineKVFormat f) {
-  return f == EngineKVFormat::NB_NL_TWO_BS_NH_HS ||
-         f == EngineKVFormat::NB_NL_TWO_NH_BS_HS;
-}
-
-inline constexpr bool is_kv_list(EngineKVFormat f) {
-  return f == EngineKVFormat::TWO_X_NL_X_NBBS_NH_HS ||
-         f == EngineKVFormat::TWO_X_NL_X_NB_BS_NH_HS;
-}
-
-inline constexpr bool is_layer_list(EngineKVFormat f) {
-  return f == EngineKVFormat::NL_X_TWO_NB_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_NB_BS_HS ||
-         f == EngineKVFormat::NL_X_NBBS_ONE_HS ||
-         f == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-         f == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS ||
-         f == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS ||
-         f == EngineKVFormat::NL_X_NB_BS_NH_TWO_HS ||
-         f == EngineKVFormat::NL_X_NB_NH_BS_CS ||
-         f == EngineKVFormat::NL_X_NB_BS_NH_CS ||
-         f == EngineKVFormat::NL_X_NB_BSV_BSS ||
-         f == EngineKVFormat::NL_X_TWO_NB_NH_ONE_BS_HS ||
-         f == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
-}
-
-inline constexpr bool is_mla(EngineKVFormat f) {
-  return f == EngineKVFormat::NL_X_NB_BS_HS ||
-         f == EngineKVFormat::NL_X_NBBS_ONE_HS ||
-         f == EngineKVFormat::NL_X_NB_BSV_BSS ||
-         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
-}
-
-inline constexpr bool is_kv_second_tuple(EngineKVFormat f) {
-  return f == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ||
-         f == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
-}
-
 // Compile-time shape descriptor, field-for-field aligned with upstream
 // PageBufferShapeDesc (LMCache csrc/mp_mem_kernels.cuh:11). block_stride_elems
 // honours engine-side dim-0 padding when > 0, else falls back to the tight
@@ -91,13 +52,15 @@ struct PageBufferShapeDesc {
   int hs;
   int element_size;
   int block_stride_elems;
-  // Ascend-only: fmt-17 tuple plane count. 0 = unset (do not infer packed
-  // from hs % 32). plane_slot_bytes[i] is payload bytes per token.
+  // Ascend-only: physical plane count per layer. 0 = unfilled (legacy input,
+  // only fmt 16/13 may be derived); >0 = validated geometry, doubles as the
+  // "fields complete" sentinel (no separate protocol version).
   int32_t num_planes = 0;
-  int32_t plane_slot_bytes[4] = {0, 0, 0, 0};
-  // Per-block dim-0 step in bytes (stride(0) * itemsize). Packed kernel
-  // uses [0]/[1]; 0 falls back to block_stride_elems * element_size.
-  int32_t plane_block_stride_bytes[4] = {0, 0, 0, 0};
+  // Per-plane payload bytes per token slot (64-bit byte addressing). The
+  // engine-side token step is derived from the payload (dense token rows).
+  int64_t plane_slot_bytes[4] = {0, 0, 0, 0};
+  // Per-plane per-block dim-0 step in bytes (stride(0) * itemsize).
+  int64_t plane_block_stride_bytes[4] = {0, 0, 0, 0};
 
   template <typename ScalarType>
   inline size_t scalars_per_head() const {
@@ -116,15 +79,6 @@ struct PageBufferShapeDesc {
                              : static_cast<size_t>(bs) * nh * hs;
     return elems * element_size / sizeof(ScalarType);
   }
-};
-
-// Up to 4 LMCache object pointers (upstream MemoryObj4, mp_mem_kernels.cuh:64).
-// Phase 1 launches one object at a time (see multi_layer_block_kv_transfer);
-// the struct keeps the interface aligned for the phase-2 fused launch.
-template <typename ScalarType>
-struct MemoryObj4 {
-  ScalarType* objects[4];
-  int num_objects;
 };
 
 // Object-group transfer plan types (upstream mp_mem_kernels.cuh:80-116).
@@ -170,7 +124,7 @@ void execute_object_group_transfer(
 // Block-level multi-layer KV transfer between vLLM paged buffers and LMCache
 // contiguous memory objects. Mirrors upstream multi_layer_block_kv_transfer
 // (mp_mem_kernels.cuh:155). Phase 1 loops over the object batch inside this
-// entry point (one kernel launch per object, see design doc 4.5).
+// entry point (one kernel launch per object).
 void multi_layer_block_kv_transfer(
     const torch::Tensor& paged_buffer_ptrs_tensor,
     std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,

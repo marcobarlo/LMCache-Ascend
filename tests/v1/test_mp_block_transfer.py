@@ -27,9 +27,10 @@ requires_npu = pytest.mark.skipif(
     reason="Ascend NPU required",
 )
 
-KG0_FMT = getattr(
-    native.EngineKVFormat, "NL_X_TWO_X_NB_BS_HS", None
-) or native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
+KG0_FMT = (
+    getattr(native.EngineKVFormat, "NL_X_TWO_X_NB_BS_HS", None)
+    or native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
+)
 NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
 D2H = native.TransferDirection.D2H
@@ -307,9 +308,9 @@ def _make_paged_tensor(
         tensor = storage[:, :bs]
     else:
         tensor = torch.empty((nb, bs, nh, hs), dtype=torch.float16, device=device)
-    values = torch.arange(tensor.numel(), dtype=torch.float32, device=device).reshape_as(
-        tensor
-    )
+    values = torch.arange(
+        tensor.numel(), dtype=torch.float32, device=device
+    ).reshape_as(tensor)
     tensor.copy_((values + offset).to(torch.float16))
     return tensor
 
@@ -589,25 +590,17 @@ def _roundtrip_cases() -> list[Any]:
         )
     )
     cases.append(
-        pytest.param(
-            "nh_cs_fmt17", "npu", False, 0, 2, 1, [0], id="nh_cs-fmt17"
-        )
+        pytest.param("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], id="nh_cs-fmt17")
     )
     cases.append(
-        pytest.param(
-            "kg0_indep", "npu", False, 0, 2, 1, [0], id="kg0-indep-mini"
-        )
+        pytest.param("kg0_indep", "npu", False, 0, 2, 1, [0], id="kg0-indep-mini")
     )
     # Packed MLA page width (bs) and chunk = n_blocks * bs.
     cases.append(
-        pytest.param(
-            "kg0_bs16", "npu", False, 0, 2, 1, [0], id="kg0-bs16-chunk16"
-        )
+        pytest.param("kg0_bs16", "npu", False, 0, 2, 1, [0], id="kg0-bs16-chunk16")
     )
     cases.append(
-        pytest.param(
-            "kg0_bs64", "npu", False, 0, 2, 1, [0, 1], id="kg0-bs64-chunk128"
-        )
+        pytest.param("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], id="kg0-bs64-chunk128")
     )
     return cases
 
@@ -635,14 +628,20 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     bpo = len(block_ids) // num_objects
     chunk = bpo * bs
     if spec["kv_leading"]:
-        obj_shape: tuple[int, ...] = (2, spec["obj_tail"][0], chunk, spec["obj_tail"][1])
+        obj_shape: tuple[int, ...] = (
+            2,
+            spec["obj_tail"][0],
+            chunk,
+            spec["obj_tail"][1],
+        )  # noqa: E501
     else:
         obj_shape = (spec["obj_tail"][0], chunk, spec["obj_tail"][1])
     ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
     golden = _clone_engine(spec["layers"])
-    with _host_objects(
-        host, [obj_shape] * num_objects, spec["obj_dtype"], device
-    ) as (ptrs, obj_tensors):
+    with _host_objects(host, [obj_shape] * num_objects, spec["obj_dtype"], device) as (
+        ptrs,
+        obj_tensors,
+    ):
 
         def _d2h() -> None:
             _transfer(
@@ -719,9 +718,7 @@ def _layout_pair(layout: str, device: torch.device) -> dict[str, Any]:
         layers_b = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
         return dict(
             fmt=NH_CS_FMT,
-            desc=_shape_desc(
-                kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype
-            ),
+            desc=_shape_desc(kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype),
             layers_a=layers_a,
             layers_b=layers_b,
             table=_pointer_table(layers_a, device),
@@ -768,7 +765,9 @@ def _layout_pair(layout: str, device: torch.device) -> dict[str, Any]:
     raise ValueError(layout)
 
 
-def _fill_src_object(layout: str, spec: dict[str, Any], device: torch.device) -> torch.Tensor:
+def _fill_src_object(
+    layout: str, spec: dict[str, Any], device: torch.device
+) -> torch.Tensor:
     nl, chunk = spec["nl"], spec["chunk"]
     if layout == "kg0":
         return _kg0_packed_object(nl, chunk, device)
@@ -998,7 +997,6 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
     _assert_engine_equal(layers13_d, layers13_p)
 
 
-
 @requires_npu
 @pytest.mark.parametrize("affinity", [False, True], ids=["main", "affinity"])
 @pytest.mark.parametrize("num_objects", [1, 2], ids=["1obj", "2obj"])
@@ -1050,9 +1048,7 @@ def test_plan_staging_d2h_matches_direct(affinity: bool, num_objects: int) -> No
     ]
 
     def _store() -> None:
-        lmc_ops.execute_object_group_transfer(
-            int(D2H), device, 1 << 26, [spec], steps
-        )
+        lmc_ops.execute_object_group_transfer(int(D2H), device, 1 << 26, [spec], steps)
         torch.npu.synchronize()
 
     _run(_store, affinity=affinity)

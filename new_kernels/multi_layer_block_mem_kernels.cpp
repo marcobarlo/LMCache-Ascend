@@ -1,568 +1,315 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-License-Identifier: Apache-2.0
 
 // Block-level multi-layer KV transfer between the engine's paged buffers and
 // LMCache contiguous memory objects, for the MP (multiprocess) mode.
 //
-// Mirrors the upstream CUDA kernel multi_layer_block_transfer_kernel
-// (LMCache csrc/mp_mem_kernels.cu): one work item moves one full block of one
-// (layer, k_or_v) plane as a contiguous burst, instead of expanding block ids
-// to a token-level slot mapping. The CUDA grid (kv_size, NB, NL) maps onto a
-// grid-stride loop over the AIV cores.
+// Generalized NP=1..4 byte mover. One launch
+// handles one LMCache object; the host resolves every geometry question and
+// hands the kernel a flat BlockTransferLayout POD. The kernel never
+// re-interprets the engine KV format, never converts dtypes and never
+// dispatches on model names.
 //
-// Phase 1 (see ascend_mp_mode_implementation_plan.md 4.5): one LMCache object
-// per launch — the C++ boundary loops over the object batch and slices
-// block_ids by i * num_blocks_per_object. Phase 2 restores the fused
-// 4-object launch (obj_idx = flat_block_idx / num_blocks_per_object).
+// Work decomposition:
+//   - separate_plane (format 16): work item = (layer, plane, block). K and V
+//     live in disjoint LMC slabs and disjoint engine allocations, so
+//     different cores may own different planes of the same page.
+//   - packed page (formats 13/17): work item = (layer, block). ONE AIV core
+//     moves every plane of the page, so two cores can never write the same
+//     32B LMC line (thin planes such as a 2B scale share cache lines with
+//     their row neighbours).
 //
-// Layouts:
-//   SEPARATE_KV (format 16): per-layer (K, V) [NB, BS, NH, HS]; LMC 2LTD.
-//   Packed two-plane (format 17): [latent, scale] ptr table; UB rows are
-//     AlignUp32(lmc_row) with four strided DataCopyPads (two per direction).
+// Copy paths per plane block (ProcessPlaneBlock):
+//   - contiguous fast path: the LMC row holds exactly this plane
+//     (lmc_token_stride == payload), payload is a 32B multiple and both GM
+//     addresses are 32B aligned -> one DataCopy per segment.
+//   - row path: strided DataCopyPad, GM-side gap = row_stride - payload
+//     (engine side is dense, so its gap is always 0; the LMC packed-row gap
+//     is the width of the other planes). UB rows occupy AlignUp32(payload)
+//     with zero extra gap.
 
 #include "multi_layer_block_mem_kernels.h"
-#include "multi_layer_mem_kernels.h"
-#include <stdexcept>
-#include <string>
+#include "kernel_operator.h"
 
-// ---------------------------------------------------------------------------
-// Device kernel
-// ---------------------------------------------------------------------------
+namespace {
 
-template <typename scalar_t, typename slot_t>
 class MultiLayerBlockTransfer {
-    using local_scalar_t = AscendC::LocalTensor<scalar_t>;
+ public:
+  __aicore__ inline void Init(
+      GM_ADDR pointers, GM_ADDR object, GM_ADDR ids, int32_t blocks,
+      int32_t skip, int32_t nl, int32_t nb, int32_t bs, bool separate_plane,
+      kvcache_ops::BlockTransferLayout layout, AscendC::TPipe* pipe) {
+    pointers_ = reinterpret_cast<__gm__ uint64_t*>(pointers);
+    ids_ = reinterpret_cast<__gm__ int64_t*>(ids);
+    object_base_ = reinterpret_cast<__gm__ uint8_t*>(object);
+    object_.SetGlobalBuffer(object_base_, layout.lmc_object_bytes);
+    blocks_ = blocks;
+    skip_ = skip;
+    nl_ = nl;
+    nb_ = nb;
+    bs_ = bs;
+    separate_plane_ = separate_plane;
+    layout_ = layout;
 
-public:
-    __aicore__ inline MultiLayerBlockTransfer() {}
+    // UB segmentation: every token row occupies AlignUp32(payload) in UB
+    // (DataCopyPad rounds each row up to the 32B boundary). All planes share
+    // one queue buffer, so the segment must fit the widest aligned row.
+    const int64_t max_row = MaxAlignedRowBytes();
+    // One in-flight segment per queue slot: host guarantees
+    // align_up32(payload) <= UB / kBlockTransferQueueDepth, so fit >= 1.
+    const int64_t fit = kvcache_ops::kBlockTransferUbBytes /
+                        (kvcache_ops::kBlockTransferQueueDepth * max_row);
+    int64_t rows = fit < bs ? fit : bs;
+    if (rows < 1) {
+      rows = 1;  // unreachable after host validation; keeps InitBuffer sane
+    }
+    tokens_per_segment_ = static_cast<int32_t>(rows);
+    pipe->InitBuffer(queue_, kvcache_ops::kBlockTransferQueueDepth,
+                     tokens_per_segment_ * max_row);
+  }
 
-    __aicore__ inline void init(
-        GM_ADDR paged_buffer_ptrs, GM_ADDR lmcache_obj,
-        GM_ADDR engine_block_ids, const int32_t num_blocks_per_object,
-        const int32_t skip_prefix_n_blocks, const int32_t nl, const int32_t bs,
-        const int32_t nh, const int32_t hs, const int32_t block_stride_elems,
-        const int32_t lmcache_chunk_size, const bool lmcache_to_engine,
-        const int32_t k_plane_elems, const int32_t v_plane_elems,
-        const int32_t lmc_row_elems, const int32_t kv_size,
-        const int32_t k_block_stride_bytes, const int32_t v_block_stride_bytes,
-        AscendC::TPipe *pipe)
-    {
-        paged_buffer_ptrs_ = paged_buffer_ptrs;
-        lmcache_obj_ = lmcache_obj;
-        engine_block_ids_ = reinterpret_cast<__gm__ slot_t *>(engine_block_ids);
-        num_blocks_per_object_ = num_blocks_per_object;
-        skip_prefix_n_blocks_ = skip_prefix_n_blocks;
-        nl_ = nl;
-        bs_ = bs;
-        lmcache_chunk_size_ = lmcache_chunk_size;
-        lmcache_to_engine_ = lmcache_to_engine;
-        k_plane_elems_ = k_plane_elems;
-        v_plane_elems_ = v_plane_elems;
-        lmc_row_elems_ = lmc_row_elems;
-        kv_size_ = kv_size < 1 ? 1 : kv_size;
-
-        scalars_per_token_ = static_cast<int64_t>(nh) * hs;
-
-        // Engine-side per-block dim-0 stride in scalar_t elements: the padded
-        // block_stride_elems when set, the tight bs * nh * hs otherwise
-        // (upstream PageBufferShapeDesc::scalars_per_block() semantics).
-        engine_block_stride_ = block_stride_elems > 0
-            ? static_cast<int64_t>(block_stride_elems)
-            : static_cast<int64_t>(bs) * scalars_per_token_;
-
-        const int64_t sharedPagedBlockBytes =
-            engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
-        k_block_stride_bytes_ = k_block_stride_bytes > 0
-            ? static_cast<int64_t>(k_block_stride_bytes)
-            : sharedPagedBlockBytes;
-        v_block_stride_bytes_ = v_block_stride_bytes > 0
-            ? static_cast<int64_t>(v_block_stride_bytes)
-            : sharedPagedBlockBytes;
-
-        // Contiguous data extent per block (trailing padding is never moved).
-        data_elems_per_block_ = static_cast<int64_t>(bs) * scalars_per_token_;
-
-        // --- UB segmentation (design doc 4.2) ---
-        // Bound one segment to half of a conservative UB budget so the
-        // depth-2 double-buffered queue fits; the same bound covers the
-        // single-DataCopy burst length. Host-side checks guarantee
-        // token_bytes <= budget / 2, so tokens_per_seg_ >= 1 here.
-        const int64_t ubBudgetBytes = 128 * 1024;
-        const int64_t kBytes = k_plane_elems_ > 0
-            ? static_cast<int64_t>(k_plane_elems_) *
-                  static_cast<int64_t>(sizeof(scalar_t))
-            : scalars_per_token_ * static_cast<int64_t>(sizeof(scalar_t));
-        const int64_t vBytes = v_plane_elems_ > 0
-            ? static_cast<int64_t>(v_plane_elems_) *
-                  static_cast<int64_t>(sizeof(scalar_t))
-            : kBytes;
-        const int64_t maxHdBytes = kBytes > vBytes ? kBytes : vBytes;
-        // Packed path stages the whole page: rows are AlignUp32(lmc_row).
-        const int64_t tokenBytes = lmc_row_elems_ > 0
-            ? AlignUp32Bytes(static_cast<int64_t>(lmc_row_elems_) *
-                             static_cast<int64_t>(sizeof(scalar_t)))
-            : maxHdBytes;
-        int64_t fit = lmc_row_elems_ > 0 ? static_cast<int64_t>(bs)
-                                         : ubBudgetBytes / (2 * tokenBytes);
-        if (fit < 1) {
-            fit = 1;
+  template <bool ToEngine>
+  __aicore__ inline void Process() {
+    // separate_plane: one work item per (layer, plane, block); packed page:
+    // one per (layer, block) with the plane loop inside the work item.
+    const int32_t plane_slots = separate_plane_ ? layout_.num_planes : 1;
+    const int64_t work =
+        static_cast<int64_t>(nl_) * plane_slots * blocks_;
+    for (int64_t w = AscendC::GetBlockIdx(); w < work;
+         w += AscendC::GetBlockNum()) {
+      const int32_t block = w % blocks_;
+      if (block < skip_) continue;
+      const int32_t plane = (w / blocks_) % plane_slots;
+      const int32_t layer =
+          w / (static_cast<int64_t>(blocks_) * plane_slots);
+      // Map the in-object logical block to the engine's physical block. The
+      // producer contract guarantees 0 <= id < nb;
+      const int64_t engine_block = ids_[block];
+      if (engine_block < 0 || engine_block >= nb_) continue;
+      if (separate_plane_) {
+        ProcessPlaneBlock<ToEngine>(layer, plane, block, engine_block);
+      } else {
+        for (int32_t p = 0; p < layout_.num_planes; ++p) {
+          ProcessPlaneBlock<ToEngine>(layer, p, block, engine_block);
         }
-        if (fit > bs) {
-            fit = bs;
-        }
-        tokens_per_seg_ = static_cast<int32_t>(fit);
-
-        pipe_ = pipe;
-        pipe_->InitBuffer(block_que_, 2, tokens_per_seg_ * tokenBytes);
+      }
     }
+  }
 
-    __aicore__ inline void process()
-    {
-        // Phase 1: single object per launch, so total_blocks is this object's
-        // block count (design doc 4.1). kv_size_ is 2 for separate K/V, 1 for
-        // packed MLA (both planes on one core) and fused NH_CS.
-        const int32_t total_blocks = num_blocks_per_object_;
-        const int32_t kv = kv_size_;
-        const int32_t total_work = nl_ * kv * total_blocks;
-        const int32_t core_num = AscendC::GetBlockNum();
+ private:
+  __aicore__ inline int64_t AlignUp32(int64_t bytes) const {
+    return (bytes + 31) & ~int64_t(31);
+  }
 
-        for (int32_t w = AscendC::GetBlockIdx(); w < total_work; w += core_num) {
-            // Dimension decomposition mirrors the CUDA grid
-            // (z, y, x) = (layer, k_or_v, flat_block), upstream L233-236.
-            const int32_t layer_idx = w / (kv * total_blocks);
-            const int32_t remainder = w % (kv * total_blocks);
-            const int32_t k_or_v = remainder / total_blocks;
-            const int32_t flat_block_idx = remainder % total_blocks;
-
-            // Prefix blocks idle-return without reading the ids array
-            // (upstream L239: the array is indexed from 0 including prefix).
-            if (flat_block_idx < skip_prefix_n_blocks_) {
-                continue;
-            }
-
-            const int64_t engine_block_idx =
-                static_cast<int64_t>(engine_block_ids_[flat_block_idx]);
-            process_single_block(layer_idx, k_or_v, flat_block_idx,
-                                 engine_block_idx);
-        }
+  __aicore__ inline int64_t MaxAlignedRowBytes() const {
+    int64_t max_row = 0;
+    for (int32_t p = 0; p < layout_.num_planes; ++p) {
+      const int64_t row = AlignUp32(layout_.planes[p].payload_bytes);
+      max_row = row > max_row ? row : max_row;
     }
+    return max_row;
+  }
 
-private:
-    __aicore__ inline int64_t AlignUp32Bytes(const int64_t bytes) const {
-        return (bytes + 31) & ~static_cast<int64_t>(31);
-    }
+  // Pointer table: ptrs[layer * num_planes + plane]; each entry already
+  // includes the view's storage_offset.
+  __aicore__ inline __gm__ uint8_t* ResolveEnginePlanePtr(
+      int32_t layer, int32_t plane) const {
+    return reinterpret_cast<__gm__ uint8_t*>(
+        pointers_[static_cast<int64_t>(layer) * layout_.num_planes + plane]);
+  }
 
-    // DataCopyPad UB stride is in 32 B dataBlocks, start-to-start. hd=2 -> 1.
-    __aicore__ inline uint32_t UbRowStrideBlks(const int64_t hdBytes) const {
-        return static_cast<uint32_t>(AlignUp32Bytes(hdBytes) / 32);
-    }
+  // LMC side: plane column offset + layer stride + in-object block offset.
+  // The in-object block index (not the engine block id) addresses LMC
+  // pages: object token order is contiguous regardless of engine placement.
+  __aicore__ inline int64_t LmcGlobalOffset(
+      int32_t layer, int32_t block,
+      const kvcache_ops::PlaneLayout& plane) const {
+    return plane.lmc_base_offset_bytes +
+           static_cast<int64_t>(layer) * layout_.lmc_layer_stride_bytes +
+           static_cast<int64_t>(block) * bs_ * layout_.lmc_token_stride_bytes;
+  }
 
-    __aicore__ inline void CopyPagedBlockToUb(local_scalar_t dst,
-                                              const int64_t srcByteOff,
-                                              const int32_t nTok,
-                                              const int64_t hdBytes) {
-        AscendC::LocalTensor<uint8_t> dstU8 = dst.template ReinterpretCast<uint8_t>();
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), static_cast<uint32_t>(hdBytes),
-            0u, UbRowStrideBlks(hdBytes), 0u};
-        AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
-        AscendC::DataCopyPad(dstU8, this->pagedTokenGlobalU8_[srcByteOff], params, pad);
-    }
+  // GM -> UB strided rows. DataCopyExtParams: blockCount = rows,
+  // blockLen = payload, srcStride = GM-side row gap in bytes,
+  // dstStride = extra UB gap in 32B blocks (0: rows land at
+  // AlignUp32(payload) pitch, matching the InitBuffer budget).
+  __aicore__ inline void CopyRowsToUb(
+      AscendC::LocalTensor<uint8_t> ub, AscendC::GlobalTensor<uint8_t>& gm,
+      int64_t offset, uint16_t rows, uint32_t bytes, int64_t row_stride) {
+    AscendC::DataCopyExtParams copy{
+        rows, bytes, static_cast<uint32_t>(row_stride - bytes), 0u, 0u};
+    AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
+    AscendC::DataCopyPad(ub, gm[offset], copy, pad);
+  }
 
-    __aicore__ inline void CopyUbToLmcBlock(const int64_t dstByteOff,
-                                            local_scalar_t src,
-                                            const int32_t nTok,
-                                            const int64_t hdBytes,
-                                            const int64_t lmcRowBytes) {
-        AscendC::LocalTensor<uint8_t> srcU8 = src.template ReinterpretCast<uint8_t>();
-        const uint32_t dstStride = static_cast<uint32_t>(lmcRowBytes - hdBytes);
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), static_cast<uint32_t>(hdBytes),
-            UbRowStrideBlks(hdBytes), dstStride, 0u};
-        AscendC::DataCopyPad(this->lmcBufferGlobalU8_[dstByteOff], srcU8, params);
-    }
+  // UB -> GM strided rows: the stride roles swap. UB rows are read at
+  // AlignUp32(payload) pitch (srcStride = 0); dstStride is the GM-side row
+  // gap in bytes.
+  __aicore__ inline void CopyUbToRows(
+      AscendC::GlobalTensor<uint8_t>& gm, int64_t offset,
+      AscendC::LocalTensor<uint8_t> ub, uint16_t rows, uint32_t bytes,
+      int64_t row_stride) {
+    AscendC::DataCopyExtParams copy{
+        rows, bytes, 0u, static_cast<uint32_t>(row_stride - bytes), 0u};
+    AscendC::DataCopyPad(gm[offset], ub, copy);
+  }
 
-    __aicore__ inline void CopyLmcBlockToUb(local_scalar_t dst,
-                                            const int64_t srcByteOff,
-                                            const int32_t nTok,
-                                            const int64_t hdBytes,
-                                            const int64_t lmcRowBytes) {
-        AscendC::LocalTensor<uint8_t> dstU8 = dst.template ReinterpretCast<uint8_t>();
-        const uint32_t srcStride = static_cast<uint32_t>(lmcRowBytes - hdBytes);
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), static_cast<uint32_t>(hdBytes),
-            srcStride, UbRowStrideBlks(hdBytes), 0u};
-        AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
-        AscendC::DataCopyPad(dstU8, this->lmcBufferGlobalU8_[srcByteOff], params, pad);
-    }
+  // Move one (layer, plane, block) between the engine page and the LMC
+  // packed row, segmented to fit the UB budget.
+  template <bool ToEngine>
+  __aicore__ inline void ProcessPlaneBlock(int32_t layer, int32_t plane_idx,
+                                           int32_t block,
+                                           int64_t engine_block) {
+    const auto& plane = layout_.planes[plane_idx];
+    // Engine side: dense token rows, so the token step equals the payload.
+    auto* engine_ptr = ResolveEnginePlanePtr(layer, plane_idx) +
+                       engine_block * plane.engine_block_stride_bytes;
+    AscendC::GlobalTensor<uint8_t> engine;
+    engine.SetGlobalBuffer(
+        engine_ptr, static_cast<uint64_t>(bs_) * plane.payload_bytes);
+    const int64_t lmc_base = LmcGlobalOffset(layer, block, plane);
 
-    __aicore__ inline void CopyUbToPagedBlock(const int64_t dstByteOff,
-                                              local_scalar_t src,
-                                              const int32_t nTok,
-                                              const int64_t hdBytes) {
-        AscendC::LocalTensor<uint8_t> srcU8 = src.template ReinterpretCast<uint8_t>();
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), static_cast<uint32_t>(hdBytes),
-            UbRowStrideBlks(hdBytes), 0u, 0u};
-        AscendC::DataCopyPad(this->pagedTokenGlobalU8_[dstByteOff], srcU8, params);
-    }
+    // Fast path: the LMC row holds exactly this plane, the payload is a 32B
+    // multiple and both GM bases are 32B aligned -> whole segment in one
+    // DataCopy. Packed multi-plane rows always take the row path.
+    const bool contiguous =
+        layout_.lmc_token_stride_bytes == plane.payload_bytes &&
+        plane.payload_bytes % 32 == 0 &&
+        reinterpret_cast<uint64_t>(engine_ptr) % 32 == 0 &&
+        reinterpret_cast<uint64_t>(object_base_ + lmc_base) % 32 == 0;
 
-    // DataCopyPad stride is the GAP between blocks: GM side in bytes, UB side
-    // in 32 B DataBlocks after the block is rounded up to 32 B.
-    __aicore__ inline void CopyGmToUbPad(
-        AscendC::LocalTensor<uint8_t> dst,
-        const AscendC::GlobalTensor<uint8_t> &src, const int64_t srcByteOff,
-        const int32_t nTok, const uint32_t blockLen,
-        const uint32_t srcGapBytes, const uint32_t dstGapBlks) {
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), blockLen, srcGapBytes, dstGapBlks, 0u};
-        AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0u, 0u, 0u};
-        AscendC::DataCopyPad(dst, src[srcByteOff], params, pad);
-    }
+    for (int32_t start = 0; start < bs_; start += tokens_per_segment_) {
+      const int32_t remaining = bs_ - start;
+      const int32_t rows =
+          remaining < tokens_per_segment_ ? remaining : tokens_per_segment_;
+      const int64_t engine_offset =
+          static_cast<int64_t>(start) * plane.payload_bytes;
+      const int64_t lmc_offset = lmc_base +
+                                 static_cast<int64_t>(start) *
+                                     layout_.lmc_token_stride_bytes;
 
-    __aicore__ inline void CopyUbToGmPad(
-        const AscendC::GlobalTensor<uint8_t> &dst, const int64_t dstByteOff,
-        AscendC::LocalTensor<uint8_t> src, const int32_t nTok,
-        const uint32_t blockLen, const uint32_t srcGapBlks,
-        const uint32_t dstGapBytes) {
-        AscendC::DataCopyExtParams params{
-            static_cast<uint16_t>(nTok), blockLen, srcGapBlks, dstGapBytes, 0u};
-        AscendC::DataCopyPad(dst[dstByteOff], src, params);
-    }
-
-    // Packed two-plane (fmt 17): one AIV moves both planes of one (layer, page).
-    // UB page = bs rows of AlignUp32(lmc_row): [k latent | v scale | dummy].
-    __aicore__ inline void process_packed_block(
-        const int32_t layer_idx, const int32_t block_idx_in_object,
-        const int64_t engine_block_idx)
-    {
-        const int64_t kBytes = static_cast<int64_t>(k_plane_elems_) *
-                               static_cast<int64_t>(sizeof(scalar_t));
-        const int64_t vBytes = static_cast<int64_t>(v_plane_elems_) *
-                               static_cast<int64_t>(sizeof(scalar_t));
-        const int64_t rowBytes = static_cast<int64_t>(lmc_row_elems_) *
-                                 static_cast<int64_t>(sizeof(scalar_t));
-        const int64_t ubRowBytes = AlignUp32Bytes(rowBytes);
-        const int32_t nTok = bs_;
-        // Gaps in 32 B DataBlocks so every UB row pitch is ubRowBytes.
-        const uint32_t latentGapBlks =
-            static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(kBytes)) / 32);
-        const uint32_t scaleGapBlks =
-            static_cast<uint32_t>((ubRowBytes - AlignUp32Bytes(vBytes)) / 32);
-
-        __gm__ uint8_t *latent_base =
-            kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
-                paged_buffer_ptrs_, layer_idx, 0);
-        __gm__ uint8_t *scale_base =
-            kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
-                paged_buffer_ptrs_, layer_idx, 1);
-        pagedTokenGlobalU8_.SetGlobalBuffer(
-            latent_base + engine_block_idx * k_block_stride_bytes_,
-            static_cast<uint64_t>(nTok) * kBytes);
-        scalePagedGlobalU8_.SetGlobalBuffer(
-            scale_base + engine_block_idx * v_block_stride_bytes_,
-            static_cast<uint64_t>(nTok) * vBytes);
-        lmcBufferGlobalU8_.SetGlobalBuffer(
-            reinterpret_cast<__gm__ uint8_t *>(lmcache_obj_),
-            static_cast<uint64_t>(nl_) * lmcache_chunk_size_ * rowBytes);
-
-        const int64_t lmcBlockByteOff =
-            static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ * rowBytes +
-            static_cast<int64_t>(block_idx_in_object) * bs_ * rowBytes;
-
-        local_scalar_t page = block_que_.template AllocTensor<scalar_t>();
-        AscendC::LocalTensor<uint8_t> pageU8 =
-            page.template ReinterpretCast<uint8_t>();
-
-        if (lmcache_to_engine_) {
-            CopyGmToUbPad(pageU8, lmcBufferGlobalU8_, lmcBlockByteOff, nTok,
-                          static_cast<uint32_t>(rowBytes), 0u, 0u);
-            block_que_.EnQue(page);
-            page = block_que_.template DeQue<scalar_t>();
-            pageU8 = page.template ReinterpretCast<uint8_t>();
-            CopyUbToGmPad(pagedTokenGlobalU8_, 0, pageU8, nTok,
-                          static_cast<uint32_t>(kBytes), latentGapBlks, 0u);
-            // Dense scale plane: one instruction owns whole 32 B GM lines.
-            CopyUbToGmPad(scalePagedGlobalU8_, 0,
-                          pageU8[static_cast<int32_t>(kBytes)], nTok,
-                          static_cast<uint32_t>(vBytes), scaleGapBlks, 0u);
+      auto ub = queue_.AllocTensor<uint8_t>();
+      if (contiguous) {
+        const uint32_t bytes =
+            static_cast<uint32_t>(rows * plane.payload_bytes);
+        if constexpr (ToEngine) {
+          AscendC::DataCopy(ub, object_[lmc_offset], bytes);
         } else {
-            CopyGmToUbPad(pageU8, pagedTokenGlobalU8_, 0, nTok,
-                          static_cast<uint32_t>(kBytes), 0u, latentGapBlks);
-            CopyGmToUbPad(pageU8[static_cast<int32_t>(kBytes)],
-                          scalePagedGlobalU8_, 0, nTok,
-                          static_cast<uint32_t>(vBytes), 0u, scaleGapBlks);
-            block_que_.EnQue(page);
-            page = block_que_.template DeQue<scalar_t>();
-            pageU8 = page.template ReinterpretCast<uint8_t>();
-            // blockLen=rowBytes drops the UB dummy tail of each row.
-            CopyUbToGmPad(lmcBufferGlobalU8_, lmcBlockByteOff, pageU8, nTok,
-                          static_cast<uint32_t>(rowBytes), 0u, 0u);
+          AscendC::DataCopy(ub, engine[engine_offset], bytes);
         }
-        block_que_.FreeTensor(page);
-    }
-
-    __aicore__ inline void process_single_block(
-        const int32_t layer_idx, const int32_t k_or_v,
-        const int32_t block_idx_in_object, const int64_t engine_block_idx)
-    {
-        if (lmc_row_elems_ > 0) {
-            process_packed_block(layer_idx, block_idx_in_object, engine_block_idx);
-            return;
-        }
-
-        __gm__ uint8_t *paged_layer_base;
-        if (kv_size_ == 1) {
-            paged_layer_base =
-                kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::MERGED_KV>(
-                    paged_buffer_ptrs_, layer_idx, 0);
+      } else {
+        // Row path, GM -> UB: the source stride is the LMC packed row for
+        // H2D (reading LMC), the dense payload for D2H (reading engine).
+        if constexpr (ToEngine) {
+          CopyRowsToUb(ub, object_, lmc_offset, rows, plane.payload_bytes,
+                       layout_.lmc_token_stride_bytes);
         } else {
-            paged_layer_base =
-                kvcache_ops::GetLayerBasePtr<kvcache_ops::KVCacheFormat::SEPARATE_KV>(
-                    paged_buffer_ptrs_, layer_idx, k_or_v);
+          CopyRowsToUb(ub, engine, engine_offset, rows, plane.payload_bytes,
+                       plane.payload_bytes);
         }
-
-        const int64_t hdBytes =
-            scalars_per_token_ * static_cast<int64_t>(sizeof(scalar_t));
-
-        if (hdBytes < 32) {
-            const int64_t pagedBlockBytes =
-                engine_block_stride_ * static_cast<int64_t>(sizeof(scalar_t));
-            __gm__ uint8_t *paged_block =
-                paged_layer_base + engine_block_idx * pagedBlockBytes;
-            pagedTokenGlobalU8_.SetGlobalBuffer(
-                paged_block, static_cast<uint64_t>(pagedBlockBytes));
-            lmcBufferGlobalU8_.SetGlobalBuffer(
-                reinterpret_cast<__gm__ uint8_t *>(lmcache_obj_),
-                static_cast<uint64_t>(nl_) * lmcache_chunk_size_ * hdBytes);
-
-            const int64_t lmcBlockByteOff =
-                static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ * hdBytes +
-                static_cast<int64_t>(block_idx_in_object) * bs_ * hdBytes;
-
-            const int32_t num_segs =
-                (bs_ + tokens_per_seg_ - 1) / tokens_per_seg_;
-            for (int32_t seg = 0; seg < num_segs; ++seg) {
-                const int64_t seg_start_token = seg * tokens_per_seg_;
-                int64_t seg_tokens = static_cast<int64_t>(bs_) - seg_start_token;
-                if (seg_tokens > tokens_per_seg_) {
-                    seg_tokens = tokens_per_seg_;
-                }
-                const int32_t nTok = static_cast<int32_t>(seg_tokens);
-                const int64_t srcByteOff = seg_start_token * hdBytes;
-                const int64_t lmcByteOff =
-                    lmcBlockByteOff + seg_start_token * hdBytes;
-
-                local_scalar_t buf = block_que_.template AllocTensor<scalar_t>();
-                if (lmcache_to_engine_) {
-                    CopyLmcBlockToUb(buf, lmcByteOff, nTok, hdBytes, hdBytes);
-                    block_que_.EnQue(buf);
-                    buf = block_que_.template DeQue<scalar_t>();
-                    CopyUbToPagedBlock(srcByteOff, buf, nTok, hdBytes);
-                } else {
-                    CopyPagedBlockToUb(buf, srcByteOff, nTok, hdBytes);
-                    block_que_.EnQue(buf);
-                    buf = block_que_.template DeQue<scalar_t>();
-                    CopyUbToLmcBlock(lmcByteOff, buf, nTok, hdBytes, hdBytes);
-                }
-                block_que_.FreeTensor(buf);
-            }
-            return;
+      }
+      queue_.EnQue(ub);
+      ub = queue_.DeQue<uint8_t>();
+      if (contiguous) {
+        const uint32_t bytes =
+            static_cast<uint32_t>(rows * plane.payload_bytes);
+        if constexpr (ToEngine) {
+          AscendC::DataCopy(engine[engine_offset], ub, bytes);
+        } else {
+          AscendC::DataCopy(object_[lmc_offset], ub, bytes);
         }
-
-        // === 2LTD SEPARATE_KV: equal-width planes, aligned DataCopy ===
-        __gm__ scalar_t *engine_ptr =
-            reinterpret_cast<__gm__ scalar_t *>(paged_layer_base) +
-            engine_block_idx * engine_block_stride_;
-
-        __gm__ scalar_t *lmcache_ptr =
-            reinterpret_cast<__gm__ scalar_t *>(lmcache_obj_) +
-            static_cast<int64_t>(k_or_v) * nl_ * lmcache_chunk_size_ *
-                scalars_per_token_ +
-            static_cast<int64_t>(layer_idx) * lmcache_chunk_size_ *
-                scalars_per_token_ +
-            static_cast<int64_t>(block_idx_in_object) * bs_ * scalars_per_token_;
-
-        AscendC::GlobalTensor<scalar_t> engine_global;
-        AscendC::GlobalTensor<scalar_t> lmcache_global;
-        engine_global.SetGlobalBuffer(engine_ptr, data_elems_per_block_);
-        lmcache_global.SetGlobalBuffer(lmcache_ptr, data_elems_per_block_);
-
-        const int32_t num_segs = (bs_ + tokens_per_seg_ - 1) / tokens_per_seg_;
-        for (int32_t seg = 0; seg < num_segs; ++seg) {
-            const int64_t seg_start_token = seg * tokens_per_seg_;
-            int64_t seg_tokens = static_cast<int64_t>(bs_) - seg_start_token;
-            if (seg_tokens > tokens_per_seg_) {
-                seg_tokens = tokens_per_seg_;
-            }
-            const int64_t seg_elems = seg_tokens * scalars_per_token_;
-            const int64_t seg_elem_off = seg_start_token * scalars_per_token_;
-
-            local_scalar_t buf = block_que_.template AllocTensor<scalar_t>();
-            if (lmcache_to_engine_) {
-                AscendC::DataCopy(buf, lmcache_global[seg_elem_off], seg_elems);
-                block_que_.EnQue(buf);
-                buf = block_que_.template DeQue<scalar_t>();
-                AscendC::DataCopy(engine_global[seg_elem_off], buf, seg_elems);
-            } else {
-                AscendC::DataCopy(buf, engine_global[seg_elem_off], seg_elems);
-                block_que_.EnQue(buf);
-                buf = block_que_.template DeQue<scalar_t>();
-                AscendC::DataCopy(lmcache_global[seg_elem_off], buf, seg_elems);
-            }
-            block_que_.FreeTensor(buf);
+      } else {
+        // Row path, UB -> GM: same stride choice on the destination side.
+        if constexpr (ToEngine) {
+          CopyUbToRows(engine, engine_offset, ub, rows, plane.payload_bytes,
+                       plane.payload_bytes);
+        } else {
+          CopyUbToRows(object_, lmc_offset, ub, rows, plane.payload_bytes,
+                       layout_.lmc_token_stride_bytes);
         }
+      }
+      queue_.FreeTensor(ub);
     }
+  }
 
-    AscendC::TPipe *pipe_;
-    AscendC::TQueBind<AscendC::QuePosition::VECIN, AscendC::QuePosition::VECOUT, 2>
-        block_que_;
-
-    GM_ADDR paged_buffer_ptrs_;
-    GM_ADDR lmcache_obj_;
-    __gm__ slot_t *engine_block_ids_;
-
-    int32_t num_blocks_per_object_;
-    int32_t skip_prefix_n_blocks_;
-    int32_t nl_;
-    int32_t bs_;
-    int32_t lmcache_chunk_size_;
-    bool lmcache_to_engine_;
-    int32_t k_plane_elems_;
-    int32_t v_plane_elems_;
-    int32_t lmc_row_elems_;
-    int32_t kv_size_;
-
-    int64_t scalars_per_token_;
-    int64_t engine_block_stride_;
-    int64_t k_block_stride_bytes_;
-    int64_t v_block_stride_bytes_;
-    int64_t data_elems_per_block_;
-    int32_t tokens_per_seg_;
-
-    AscendC::GlobalTensor<uint8_t> pagedTokenGlobalU8_;
-    AscendC::GlobalTensor<uint8_t> scalePagedGlobalU8_;
-    AscendC::GlobalTensor<uint8_t> lmcBufferGlobalU8_;
+  __gm__ uint64_t* pointers_;    // ptrs[layer * num_planes + plane]
+  __gm__ int64_t* ids_;          // logical block -> engine physical block
+  __gm__ uint8_t* object_base_;  // LMC object base (device VA, maybe staged)
+  AscendC::GlobalTensor<uint8_t> object_;
+  AscendC::TQueBind<AscendC::QuePosition::VECIN, AscendC::QuePosition::VECOUT,
+                    kvcache_ops::kBlockTransferQueueDepth>
+      queue_;
+  kvcache_ops::BlockTransferLayout layout_;
+  int32_t blocks_, skip_, nl_, nb_, bs_, tokens_per_segment_;
+  bool separate_plane_;
 };
 
-#define MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(TYPE, SLOTTYPE) \
-    multi_layer_block_transfer_kernel_##TYPE##_##SLOTTYPE
+}  // namespace
 
-#define MULTI_LAYER_BLOCK_TRANSFER_KERNEL_DECLARE(TYPE, SLOTTYPE)              \
-    extern "C" __global__ __aicore__ void                                      \
-    MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(TYPE, SLOTTYPE)(                    \
-        GM_ADDR paged_buffer_ptrs, GM_ADDR lmcache_obj,                         \
-        GM_ADDR engine_block_ids, const int32_t num_blocks_per_object,          \
-        const int32_t skip_prefix_n_blocks, const int32_t nl,                  \
-        const int32_t bs, const int32_t nh, const int32_t hs,                  \
-        const int32_t block_stride_elems, const int32_t lmcache_chunk_size,    \
-        const bool lmcache_to_engine, const int32_t k_plane_elems,             \
-        const int32_t v_plane_elems, const int32_t lmc_row_elems,              \
-        const int32_t kv_size, const int32_t k_block_stride_bytes,             \
-        const int32_t v_block_stride_bytes)                                    \
-    {                                                                          \
-        AscendC::TPipe pipe;                                                   \
-        MultiLayerBlockTransfer<TYPE, SLOTTYPE> op{};                          \
-        op.init(paged_buffer_ptrs, lmcache_obj, engine_block_ids,              \
-                num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,   \
-                block_stride_elems, lmcache_chunk_size, lmcache_to_engine,     \
-                k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,          \
-                k_block_stride_bytes, v_block_stride_bytes, &pipe);            \
-        op.process();                                                          \
-    }
-
-// Declare supported kernel entries on the device side (slot_t is int64,
-// mirroring the upstream block_ids dtype).
-MULTI_LAYER_BLOCK_TRANSFER_KERNEL_DECLARE(half, int64_t)
-MULTI_LAYER_BLOCK_TRANSFER_KERNEL_DECLARE(int8_t, int64_t)
-MULTI_LAYER_BLOCK_TRANSFER_KERNEL_DECLARE(float, int64_t)
-#if (__CCE_AICORE__ >= 220)
-MULTI_LAYER_BLOCK_TRANSFER_KERNEL_DECLARE(bfloat16_t, int64_t)
-#endif
+// The CANN host-stub generator only understands builtin types: GM_ADDR
+// becomes void* and custom types are copied verbatim without their defining
+// include. The device entry therefore takes the layout flattened into
+// scalars and rebuilds the POD; the host launcher below keeps the struct
+// signature.
+extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
+    GM_ADDR pointers, GM_ADDR object, GM_ADDR ids, int32_t blocks,
+    int32_t skip, int32_t nl, int32_t nb, int32_t bs, bool separate_plane,
+    bool to_engine, int32_t num_planes, int64_t lmc_row_bytes,
+    int64_t lmc_layer_stride, int64_t lmc_object_bytes, int64_t p0_payload,
+    int64_t p0_block_stride, int64_t p0_base, int64_t p1_payload,
+    int64_t p1_block_stride, int64_t p1_base, int64_t p2_payload,
+    int64_t p2_block_stride, int64_t p2_base, int64_t p3_payload,
+    int64_t p3_block_stride, int64_t p3_base) {
+  kvcache_ops::BlockTransferLayout layout = {};
+  layout.num_planes = num_planes;
+  layout.lmc_token_stride_bytes = lmc_row_bytes;
+  layout.lmc_layer_stride_bytes = lmc_layer_stride;
+  layout.lmc_object_bytes = lmc_object_bytes;
+  const int64_t payloads[kvcache_ops::kMaxPlanes] = {p0_payload, p1_payload,
+                                                     p2_payload, p3_payload};
+  const int64_t block_strides[kvcache_ops::kMaxPlanes] = {
+      p0_block_stride, p1_block_stride, p2_block_stride, p3_block_stride};
+  const int64_t bases[kvcache_ops::kMaxPlanes] = {p0_base, p1_base, p2_base,
+                                                  p3_base};
+  for (int32_t p = 0; p < num_planes; ++p) {
+    layout.planes[p] = kvcache_ops::PlaneLayout{payloads[p], block_strides[p],
+                                                bases[p]};
+  }
+  AscendC::TPipe pipe;
+  MultiLayerBlockTransfer op;
+  op.Init(pointers, object, ids, blocks, skip, nl, nb, bs, separate_plane,
+          layout, &pipe);
+  if (to_engine) {
+    op.Process<true>();
+  } else {
+    op.Process<false>();
+  }
+}
 
 namespace kvcache_ops {
 
 void multi_layer_block_transfer_kernel(
-    AscendType type, uint32_t blockDim, void *stream, uint8_t *paged_buffer_ptrs,
-    uint8_t *lmcache_obj, uint8_t *engine_block_ids,
-    int32_t num_blocks_per_object, int32_t skip_prefix_n_blocks,
-    int32_t nl, int32_t bs, int32_t nh, int32_t hs,
-    int32_t block_stride_elems, int32_t lmcache_chunk_size,
-    bool lmcache_to_engine, int32_t k_plane_elems, int32_t v_plane_elems,
-    int32_t lmc_row_elems, int32_t kv_size, int32_t k_block_stride_bytes,
-    int32_t v_block_stride_bytes)
-{
-    switch (type) {
-        case AscendType::FP16:
-            MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(half, int64_t)
-                <<<blockDim, nullptr, stream>>>(
-                    paged_buffer_ptrs, lmcache_obj, engine_block_ids,
-                    num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
-                    block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
-                    k_block_stride_bytes, v_block_stride_bytes);
-            break;
-        case AscendType::FP32:
-            MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(float, int64_t)
-                <<<blockDim, nullptr, stream>>>(
-                    paged_buffer_ptrs, lmcache_obj, engine_block_ids,
-                    num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
-                    block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
-                    k_block_stride_bytes, v_block_stride_bytes);
-            break;
-        case AscendType::INT8:
-            MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(int8_t, int64_t)
-                <<<blockDim, nullptr, stream>>>(
-                    paged_buffer_ptrs, lmcache_obj, engine_block_ids,
-                    num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
-                    block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
-                    k_block_stride_bytes, v_block_stride_bytes);
-            break;
-#if (ASCEND_AICORE_ARCH >= 220)
-        case AscendType::BF16:
-            MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(bfloat16_t, int64_t)
-                <<<blockDim, nullptr, stream>>>(
-                    paged_buffer_ptrs, lmcache_obj, engine_block_ids,
-                    num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
-                    block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
-                    k_block_stride_bytes, v_block_stride_bytes);
-            break;
-#else
-        case AscendType::BF16:
-            // Pure byte move: fall back to the 2-byte half kernel on SoCs
-            // without the bf16 expansion.
-            MULTI_LAYER_BLOCK_TRANSFER_KERNEL_NAME(half, int64_t)
-                <<<blockDim, nullptr, stream>>>(
-                    paged_buffer_ptrs, lmcache_obj, engine_block_ids,
-                    num_blocks_per_object, skip_prefix_n_blocks, nl, bs, nh, hs,
-                    block_stride_elems, lmcache_chunk_size, lmcache_to_engine,
-                    k_plane_elems, v_plane_elems, lmc_row_elems, kv_size,
-                    k_block_stride_bytes, v_block_stride_bytes);
-            break;
-#endif
-        default:
-            ASCENDC_REPORT_NOT_SUPPORT(
-                false, std::to_string(static_cast<int>(type)) + " is not supported.")
-            throw std::runtime_error(
-                "Scalar type: " + std::to_string(static_cast<int>(type)) +
-                " not supported. This should not have happened.");
-    }
+    uint32_t block_dim, void* stream, uint8_t* paged_buffer_ptrs,
+    uint8_t* lmcache_obj, uint8_t* engine_block_ids,
+    int32_t num_blocks_per_object, int32_t skip_prefix_n_blocks, int32_t nl,
+    int32_t nb, int32_t bs, bool separate_plane, BlockTransferLayout layout,
+    bool to_engine) {
+  ::multi_layer_block_transfer_kernel<<<block_dim, nullptr, stream>>>(
+      paged_buffer_ptrs, lmcache_obj, engine_block_ids,
+      num_blocks_per_object, skip_prefix_n_blocks, nl, nb, bs, separate_plane,
+      to_engine, layout.num_planes, layout.lmc_token_stride_bytes,
+      layout.lmc_layer_stride_bytes, layout.lmc_object_bytes,
+      layout.planes[0].payload_bytes,
+      layout.planes[0].engine_block_stride_bytes,
+      layout.planes[0].lmc_base_offset_bytes,
+      layout.planes[1].payload_bytes,
+      layout.planes[1].engine_block_stride_bytes,
+      layout.planes[1].lmc_base_offset_bytes,
+      layout.planes[2].payload_bytes,
+      layout.planes[2].engine_block_stride_bytes,
+      layout.planes[2].lmc_base_offset_bytes,
+      layout.planes[3].payload_bytes,
+      layout.planes[3].engine_block_stride_bytes,
+      layout.planes[3].lmc_base_offset_bytes);
 }
 
 } // namespace kvcache_ops
