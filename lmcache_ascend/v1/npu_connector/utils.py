@@ -3,7 +3,9 @@
 from typing import List, Tuple, Union
 
 # Third Party
-from lmcache.v1.gpu_connector.utils import permute_to_contiguous
+from lmcache.v1.gpu_connector.kv_format.contiguity import (
+    attempt_permute_to_contiguous_view,
+)
 import torch
 
 _KVTupleTwoOrMore = Tuple[torch.Tensor, ...]
@@ -18,19 +20,19 @@ def _maybe_permute(tensor: torch.Tensor) -> torch.Tensor:
         tight = int(tensor.numel()) // int(tensor.shape[0])
         if int(tensor.stride(0)) > tight:
             return tensor
-    return permute_to_contiguous(tensor)
+    return attempt_permute_to_contiguous_view(tensor)
 
 
 def permute_kv_caches_to_contiguous(
     kv_caches: List[_KVLayer],
 ) -> List[_KVLayer]:
-    """Apply :func:`permute_to_contiguous` to each tensor in *kv_caches*.
+    """Apply :func:`attempt_permute_to_contiguous_view` to each tensor in *kv_caches*.
 
     Each entry is either a single ``torch.Tensor`` (merged KV) or a tuple of
     two or more tensors (e.g. K/V, or more parts). The returned list has the
     same length and
     structure; tensors are metadata-only permutes where applicable and may
-    share storage with the inputs (see upstream ``permute_to_contiguous``).
+    share storage with the inputs (see upstream ``attempt_permute_to_contiguous_view``).
 
     v0.20 DeepSeek-V4 shared-pool views with ``storage_offset != 0`` or dim-0
     padding are passed through unchanged; kernels use ``data_ptr()`` and
