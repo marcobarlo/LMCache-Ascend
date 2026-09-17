@@ -262,6 +262,9 @@ def _patch_ops():
     # Standard
     from enum import IntEnum
 
+    # Third Party
+    import lmcache.v1.platform.torch_ops as python_ops_fallback
+
     # First Party
     import lmcache_ascend.c_ops as ascend_c_ops
 
@@ -282,7 +285,98 @@ def _patch_ops():
 
         ascend_c_ops.GPUKVFormat = GPUKVFormat
 
+    # Block kernel: 16 separate K/V, 17 packed multi-plane (MLA/DSA/DSv4),
+    # 13 fused NH_CS. Annotation has no Tensor so MP stays in ptr mode.
+    # The host prepare_group/validate_launch pair is the SINGLE authority on
+    # which geometries launch natively: this wrapper only does
+    # tensor/descriptor conversion and lifetime management — no narrow-tail
+    # admission checks here.
+    _native_block = ascend_c_ops.multi_layer_block_kv_transfer
+    _fmt_13 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_BS_NH_CS)
+    _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
+    _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
+
+    def _paged_arg_to_ptr_tensor(paged, device):
+        """NPU cache context returns per-layer tensors; the C++ op wants int64 ptrs."""
+        import torch
+
+        if isinstance(paged, torch.Tensor):
+            return paged
+        ptrs: list[int] = []
+        for layer in paged:
+            if isinstance(layer, (tuple, list)):
+                ptrs.extend(int(plane.data_ptr()) for plane in layer)
+            else:
+                ptrs.append(int(layer.data_ptr()))
+        return torch.tensor(ptrs, dtype=torch.int64, device=device)
+
+    def multi_layer_block_kv_transfer(
+        paged_buffer_ptrs_tensor,
+        lmcache_objects_ptrs: list[int],
+        block_ids,
+        device,
+        direction,
+        shape_desc,
+        lmcache_chunk_size,
+        engine_kv_format,
+        skip_prefix_n_blocks,
+    ):
+        if int(engine_kv_format) in (_fmt_13, _fmt_16, _fmt_17):
+            import torch
+
+            paged = _paged_arg_to_ptr_tensor(paged_buffer_ptrs_tensor, device)
+            if isinstance(block_ids, torch.Tensor):
+                block_ids = block_ids.contiguous()
+            return _native_block(
+                paged,
+                lmcache_objects_ptrs,
+                block_ids,
+                device,
+                direction,
+                shape_desc,
+                lmcache_chunk_size,
+                engine_kv_format,
+                skip_prefix_n_blocks,
+            )
+        return python_ops_fallback.multi_layer_block_kv_transfer(
+            paged_buffer_ptrs_tensor,
+            lmcache_objects_ptrs,
+            block_ids,
+            device,
+            direction,
+            shape_desc,
+            lmcache_chunk_size,
+            engine_kv_format,
+            skip_prefix_n_blocks,
+        )
+
+    ascend_c_ops.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
+    dop = getattr(sys.modules.get("lmcache"), "device_ops", None)
+    if dop is not None:
+        dop.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
+        # bind_native may have run before this wrap; re-bind the CUDA plan
+        # surface so hasattr(device_ops, "execute_object_group_transfer")
+        # matches a CUDA build.
+        for _plan_name in (
+            "execute_object_group_transfer",
+            "KernelGroupSpec",
+            "StagingCopy",
+            "LaunchVar",
+            "BatchStep",
+        ):
+            if hasattr(ascend_c_ops, _plan_name):
+                setattr(dop, _plan_name, getattr(ascend_c_ops, _plan_name))
+
     sys.modules["lmcache.c_ops"] = ascend_c_ops
+
+    try:
+        import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as _ldt
+
+        _ldt._HAS_NATIVE_OBJECT_GROUP_TRANSFER = hasattr(
+            ascend_c_ops, "execute_object_group_transfer"
+        )
+    except ImportError:
+        pass
 
 
 def _patch_storage_backend_init():
@@ -417,31 +511,6 @@ def _patch_remote_backend():
     RemoteBackend.batched_get_blocking = new_batched_get_blocking
 
 
-def _patch_multi_process():
-    # Third Party
-    import lmcache.v1.multiprocess.custom_types as lm_mp_types
-
-    # First Party
-    from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
-
-    lm_mp_types.CudaIPCWrapper = AscendIPCWrapper
-
-
-def _patch_kv_layer_group():
-    # Third Party
-    from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
-
-    # First Party
-    import lmcache_ascend.v1.kv_layer_groups as ascend_kv_layer_groups
-
-    KVLayerGroupsManager.build_kv_layer_groups = (
-        ascend_kv_layer_groups.build_kv_layer_groups
-    )
-    KVLayerGroupInfo.hidden_dim_size = property(
-        ascend_kv_layer_groups.patched_hidden_dim_size
-    )
-
-
 def _patch_gpu_connector():
     """Patch CreateGPUConnector to return NPU connectors on Ascend.
 
@@ -487,23 +556,6 @@ def _patch_gpu_connector():
         _manager_mod.CreateGPUConnector = CreateNPUConnector
 
 
-def _patch_get_vllm_torch_dev():
-    """Patch get_vllm_torch_dev to return NPU device on Ascend.
-
-    The upstream function only supports CUDA and XPU. This patch adds
-    NPU support by replacing the function with our Ascend-specific version.
-    """
-    # Third Party
-    import lmcache.integration.vllm.utils as lm_utils
-
-    # First Party
-    from lmcache_ascend.integration.vllm.utils import (
-        get_vllm_torch_dev as ascend_get_vllm_torch_dev,
-    )
-
-    lm_utils.get_vllm_torch_dev = ascend_get_vllm_torch_dev
-
-
 def _patch_vllm_v1_adapter():
     # Third Party
     from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -545,17 +597,22 @@ def _patch_cache_engine():
             mod.LMCacheEngine = AscendLMCacheEngine
 
 
+def _patch_logical_block_size():
+    """Wrap LMCache ``get_tokens_per_block`` when Ascend ``block_size`` is physical.
+
+    Pre-#13242 pool math still uses ``block_size * compress_ratio``; the wrap
+    reports that span for Ascend leaves. Post-#13242 ``block_size`` is already
+    logical, so LMCache core is left unpatched. Never mutate ``spec.block_size``.
+    """
+    from lmcache_ascend.integration.vllm.logical_block_size import install_overrides
+
+
+    install_overrides()
+
+
 def _patch_hash_token():
-    # On OpenEuler and python3.10,
-    # the _hash_tokens func hash(None) seems to run into
-    # ASLR lead to non-deterministic hashing for builtin hash
     # Third Party
     import lmcache.v1.token_database
-
-    # First Party
-    from lmcache_ascend.v1.tokens_hash import _hash_tokens
-
-    lmcache.v1.token_database.TokenDatabase._hash_tokens = _hash_tokens
 
     # First Party
     from lmcache_ascend.v1.token_database import TokenDatabase_process_tokens
@@ -716,7 +773,6 @@ if not LMCACHE_ASCEND_PATCHED:
 
     _patch_ops()
     if is_vllm:
-        _patch_get_vllm_torch_dev()
         _patch_gpu_connector()
 
     _patch_hash_token()
@@ -729,12 +785,9 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_storage_manager()
         _patch_transfer_channel()
         _patch_cacheblend()
-        _patch_multi_process()
         _patch_lookup_client()
         _patch_cache_controller_worker()
         _patch_rpc_utils()
-
-    _patch_kv_layer_group()
 
     if is_sgl:
         _patch_sgl()
@@ -744,6 +797,7 @@ if not LMCACHE_ASCEND_PATCHED:
 
         _patch_lookup_client_factory()
         _patch_vllm_v1_adapter()
+        _patch_logical_block_size()
 
         _patch_cache_engine()
 
