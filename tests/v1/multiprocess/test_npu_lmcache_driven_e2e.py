@@ -8,7 +8,7 @@ events; the parent drives the real server-side LMCacheDrivenTransferModule
 """
 
 # Standard
-import gc
+from contextlib import closing
 import math
 import multiprocessing as mp
 from types import SimpleNamespace
@@ -30,6 +30,7 @@ import lmcache_ascend  # noqa: F401, E402  (applies plugin patches)
 # First Party
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 from lmcache.utils import EngineType  # noqa: E402
+from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
 from lmcache.v1.gpu_connector.utils import LayoutHints  # noqa: E402
 from lmcache.v1.multiprocess.custom_types import KVCache  # noqa: E402
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer  # noqa: E402
@@ -47,6 +48,7 @@ NL = 4
 NB = 16
 BS = 16
 CHUNK = 256  # BS * NB
+CHUNK_KEY = ObjectKey(chunk_hash=b"e2e0", model_name="mla-e2e", kv_rank=0)
 W_LATENT = 128
 W_ROPE = 16
 HIDDEN = W_LATENT + W_ROPE
@@ -92,20 +94,6 @@ def _worker(device_index: int, conn) -> None:
         }
     )
     conn.recv()  # hold the mappings until the parent finishes
-
-
-class _NoopDispatcher:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def register(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def start(self) -> None:
-        pass
-
-    def stop(self, timeout: float = 0.0) -> None:
-        pass
 
 
 class _FakeMemoryObj:
@@ -217,7 +205,6 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
     parent_conn, child_conn = ctx.Pipe()
     process = ctx.Process(target=_worker, args=(device_index, child_conn))
     process.start()
-    cache_context = None
     try:
         message = parent_conn.recv()
         decoder = get_customized_decoder(type=list[NpuIPCWrapper])
@@ -236,92 +223,96 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             engine_group_infos=(),
             engine_type=EngineType.VLLM,
         )
-        expect_fmt = getattr(
-            lmcache_native.EngineKVFormat, "NL_X_TWO_X_NB_BS_HS", None
-        ) or lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
-        assert cache_context.get_engine_kv_format(0) == expect_fmt
-        event_backend = NpuEventIPCBackend()
-        storage_manager = _FakeStorageManager()
-        monkeypatch.setattr(
-            lmcache_driven_transfer, "DeviceHostFuncDispatcher", _NoopDispatcher
-        )
-
-        module = lmcache_driven_transfer.LMCacheDrivenTransferModule(
-            SimpleNamespace(
-                chunk_size=CHUNK,
-                storage_manager=storage_manager,
-                event_bus=SimpleNamespace(
-                    publish=lambda event: None,
-                    publish_on_stream=lambda stream, event: None,
-                    has_subscribers=lambda event_type: False,
-                ),
-                resolve_obj_keys=lambda key, group_ids: [[("chunk", 0)]],
+        with closing(cache_context):
+            assert (
+                cache_context.get_engine_kv_format(0)
+                == lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
             )
-        )
-        entry = lmcache_driven_transfer.ContextEntry(
-            cache_context=cache_context,
-            model_name="mla-e2e",
-            world_size=1,
-            event_backend=event_backend,
-        )
-        monkeypatch.setattr(module, "get_and_touch_context_entry", lambda iid: entry)
-        key = SimpleNamespace(
-            request_id="e2e",
-            cache_salt="",
-            worker_id=0,
-            token_ids=list(range(CHUNK)),
-            start=0,
-            end=CHUNK,
-        )
+            event_backend = NpuEventIPCBackend()
+            storage_manager = _FakeStorageManager()
 
-        block_ids = [list(range(NB))]
-        # The producer events were exported by the worker process; the
-        # module imports them cross-process (the supported path on CANN).
-        store_handle, stored = module.store(key, 1, block_ids, message["producer_a"])
-        assert stored is True
-        assert isinstance(store_handle, bytes) and len(store_handle) > 0
-
-        # The module returns after the completion submit; drain the
-        # transfer stream before reading the staged host bytes.
-        cache_context.stream.synchronize()
-
-        # Stored bytes equal the worker's plane contents in [L, tokens, W]
-        # staging order (latent plane then rope plane per layer).
-        stored_obj = storage_manager.objects[("chunk", 0)]
-        host = stored_obj.raw_tensor.view(torch.float32)
-        assert torch.allclose(host.view(NL, NB * BS, HIDDEN), _expected_staging())
-
-        # Retrieve: mutate host bytes, scatter back into the same blocks.
-        stored_obj.raw_tensor.view(torch.float32).add_(1.0)
-        retrieve_handle, retrieved = module.retrieve(
-            key, 1, block_ids, message["producer_b"]
-        )
-        assert retrieved is True
-        assert isinstance(retrieve_handle, bytes) and len(retrieve_handle) > 0
-        cache_context.stream.synchronize()
-
-        # Every imported plane element now carries the +1 mutation. The
-        # context's own views are the tensors the scatter wrote into.
-        expected = _expected_staging()
-        kv_tensors = cache_context.kv_tensors
-        for layer in range(NL):
-            latent = kv_tensors[layer][0]
-            rope = kv_tensors[layer][1]
-            for block in range(NB):
-                exp_latent = (
-                    expected[layer, block * BS : (block + 1) * BS, :W_LATENT] + 1.0
+            module = lmcache_driven_transfer.LMCacheDrivenTransferModule(
+                SimpleNamespace(
+                    chunk_size=CHUNK,
+                    storage_manager=storage_manager,
+                    event_bus=SimpleNamespace(
+                        publish=lambda event: None,
+                        publish_on_stream=lambda stream, event: None,
+                        has_subscribers=lambda event_type: False,
+                    ),
+                    resolve_obj_keys=lambda key, group_ids: [[CHUNK_KEY]],
                 )
-                exp_rope = (
-                    expected[layer, block * BS : (block + 1) * BS, W_LATENT:] + 1.0
+            )
+            with closing(module):
+                entry = lmcache_driven_transfer.ContextEntry(
+                    cache_context=cache_context,
+                    model_name="mla-e2e",
+                    world_size=1,
+                    event_backend=event_backend,
                 )
-                assert torch.allclose(latent[block, :, 0, :].cpu(), exp_latent)
-                assert torch.allclose(rope[block, :, 0, :].cpu(), exp_rope)
-        del kv_tensors, latent, rope, kv_caches, entry, module
+                monkeypatch.setattr(
+                    module, "get_and_touch_context_entry", lambda iid: entry
+                )
+                key = SimpleNamespace(
+                    request_id="e2e",
+                    cache_salt="",
+                    worker_id=0,
+                    token_ids=list(range(CHUNK)),
+                    start=0,
+                    end=CHUNK,
+                )
+
+                block_ids = [list(range(NB))]
+                # The producer events were exported by the worker process; the
+                # module imports them cross-process (the supported path on CANN).
+                store_handle, stored = module.store(
+                    key, 1, block_ids, message["producer_a"]
+                )
+                assert stored is True
+                assert isinstance(store_handle, bytes) and len(store_handle) > 0
+
+                # The module returns after the completion submit; drain the
+                # transfer stream before reading the staged host bytes.
+                cache_context.stream.synchronize()
+
+                # Stored bytes equal the worker's plane contents in [L, tokens, W]
+                # staging order (latent plane then rope plane per layer).
+                stored_obj = storage_manager.objects[CHUNK_KEY]
+                host = stored_obj.raw_tensor.view(torch.float32)
+                assert torch.allclose(
+                    host.view(NL, NB * BS, HIDDEN), _expected_staging()
+                )
+
+                # Retrieve: mutate host bytes, scatter back into the same blocks.
+                stored_obj.raw_tensor.view(torch.float32).add_(1.0)
+                retrieve_handle, retrieved = module.retrieve(
+                    key, 1, block_ids, message["producer_b"]
+                )
+                assert retrieved is True
+                assert isinstance(retrieve_handle, bytes) and len(retrieve_handle) > 0
+                cache_context.stream.synchronize()
+
+                # Every imported plane element now carries the +1 mutation. The
+                # context's own views are the tensors the scatter wrote into.
+                expected = _expected_staging()
+                kv_tensors = cache_context.kv_tensors
+                for layer in range(NL):
+                    latent = kv_tensors[layer][0]
+                    rope = kv_tensors[layer][1]
+                    for block in range(NB):
+                        exp_latent = (
+                            expected[layer, block * BS : (block + 1) * BS, :W_LATENT]
+                            + 1.0
+                        )
+                        exp_rope = (
+                            expected[layer, block * BS : (block + 1) * BS, W_LATENT:]
+                            + 1.0
+                        )
+                        assert torch.allclose(
+                            latent[block, :, 0, :].cpu(), exp_latent
+                        )
+                        assert torch.allclose(rope[block, :, 0, :].cpu(), exp_rope)
     finally:
-        if cache_context is not None:
-            cache_context.close()
-            cache_context = None
-        gc.collect()
         parent_conn.send("done")
         process.join(timeout=60)
     # Producer-side CANN aborts (SIGABRT) when imported NPU IPC storages
