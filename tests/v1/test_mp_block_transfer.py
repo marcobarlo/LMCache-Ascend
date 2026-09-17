@@ -517,6 +517,7 @@ def _build_roundtrip_engine(
                 hs=hs,
                 dtype=dtype,
                 plane_slot_bytes=(hs * 2,),
+                plane_block_stride_bytes=(bs * hs * 2,),
             ),
             layers=layers,
             table=_pointer_table(layers, device),
