@@ -31,7 +31,6 @@ KG0_FMT = (
     getattr(native.EngineKVFormat, "NL_X_TWO_X_NB_BS_HS", None)
     or native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
 )
-NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
 D2H = native.TransferDirection.D2H
 H2D = native.TransferDirection.H2D
@@ -173,6 +172,118 @@ def _kg0_packed_object(
     return obj
 
 
+# fmt17 production plane shapes: DS MLA (latent+rope), DSA 3-plane, and the
+# DSv4 DSA-C8 4-plane mixed-dtype bundle. Mirrors the grouping expectations
+# in tests/v1/test_kv_layer_groups_npu.py.
+_PACKED_PLANE_SPECS: dict[str, tuple[tuple[int, torch.dtype], ...]] = {
+    "mla_bf16": ((512, torch.bfloat16), (64, torch.bfloat16)),
+    "mla_bf16_bs128": ((512, torch.bfloat16), (64, torch.bfloat16)),
+    "dsa3": (
+        (512, torch.bfloat16),
+        (64, torch.bfloat16),
+        (128, torch.bfloat16),
+    ),
+    "dsa_c8_4": (
+        (512, torch.bfloat16),
+        (64, torch.bfloat16),
+        (128, torch.int8),
+        (1, torch.float16),
+    ),
+}
+
+
+def _plane_row_bytes(plane_specs: tuple[tuple[int, torch.dtype], ...]) -> int:
+    return sum(w * torch.empty((), dtype=d).element_size() for w, d in plane_specs)
+
+
+def _packed_planes_desc(
+    *,
+    nl: int,
+    nb: int,
+    bs: int,
+    plane_specs: tuple[tuple[int, torch.dtype], ...],
+) -> object:
+    slot_bytes = tuple(
+        w * torch.empty((), dtype=d).element_size() for w, d in plane_specs
+    )
+    element_size = max(
+        torch.empty((), dtype=d).element_size() for _, d in plane_specs
+    )
+    return _shape_desc(
+        kv_size=1,
+        nl=nl,
+        nb=nb,
+        bs=bs,
+        nh=1,
+        hs=_plane_row_bytes(plane_specs) // element_size,
+        dtype=torch.bfloat16,
+        plane_slot_bytes=slot_bytes,
+        plane_block_stride_bytes=tuple(bs * b for b in slot_bytes),
+    )
+
+
+def _multi_plane_layers(
+    *,
+    nl: int,
+    nb: int,
+    bs: int,
+    plane_specs: tuple[tuple[int, torch.dtype], ...],
+    device: torch.device,
+) -> list[tuple[torch.Tensor, ...]]:
+    """Per-layer tuples of fmt17 single-head planes, arange-filled.
+
+    Values are encoded from arange (never random bits) so packed bytes stay
+    NaN-safe when reinterpreted as the plane dtype.
+    """
+    layers: list[tuple[torch.Tensor, ...]] = []
+    for layer_i in range(nl):
+        planes: list[torch.Tensor] = []
+        for plane_i, (width, dtype) in enumerate(plane_specs):
+            salt = 1000 * layer_i + 97 * plane_i
+            numel = nb * bs * width
+            if dtype in (torch.int8, torch.uint8):
+                values = (
+                    torch.arange(numel, device=device, dtype=torch.int32) + salt
+                ) % 251
+            else:
+                values = (
+                    torch.arange(numel, device=device, dtype=torch.float32)
+                    + float(salt)
+                )
+            planes.append(values.to(dtype).view(nb, bs, 1, width))
+        layers.append(tuple(planes))
+    return layers
+
+
+def _packed_object_from_planes(
+    *,
+    nl: int,
+    chunk: int,
+    plane_specs: tuple[tuple[int, torch.dtype], ...],
+    device: torch.device,
+) -> torch.Tensor:
+    """Synthetic packed LMC object: per-token rows of concatenated plane bytes."""
+    rows: list[torch.Tensor] = []
+    for layer_i in range(nl):
+        columns: list[torch.Tensor] = []
+        for plane_i, (width, dtype) in enumerate(plane_specs):
+            salt = 1000 * layer_i + 97 * plane_i
+            numel = chunk * width
+            if dtype in (torch.int8, torch.uint8):
+                values = (
+                    torch.arange(numel, device=device, dtype=torch.int32) + salt
+                ) % 251
+            else:
+                values = (
+                    torch.arange(numel, device=device, dtype=torch.float32)
+                    + float(salt)
+                )
+            typed = values.to(dtype).view(chunk, width)
+            columns.append(typed.contiguous().view(torch.uint8).view(chunk, -1))
+        rows.append(torch.cat(columns, dim=-1))
+    return torch.stack(rows)
+
+
 def _nh_cs_layers(
     *,
     nl: int,
@@ -189,24 +300,6 @@ def _nh_cs_layers(
         )
         layers.append((values + 1000 * layer_i).to(dtype))
     return layers
-
-
-def _nh_cs_padded(
-    *, nl: int, nb: int, bs: int, hs: int, stride: int, device: torch.device
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    dtype = torch.float32
-    pools: list[torch.Tensor] = []
-    layers: list[torch.Tensor] = []
-    for layer_i in range(nl):
-        pool = torch.full((nb, stride), 999.0, dtype=dtype, device=device)
-        view = pool[:, : bs * hs].view(nb, bs, 1, hs)
-        view.copy_(
-            torch.arange(nb * bs * hs, dtype=dtype, device=device).view(nb, bs, 1, hs)
-            + 1000 * layer_i
-        )
-        pools.append(pool)
-        layers.append(view)
-    return pools, layers
 
 
 def _pointer_table(layers: Sequence[Any], device: torch.device) -> torch.Tensor:
@@ -356,14 +449,10 @@ def _assert_block_equal(left: Sequence[Any], right: Sequence[Any], bid: int) -> 
                 assert torch.equal(ta[bid].cpu(), tb[bid].cpu())
 
 
-def _kg0_packed_block(
-    latent: torch.Tensor, scale: torch.Tensor, bid: int, bs: int
-) -> torch.Tensor:
+def _packed_block(planes: Sequence[torch.Tensor], bid: int, bs: int) -> torch.Tensor:
+    """Concatenate one engine block's per-plane bytes into packed LMC rows."""
     return torch.cat(
-        [
-            latent[bid].reshape(bs, 128),
-            scale[bid].contiguous().view(torch.uint8).reshape(bs, 2),
-        ],
+        [p[bid].contiguous().view(torch.uint8).reshape(bs, -1) for p in planes],
         dim=-1,
     )
 
@@ -397,10 +486,10 @@ def _assert_d2h_object(
             else:
                 first = layers[0]
                 if isinstance(first, tuple):
-                    for layer, (latent, scale) in enumerate(layers):
+                    for layer, planes in enumerate(layers):
                         assert torch.equal(
                             obj[layer, sl].cpu(),
-                            _kg0_packed_block(latent, scale, bid, bs).cpu(),
+                            _packed_block(planes, bid, bs).cpu(),
                         )
                 else:
                     for layer, tensor in enumerate(layers):
@@ -480,6 +569,8 @@ def _build_roundtrip_engine(
             )
             layers.append((key, value))
         stride = (bs + 1 if padded else bs) * hidden
+        row_bytes = hidden * 2  # float16
+        stride_bytes = stride * 2
         return dict(
             fmt=SEP_KV_FMT,
             desc=_shape_desc(
@@ -490,7 +581,8 @@ def _build_roundtrip_engine(
                 nh=nh,
                 hs=hs,
                 dtype=torch.float16,
-                block_stride_elems=stride if padded else 0,
+                plane_slot_bytes=(row_bytes, row_bytes),
+                plane_block_stride_bytes=(stride_bytes, stride_bytes),
             ),
             layers=layers,
             table=_pointer_table(layers, device),
@@ -499,7 +591,7 @@ def _build_roundtrip_engine(
             kv_leading=True,
             bs=bs,
         )
-    if layout in ("nh_cs", "nh_cs_fmt17"):
+    if layout == "nh_cs_fmt17":
         nb = nb or 32
         bs, hs = 32, 512
         dtype = torch.bfloat16
@@ -507,7 +599,7 @@ def _build_roundtrip_engine(
         return dict(
             # Serving classifies G1 as fmt 17; dense 32 B-aligned rows are
             # not packed (latent+scale tail).
-            fmt=KG0_FMT if layout == "nh_cs_fmt17" else NH_CS_FMT,
+            fmt=KG0_FMT,
             desc=_shape_desc(
                 kv_size=1,
                 nl=nl,
@@ -517,6 +609,8 @@ def _build_roundtrip_engine(
                 hs=hs,
                 dtype=dtype,
                 plane_slot_bytes=(hs * 2,),
+                # Explicit geometry must be complete: registration fills
+                # both plane fields, so the dense tight stride is required.
                 plane_block_stride_bytes=(bs * hs * 2,),
             ),
             layers=layers,
@@ -537,6 +631,25 @@ def _build_roundtrip_engine(
             table=_pointer_table(layers, device),
             obj_dtype=torch.uint8,
             obj_tail=(nl, 130),
+            kv_leading=False,
+            bs=bs,
+        )
+    if layout in _PACKED_PLANE_SPECS:
+        plane_specs = _PACKED_PLANE_SPECS[layout]
+        nb = nb or 32
+        # bs=128 pushes bs * row_bytes (147456) past the 128KB segment
+        # budget, exercising the multi-segment block split.
+        bs = 128 if layout == "mla_bf16_bs128" else 16
+        layers = _multi_plane_layers(
+            nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
+        )
+        return dict(
+            fmt=KG0_FMT,
+            desc=_packed_planes_desc(nl=nl, nb=nb, bs=bs, plane_specs=plane_specs),
+            layers=layers,
+            table=_pointer_table(layers, device),
+            obj_dtype=torch.uint8,
+            obj_tail=(nl, _plane_row_bytes(plane_specs)),
             kv_leading=False,
             bs=bs,
         )
@@ -586,11 +699,6 @@ def _roundtrip_cases() -> list[Any]:
         )
     )
     cases.append(
-        pytest.param(
-            "nh_cs", "npu", False, 0, 21, 1, list(range(32)), id="nh_cs-npu-1chunk"
-        )
-    )
-    cases.append(
         pytest.param("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], id="nh_cs-fmt17")
     )
     cases.append(
@@ -602,6 +710,34 @@ def _roundtrip_cases() -> list[Any]:
     )
     cases.append(
         pytest.param("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], id="kg0-bs64-chunk128")
+    )
+    # Production packed plane shapes (fmt17): MLA 2-plane, DSA 3-plane, and
+    # the DSv4 DSA-C8 4-plane mixed-dtype bundle.
+    cases.append(
+        pytest.param("mla_bf16", "npu", False, 0, 2, 1, [0, 1], id="mla-bf16-bs16")
+    )
+    cases.append(
+        pytest.param(
+            "mla_bf16_bs128",
+            "npu",
+            False,
+            0,
+            2,
+            1,
+            [0, 1],
+            id="mla-bf16-bs128-segsplit",
+        )
+    )
+    cases.append(
+        pytest.param("dsa3", "npu", False, 0, 2, 1, [0, 1], id="dsa3-bs16")
+    )
+    cases.append(
+        pytest.param("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], id="dsa-c8-4plane")
+    )
+    cases.append(
+        pytest.param(
+            "dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], id="dsa-c8-4plane-skip"
+        )
     )
     return cases
 
@@ -712,56 +848,29 @@ def _layout_pair(layout: str, device: torch.device) -> dict[str, Any]:
             pools_a=pools_a,
             pad_width=None,
         )
-    if layout == "nh_cs":
-        nl, nb, bs, hs, chunk = 2, 4, 4, 512, 4
-        dtype = torch.bfloat16
-        layers_a = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
-        layers_b = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
+    if layout in ("mla_bf16", "dsa3", "dsa_c8_4"):
+        plane_specs = _PACKED_PLANE_SPECS[layout]
+        nl, nb, bs = 2, 4, 16
+        chunk = bs  # one selected block per object
+        layers_a = _multi_plane_layers(
+            nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
+        )
+        layers_b = _multi_plane_layers(
+            nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
+        )
         return dict(
-            fmt=NH_CS_FMT,
-            desc=_shape_desc(kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype),
+            fmt=KG0_FMT,
+            desc=_packed_planes_desc(nl=nl, nb=nb, bs=bs, plane_specs=plane_specs),
             layers_a=layers_a,
             layers_b=layers_b,
             table=_pointer_table(layers_a, device),
-            obj_shape=(nl, chunk, hs),
-            obj_dtype=dtype,
-            block_ids=torch.tensor([1], dtype=torch.int64, device=device),
+            obj_shape=(nl, chunk, _plane_row_bytes(plane_specs)),
+            obj_dtype=torch.uint8,
+            block_ids=torch.tensor([0], dtype=torch.int64, device=device),
             chunk=chunk,
             nl=nl,
             pools_a=None,
             pad_width=None,
-        )
-    if layout == "nh_cs_padded":
-        nl, nb, bs, hs, stride, chunk = 2, 4, 2, 2048, 8192, 2
-        dtype = torch.float32
-        pools_a, layers_a = _nh_cs_padded(
-            nl=nl, nb=nb, bs=bs, hs=hs, stride=stride, device=device
-        )
-        pools_b, layers_b = _nh_cs_padded(
-            nl=nl, nb=nb, bs=bs, hs=hs, stride=stride, device=device
-        )
-        return dict(
-            fmt=NH_CS_FMT,
-            desc=_shape_desc(
-                kv_size=1,
-                nl=nl,
-                nb=nb,
-                bs=bs,
-                nh=1,
-                hs=hs,
-                dtype=dtype,
-                block_stride_elems=stride,
-            ),
-            layers_a=layers_a,
-            layers_b=layers_b,
-            table=_pointer_table(layers_a, device),
-            obj_shape=(nl, chunk, hs),
-            obj_dtype=dtype,
-            block_ids=torch.tensor([1], dtype=torch.int64, device=device),
-            chunk=chunk,
-            nl=nl,
-            pools_a=pools_a,
-            pad_width=bs * hs,
         )
     raise ValueError(layout)
 
@@ -772,6 +881,15 @@ def _fill_src_object(
     nl, chunk = spec["nl"], spec["chunk"]
     if layout == "kg0":
         return _kg0_packed_object(nl, chunk, device)
+    if layout in _PACKED_PLANE_SPECS:
+        # Arange-encoded packed rows: random bits reinterpreted as bf16 could
+        # be NaN, and torch.equal is always False for NaN.
+        return _packed_object_from_planes(
+            nl=nl,
+            chunk=chunk,
+            plane_specs=_PACKED_PLANE_SPECS[layout],
+            device=device,
+        )
     src = torch.arange(
         nl * chunk * spec["obj_shape"][-1], dtype=torch.float32, device=device
     ).view(nl, chunk, spec["obj_shape"][-1])
@@ -779,7 +897,7 @@ def _fill_src_object(
 
 
 @requires_npu
-@pytest.mark.parametrize("layout", ["kg0", "nh_cs", "nh_cs_padded"])
+@pytest.mark.parametrize("layout", ["kg0", "mla_bf16", "dsa3", "dsa_c8_4"])
 @pytest.mark.parametrize("direction_d2h", [True, False], ids=["d2h", "h2d"])
 def test_native_matches_torch_ops(layout: str, direction_d2h: bool) -> None:
     torch_ops = pytest.importorskip("lmcache.v1.platform.torch_ops")
@@ -835,7 +953,7 @@ def test_native_matches_torch_ops(layout: str, direction_d2h: bool) -> None:
 
 
 @requires_npu
-@pytest.mark.parametrize("layout", ["kg0", "nh_cs"])
+@pytest.mark.parametrize("layout", ["kg0"])
 @pytest.mark.parametrize("direction_d2h", [True, False], ids=["d2h", "h2d"])
 def test_nested_layers_match_pointer_table(layout: str, direction_d2h: bool) -> None:
     device = torch.device("npu:0")
@@ -917,14 +1035,23 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
     obj17_d = torch.zeros((nl, chunk, 130), dtype=torch.uint8, device=device)
     obj17_p = obj17_d.clone()
 
-    hs, dtype = 512, torch.bfloat16
-    desc13 = _shape_desc(kv_size=1, nl=nl, nb=nb, bs=bs, nh=1, hs=hs, dtype=dtype)
-    layers13_d = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
-    layers13_p = _nh_cs_layers(nl=nl, nb=nb, bs=bs, hs=hs, dtype=dtype, device=device)
-    table13_d = _pointer_table(layers13_d, device)
-    table13_p = _pointer_table(layers13_p, device)
-    obj13_d = torch.zeros((nl, chunk, hs), dtype=dtype, device=device)
-    obj13_p = obj13_d.clone()
+    # Second spec: the 4-plane mixed-dtype DSA-C8 bundle — also fmt17 but
+    # with different plane geometry, so the plan batches two heterogeneous
+    # kernel groups in one step.
+    plane_specs = _PACKED_PLANE_SPECS["dsa_c8_4"]
+    bs2, chunk2 = 16, 16
+    desc_mp = _packed_planes_desc(nl=nl, nb=nb, bs=bs2, plane_specs=plane_specs)
+    layers_mp_d = _multi_plane_layers(
+        nl=nl, nb=nb, bs=bs2, plane_specs=plane_specs, device=device
+    )
+    layers_mp_p = _multi_plane_layers(
+        nl=nl, nb=nb, bs=bs2, plane_specs=plane_specs, device=device
+    )
+    table_mp_d = _pointer_table(layers_mp_d, device)
+    table_mp_p = _pointer_table(layers_mp_p, device)
+    row2 = _plane_row_bytes(plane_specs)
+    obj_mp_d = torch.zeros((nl, chunk2, row2), dtype=torch.uint8, device=device)
+    obj_mp_p = obj_mp_d.clone()
     block_ids = torch.tensor([0], dtype=torch.int64, device=device)
     direction = D2H if direction_d2h else H2D
 
@@ -932,17 +1059,15 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
         packed = _kg0_packed_object(nl, chunk, device)
         obj17_d.copy_(packed)
         obj17_p.copy_(packed)
-        src13 = (
-            torch.arange(nl * chunk * hs, dtype=torch.float32, device=device)
-            .view(nl, chunk, hs)
-            .to(dtype)
+        packed_mp = _packed_object_from_planes(
+            nl=nl, chunk=chunk2, plane_specs=plane_specs, device=device
         )
-        obj13_d.copy_(src13)
-        obj13_p.copy_(src13)
+        obj_mp_d.copy_(packed_mp)
+        obj_mp_p.copy_(packed_mp)
         _zero_engine(layers17_d)
         _zero_engine(layers17_p)
-        _zero_engine(layers13_d)
-        _zero_engine(layers13_p)
+        _zero_engine(layers_mp_d)
+        _zero_engine(layers_mp_p)
 
     _transfer(
         table17_d,
@@ -955,14 +1080,14 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
         KG0_FMT,
     )
     _transfer(
-        table13_d,
-        [int(obj13_d.data_ptr())],
+        table_mp_d,
+        [int(obj_mp_d.data_ptr())],
         block_ids,
         device,
         direction,
-        desc13,
-        chunk,
-        NH_CS_FMT,
+        desc_mp,
+        chunk2,
+        KG0_FMT,
     )
     spec17 = lmc_ops.KernelGroupSpec(
         table17_p.data_ptr(),
@@ -973,12 +1098,12 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
         block_ids.data_ptr(),
         block_ids.numel(),
     )
-    spec13 = lmc_ops.KernelGroupSpec(
-        table13_p.data_ptr(),
-        [obj13_p.data_ptr()],
-        desc13,
-        chunk,
-        int(NH_CS_FMT),
+    spec_mp = lmc_ops.KernelGroupSpec(
+        table_mp_p.data_ptr(),
+        [obj_mp_p.data_ptr()],
+        desc_mp,
+        chunk2,
+        int(KG0_FMT),
         block_ids.data_ptr(),
         block_ids.numel(),
     )
@@ -987,15 +1112,15 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
         [lmc_ops.LaunchVar(0, 0, 1, 1, 0), lmc_ops.LaunchVar(1, 0, 1, 1, 0)],
     )
     lmc_ops.execute_object_group_transfer(
-        int(direction), device, 1 << 26, [spec17, spec13], [step]
+        int(direction), device, 1 << 26, [spec17, spec_mp], [step]
     )
     torch.npu.synchronize()
     if direction_d2h:
         assert torch.equal(obj17_d.cpu(), obj17_p.cpu())
-        assert torch.equal(obj13_d.cpu(), obj13_p.cpu())
+        assert torch.equal(obj_mp_d.cpu(), obj_mp_p.cpu())
         return
     _assert_engine_equal(layers17_d, layers17_p)
-    _assert_engine_equal(layers13_d, layers13_p)
+    _assert_engine_equal(layers_mp_d, layers_mp_p)
 
 
 @requires_npu

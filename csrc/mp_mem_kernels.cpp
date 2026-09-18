@@ -58,28 +58,6 @@ struct PreparedGroup {
   int64_t slots_per_object = 0;
 };
 
-// num_planes == 0 is the "unfilled" sentinel: only legacy 16/13 inputs may be
-// derived (dense token rows, per-plane byte geometry from the scalar fields).
-// Format 17 must carry explicit validated geometry from registration.
-PageBufferShapeDesc describe_legacy_dense_token_rows(PageBufferShapeDesc sd,
-                                                     EngineKVFormat fmt) {
-  const int64_t row = checked_mul(
-      checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
-      "legacy scalar row bytes");
-  // Legacy block_stride_elems is in ELEMENTS of the original dtype.
-  const int64_t block_stride =
-      sd.block_stride_elems > 0
-          ? checked_mul(sd.block_stride_elems, sd.element_size,
-                        "legacy block stride bytes")
-          : checked_mul(sd.bs, row, "legacy tight block stride bytes");
-  sd.num_planes = fmt == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ? 2 : 1;
-  for (int32_t p = 0; p < sd.num_planes; ++p) {
-    sd.plane_slot_bytes[p] = row;
-    sd.plane_block_stride_bytes[p] = block_stride;
-  }
-  return sd;
-}
-
 PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
                             EngineKVFormat engine_kv_format,
                             int64_t slots_per_object) {
@@ -88,12 +66,10 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
   const bool fmt17 =
       engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
-  const bool fused =
-      engine_kv_format == EngineKVFormat::NL_X_NB_BS_NH_CS;
-  TORCH_CHECK(separate || fmt17 || fused,
+  TORCH_CHECK(separate || fmt17,
               "LMCache-Ascend block-level MP transfer currently supports "
-              "NL_X_TWO_X_NB_BS_NH_HS (16), NL_X_NP_X_NB_BS_ONE_HS (17), and "
-              "NL_X_NB_BS_NH_CS (13), got ",
+              "NL_X_TWO_X_NB_BS_NH_HS (16) and NL_X_NP_X_NB_BS_ONE_HS (17), "
+              "got ",
               static_cast<int>(engine_kv_format));
   TORCH_CHECK(sd.nl > 0 && sd.nb > 0 && sd.bs > 0 && sd.nh > 0 && sd.hs > 0,
               "shape descriptor dims must be positive, got nl=", sd.nl,
@@ -105,24 +81,16 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
               "kv_size must be ", (separate ? 2 : 1), " for format ",
               static_cast<int>(engine_kv_format), ", got ", sd.kv_size);
 
-  if (sd.num_planes == 0) {
-    TORCH_CHECK(!fmt17,
-                "format 17 requires explicit plane geometry (num_planes > "
-                "0); regenerate metadata from the real tensors");
-    sd = describe_legacy_dense_token_rows(sd, engine_kv_format);
-  }
+  // Both supported formats must carry explicit plane geometry filled at
+  // registration (num_planes == 0 is the "unfilled" sentinel).
   TORCH_CHECK(sd.num_planes >= 1 &&
                   sd.num_planes <= kvcache_ops::kMaxPlanes,
               "num_planes must be in [1, ", kvcache_ops::kMaxPlanes,
-              "], got ", sd.num_planes);
+              "] (explicit plane geometry from registration), got ",
+              sd.num_planes);
   if (separate) {
     TORCH_CHECK(sd.num_planes == 2,
                 "format 16 requires exactly 2 physical planes, got ",
-                sd.num_planes);
-  }
-  if (fused) {
-    TORCH_CHECK(sd.num_planes == 1,
-                "format 13 requires exactly 1 physical plane, got ",
                 sd.num_planes);
   }
   if (fmt17) {
@@ -504,6 +472,15 @@ void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes
   }
 }
 
+void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
+                          TransferDirection direction,
+                          size_t host_buffer_offset,
+                          size_t host_buffer_alignments) {
+  lmcache_memcpy_async_on_stream(
+      dest, src, nbytes, direction, host_buffer_offset, host_buffer_alignments,
+      c10_npu::getCurrentNPUStream().stream());
+}
+
 void execute_object_group_transfer(
     TransferDirection direction, const torch::Device& device,
     size_t host_buffer_alignment,
@@ -625,13 +602,4 @@ void execute_object_group_transfer(
     return 0;
   });
   cmd.Run();
-}
-
-void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
-                          TransferDirection direction,
-                          size_t host_buffer_offset,
-                          size_t host_buffer_alignments) {
-  lmcache_memcpy_async_on_stream(
-      dest, src, nbytes, direction, host_buffer_offset, host_buffer_alignments,
-      c10_npu::getCurrentNPUStream().stream());
 }
