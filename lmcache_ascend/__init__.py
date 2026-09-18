@@ -455,9 +455,6 @@ def _patch_config():
 
 
 def _patch_ops():
-    # Standard
-    from enum import IntEnum
-
     # Third Party
     # Merge fallback functions that ascend c_ops doesn't implement
     # (e.g., alloc_shm_pinned_ptr, free_shm_pinned_ptr, hugepage
@@ -473,35 +470,19 @@ def _patch_ops():
         if not attr_name.startswith("__") and not hasattr(ascend_c_ops, attr_name):
             setattr(ascend_c_ops, attr_name, getattr(python_ops_fallback, attr_name))
 
-    # LMCache v0.4.2 introduces GPUKVFormat enum in c_ops (CUDA pybind).
-    # Ascend c_ops doesn't have it, so we provide a compatible mock
-    # to avoid AttributeError when upstream code references it.
+    # Upstream CUDA pybind exports GPUKVFormat as an alias of EngineKVFormat
+    # (csrc/lmcache_native/pybind.cpp); mirror the alias so any downstream
+    # reference resolves identically.
     if not hasattr(ascend_c_ops, "GPUKVFormat"):
+        ascend_c_ops.GPUKVFormat = ascend_c_ops.EngineKVFormat
 
-        class GPUKVFormat(IntEnum):
-            # Keep numeric values in lockstep with ``csrc/mem_kernels.cuh``
-            # (CUDA ``lmcache.c_ops.GPUKVFormat``) so IntEnum comparisons stay
-            # consistent when upstream MP code passes raw ints.
-            NB_NL_TWO_BS_NH_HS = 0
-            NL_X_TWO_NB_BS_NH_HS = 1
-            NL_X_NB_TWO_BS_NH_HS = 2
-            NL_X_NB_BS_HS = 3
-            TWO_X_NL_X_NBBS_NH_HS = 4
-            NL_X_NBBS_ONE_HS = 5
-            NL_X_TWO_NB_NH_BS_HS = 6
-            NL_X_NB_TWO_NH_BS_HS = 7
-            NB_NL_TWO_NH_BS_HS = 8
-
-        ascend_c_ops.GPUKVFormat = GPUKVFormat
-
-    # Block kernel: 16 separate K/V, 17 packed multi-plane (MLA/DSA/DSv4),
-    # 13 fused NH_CS. Annotation has no Tensor so MP stays in ptr mode.
+    # Block kernel: 16 separate K/V, 17 packed multi-plane (MLA/DSA/DSv4).
+    # Annotation has no Tensor so MP stays in ptr mode.
     # The host prepare_group/validate_launch pair is the SINGLE authority on
     # which geometries launch natively: this wrapper only does
     # tensor/descriptor conversion and lifetime management — no narrow-tail
     # admission checks here.
     _native_block = ascend_c_ops.multi_layer_block_kv_transfer
-    _fmt_13 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_BS_NH_CS)
     _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
     _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
 
@@ -530,7 +511,7 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
-        if int(engine_kv_format) in (_fmt_13, _fmt_16, _fmt_17):
+        if int(engine_kv_format) in (_fmt_16, _fmt_17):
             import torch
 
             paged = _paged_arg_to_ptr_tensor(paged_buffer_ptrs_tensor, device)
@@ -800,6 +781,14 @@ def _patch_vllm_v1_adapter():
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
 
 
+def _patch_make_page_buffer_shape_desc():
+    """Attach per-plane byte geometry to upstream's desc factory (fmt 16/17)."""
+    # First Party
+    from lmcache_ascend.v1.shape_desc import install_plane_geometry_fill
+
+    install_plane_geometry_fill()
+
+
 def _patch_cache_engine():
     # Third Party
     import lmcache.v1.cache_engine as lmc_cache_engine
@@ -999,6 +988,7 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_gpu_connector()
 
     _patch_hash_token()
+    _patch_make_page_buffer_shape_desc()
 
     _patch_cachegen()
     _patch_remote_backend()
