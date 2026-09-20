@@ -189,6 +189,10 @@ _PACKED_PLANE_SPECS: dict[str, tuple[tuple[int, torch.dtype], ...]] = {
         (128, torch.int8),
         (1, torch.float16),
     ),
+    # 2B single-plane row: the thinnest legal payload (a bare fp16 scale).
+    # With bs=4096 the unclamped fit would be 128KB/32B = 4096 rows, one
+    # past the DataCopyPad blockCount limit (4095).
+    "thin2b_bs4096": ((1, torch.float16),),
 }
 
 
@@ -637,9 +641,10 @@ def _build_roundtrip_engine(
     if layout in _PACKED_PLANE_SPECS:
         plane_specs = _PACKED_PLANE_SPECS[layout]
         nb = nb or 32
-        # bs=128 pushes bs * row_bytes (147456) past the 128KB segment
-        # budget, exercising the multi-segment block split.
-        bs = 128 if layout == "mla_bf16_bs128" else 16
+        # bs=128 crosses the built-in 128KB floor (multi-segment split when
+        # the UB query falls back); the 2B thin plane with bs=4096 always
+        # splits via the 4095-row blockCount clamp.
+        bs = {"mla_bf16_bs128": 128, "thin2b_bs4096": 4096}.get(layout, 16)
         layers = _multi_plane_layers(
             nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
         )
@@ -737,6 +742,25 @@ def _roundtrip_cases() -> list[Any]:
     cases.append(
         pytest.param(
             "dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], id="dsa-c8-4plane-skip"
+        )
+    )
+    # skip == blocks_per_object: nothing to transfer; the host must skip
+    # the launch (<<<0>>> is invalid) and leave every byte untouched.
+    cases.append(
+        pytest.param(
+            "kg0", "npu", False, 2, 2, 1, [1, 3], id="kg0-npu-skip-all-blocks"
+        )
+    )
+    cases.append(
+        pytest.param(
+            "kg0", "cpu", False, 2, 2, 1, [1, 3], id="kg0-cpu-skip-all-blocks"
+        )
+    )
+    # Regression for the blockCount clamp: a 2B row gives fit = 4096 rows;
+    # bs=4096 must split into 4095 + 1 instead of exceeding the limit.
+    cases.append(
+        pytest.param(
+            "thin2b_bs4096", "npu", False, 0, 2, 1, [0], id="thin2b-bs4096-rowclamp"
         )
     )
     return cases

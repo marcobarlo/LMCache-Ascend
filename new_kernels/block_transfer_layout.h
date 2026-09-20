@@ -21,13 +21,23 @@
 //     offset lmc_base_offset_bytes (prefix sum) inside the row.
 //   - Format 16: two independent slabs of nl * lmc_layer_stride_bytes;
 //     planes[1].lmc_base_offset_bytes == nl * lmc_layer_stride_bytes.
-//   - Format 13: single plane, lmc_base_offset_bytes == 0.
 
 namespace kvcache_ops {
 
 constexpr int kMaxPlanes = 4;
+
+// Per-AIV UB staging budget, a conservative cross-SoC floor (950 has 248KB
+// physical UB per vector core). Bounds one token row, not a whole block;
+// full budget contract in block_transfer_contract.md section 3.
 constexpr int64_t kBlockTransferUbBytes = 128 * 1024;
+
 constexpr int32_t kBlockTransferQueueDepth = 1;
+
+// DataCopyExtParams::blockCount hardware upper bound for the DataCopyPad row
+// path ([1, 4095] per the AscendC API reference). The kernel clamps
+// rows-per-segment to this value: a thin plane (payload <= 32B) gives
+// fit = kBlockTransferUbBytes / 32B = 4096 rows, one past the limit.
+constexpr int32_t kMaxRowsPerDataCopyPad = 4095;
 
 struct PlaneLayout {
   int64_t payload_bytes;             // valid bytes per token slot

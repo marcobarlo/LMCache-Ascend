@@ -45,6 +45,20 @@ int64_t checked_add(int64_t a, int64_t b, const char* what) {
   return a + b;
 }
 
+// Usable per-AIV UB staging budget, queried from the platform: GetCoreMemSize
+// reports the PHYSICAL UB size. Returns 0 on failure -- callers then use
+// the kernel's built-in 128KB default.
+int64_t query_ub_budget_bytes() {
+  auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance(
+      aclrtGetSocName());
+  if (platform == nullptr) {
+    return 0;
+  }
+  uint64_t ub_size = 0;
+  platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_size);
+  return ub_size == 0 ? 0 : static_cast<int64_t>(ub_size);
+}
+
 // ---------------------------------------------------------------------------
 // prepare_group: static geometry, resolved once per group.
 // ---------------------------------------------------------------------------
@@ -56,11 +70,12 @@ struct PreparedGroup {
   int32_t nb = 0;
   int32_t bs = 0;
   int64_t slots_per_object = 0;
+  int64_t ub_bytes = 0;  // queried UB budget; 0 = kernel default
 };
 
 PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
                             EngineKVFormat engine_kv_format,
-                            int64_t slots_per_object) {
+                            int64_t slots_per_object, int64_t ub_bytes) {
   PageBufferShapeDesc sd = shape_desc;
   const bool separate =
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
@@ -102,6 +117,11 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
 
   PreparedGroup group;
   group.layout.num_planes = sd.num_planes;
+  // Per-segment budget: host-queried UB (query_ub_budget_bytes) or the
+  // built-in default; the kernel receives the same ub_bytes.
+  const int64_t ub_segment =
+      ub_bytes > 0 ? ub_bytes / kvcache_ops::kBlockTransferQueueDepth
+                   : kUbSegmentBytes;
   const int64_t scalar_row = checked_mul(
       checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
       "LMC scalar row bytes");
@@ -111,9 +131,9 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
     const int64_t block_stride = sd.plane_block_stride_bytes[p];
     TORCH_CHECK(payload > 0, "plane ", p, " payload must be positive, got ",
                 payload);
-    TORCH_CHECK(align_up32(payload) <= kUbSegmentBytes, "plane ", p,
+    TORCH_CHECK(align_up32(payload) <= ub_segment, "plane ", p,
                 " aligned row (", align_up32(payload),
-                " bytes) exceeds the per-segment UB budget (", kUbSegmentBytes,
+                " bytes) exceeds the per-segment UB budget (", ub_segment,
                 ")");
     const int64_t span = checked_mul(sd.bs, payload, "plane block span");
     TORCH_CHECK(block_stride >= span, "plane ", p,
@@ -175,6 +195,7 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
   group.nb = sd.nb;
   group.bs = sd.bs;
   group.slots_per_object = slots_per_object;
+  group.ub_bytes = ub_bytes;
   return group;
 }
 
@@ -239,13 +260,18 @@ void launch_prepared_objects(uint32_t aiv_num, void* stream,
                              const std::vector<int64_t>& obj_device_ptrs,
                              int64_t* block_ids_base,
                              const CheckedLaunch& launch, bool to_engine) {
-  // blockDim is clamped to the work-item count so tiny transfers do not spin
-  // idle cores. blocks_per_object >= 1 is guaranteed by validate_launch
-  // (blocks * bs == slots_per_object > 0).
+  // blockDim matches the ACTIVE work-item count (the kernel folds skip into
+  // its index map). skip == blocks -> nothing to transfer; return early
+  // because <<<0>>> would be an invalid launch.
   const int32_t plane_slots =
       group.separate_plane ? group.layout.num_planes : 1;
-  const int64_t work = static_cast<int64_t>(group.nl) * plane_slots *
-                       launch.blocks_per_object;
+  const int64_t active_blocks =
+      launch.blocks_per_object - launch.skip_prefix_n_blocks;
+  const int64_t work =
+      static_cast<int64_t>(group.nl) * plane_slots * active_blocks;
+  if (work == 0) {
+    return;
+  }
   const uint32_t blockDim =
       static_cast<uint32_t>(std::min<int64_t>(aiv_num, work));
   for (int32_t i = 0; i < launch.num_objects; ++i) {
@@ -255,7 +281,8 @@ void launch_prepared_objects(uint32_t aiv_num, void* stream,
         blockDim, stream, paged_buffer_ptrs,
         reinterpret_cast<uint8_t*>(obj_device_ptrs[i]), engine_block_ids,
         launch.blocks_per_object, launch.skip_prefix_n_blocks, group.nl,
-        group.nb, group.bs, group.separate_plane, group.layout, to_engine);
+        group.nb, group.bs, group.separate_plane, group.layout, to_engine,
+        group.ub_bytes);
   }
 }
 
@@ -381,9 +408,12 @@ void multi_layer_block_kv_transfer(
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
+  // Device guard first: the UB query below needs the current device's SoC.
+  const c10::OptionalDeviceGuard device_guard(device);
   // --- Static geometry (prepare_group) + dynamic variables (validate_launch)
-  const PreparedGroup group =
-      prepare_group(shape_desc, engine_kv_format, lmcache_chunk_size);
+  const PreparedGroup group = prepare_group(shape_desc, engine_kv_format,
+                                            lmcache_chunk_size,
+                                            query_ub_budget_bytes());
   const int num_objects = static_cast<int>(lmcache_objects_ptrs.size());
   const int64_t total_blocks = block_ids.size(0);
   const CheckedLaunch launch =
@@ -415,7 +445,6 @@ void multi_layer_block_kv_transfer(
 
   const bool to_engine = (direction == TransferDirection::H2D);
 
-  const c10::OptionalDeviceGuard device_guard(device);
   PreparedLmcPtrs prepared = prepare_lmc_ptrs(lmcache_objects_ptrs, device, group);
 
   uint8_t* paged_buffer_ptrs =
@@ -500,11 +529,12 @@ void execute_object_group_transfer(
   // --- Whole-plan pre-validation: every group is prepared and
   // every launch is validated before ANY staging copy or kernel launch is
   // enqueued. A failure here means "nothing started".
+  const int64_t ub_bytes = query_ub_budget_bytes();
   std::vector<PreparedGroup> groups;
   groups.reserve(kernel_group_specs.size());
   for (const auto& spec : kernel_group_specs) {
     groups.push_back(prepare_group(spec.shape_desc, spec.engine_kv_format,
-                                   spec.lmcache_chunk_size));
+                                   spec.lmcache_chunk_size, ub_bytes));
   }
 
   struct PreparedLaunch {
