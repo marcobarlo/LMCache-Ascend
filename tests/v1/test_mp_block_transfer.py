@@ -279,6 +279,10 @@ _PACKED_PLANE_SPECS: dict[str, tuple[tuple[int, torch.dtype], ...]] = {
         (128, torch.int8),
         (1, torch.float16),
     ),
+    # 2B single-plane row: the thinnest legal payload (a bare fp16 scale).
+    # With bs=4096 the unclamped fit would be 128KB/32B = 4096 rows, one
+    # past the DataCopyPad blockCount limit (4095).
+    "thin2b_bs4096": ((1, torch.float16),),
 }
 
 
@@ -473,7 +477,10 @@ def _build(
     if layout in _PACKED_PLANE_SPECS:
         plane_specs = _PACKED_PLANE_SPECS[layout]
         nl = nl or 2
-        bs = 128 if layout == "mla_bf16_bs128" else (bs or 16)
+        # bs=128 crosses the built-in 128KB floor (multi-segment split when
+        # the UB query falls back); the 2B thin plane with bs=4096 always
+        # splits via the 4095-row blockCount clamp.
+        bs = {"mla_bf16_bs128": 128, "thin2b_bs4096": 4096}.get(layout, bs or 16)
         nb = nb or 32
         layers = _multi_plane_layers(
             nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
@@ -645,6 +652,13 @@ def _roundtrip_cases() -> list[Any]:
         ("dsa3", "npu", False, 0, 2, 1, [0, 1], "dsa3-bs16"),
         ("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], "dsa-c8-4plane"),
         ("dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], "dsa-c8-4plane-skip"),
+        # skip == blocks_per_object: host must skip the launch (<<<0>>> is
+        # invalid) and leave every byte untouched.
+        ("kg0", "npu", False, 2, 2, 1, [1, 3], "kg0-npu-skip-all-blocks"),
+        ("kg0", "cpu", False, 2, 2, 1, [1, 3], "kg0-cpu-skip-all-blocks"),
+        # 2B row fit = 4096; bs=4096 must split 4095+1 instead of overflowing
+        # DataCopyPad blockCount.
+        ("thin2b_bs4096", "npu", False, 0, 2, 1, [0], "thin2b-bs4096-rowclamp"),
     ]
     for host in _HOSTS:
         rows.append(("kg0", host, False, 0, 2, 1, [0], f"kg0-{host}-mini"))
