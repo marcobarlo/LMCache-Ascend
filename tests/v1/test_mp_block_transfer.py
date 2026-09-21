@@ -88,6 +88,19 @@ def _engine_nb(layers: Sequence[Any]) -> int:
     return int(_planes(layers[0])[0].shape[0])
 
 
+def _paged_ptr_tensor(paged: object, device: torch.device) -> torch.Tensor:
+    """Native host wants a 1-D int64 pointer table, not nested layer tensors."""
+    if isinstance(paged, torch.Tensor):
+        return paged
+    ptrs: list[int] = []
+    for layer in paged:  # type: ignore[union-attr]
+        if isinstance(layer, (tuple, list)):
+            ptrs.extend(int(plane.data_ptr()) for plane in layer)
+        else:
+            ptrs.append(int(layer.data_ptr()))
+    return torch.tensor(ptrs, dtype=torch.int64, device=device)
+
+
 def _transfer(
     paged: object,
     obj_ptrs: list[int],
@@ -100,7 +113,15 @@ def _transfer(
     skip: int = 0,
 ) -> None:
     lmc_ops.multi_layer_block_kv_transfer(
-        paged, obj_ptrs, block_ids, device, direction, desc, chunk, fmt, skip
+        _paged_ptr_tensor(paged, device),
+        obj_ptrs,
+        block_ids,
+        device,
+        direction,
+        desc,
+        chunk,
+        fmt,
+        skip,
     )
     torch.npu.synchronize()
 
