@@ -286,6 +286,20 @@ class CustomAscendCmakeBuildExt(build_ext):
                 "Please ensure the hcomm submodule is initialized and updated."
             )
 
+        # kvcache-ops provides the cache_kernels target (ascendc_library) pulled
+        # in via add_subdirectory(third_party/kvcache-ops) in CMakeLists.txt. The
+        # submodule path can exist as an empty placeholder after `git submodule
+        # init` without `update`, so check for its CMakeLists.txt specifically.
+        kvcache_ops_cmake = os.path.join(
+            ROOT_DIR, "third_party", "kvcache-ops", "CMakeLists.txt"
+        )
+        if not os.path.exists(kvcache_ops_cmake):
+            raise RuntimeError(
+                "kvcache-ops submodule not checked out "
+                f"(missing {kvcache_ops_cmake}). "
+                "Please run: `git submodule update --init third_party/kvcache-ops`"
+            )
+
         if self._cann_version_8_5:
             logger.info(f"CANN {cann_version}: building HCCL agent (hcomm headers)")
             logger.info(f"CANN {cann_version}: building HIXL transfer channel")
