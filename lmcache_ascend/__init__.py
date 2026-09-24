@@ -696,6 +696,7 @@ def _patch_logical_block_size():
     reports that span for Ascend leaves. Post-#13242 ``block_size`` is already
     logical, so LMCache core is left unpatched. Never mutate ``spec.block_size``.
     """
+    # First Party
     from lmcache_ascend.integration.vllm.logical_block_size import install_overrides
 
     install_overrides()

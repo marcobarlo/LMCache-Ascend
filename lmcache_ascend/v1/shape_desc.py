@@ -7,8 +7,10 @@ take that class by value. Also hosts the wrap that attaches per-plane
 byte geometry to upstream's desc factory (:func:`install_plane_geometry_fill`).
 """
 
+# Future
 from __future__ import annotations
 
+# Standard
 from collections.abc import Sequence
 
 _MAX_PLANES = 4
