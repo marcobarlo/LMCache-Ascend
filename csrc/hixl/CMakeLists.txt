@@ -16,6 +16,11 @@ target_include_directories(hixl_npu_comms PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/include
     ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/pkg_inc/runtime
+    ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/pkg_inc/base
+    # profiling/ holds prof_common.h, which pkg_inc/toolchain/prof_api.h
+    # (pulled in transitively via runtime/runtime/base.h) includes.
+    ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/pkg_inc/profiling
+    ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/pkg_inc/toolchain
     ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/pkg_inc
     ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/include/experiment/msprof
 )
