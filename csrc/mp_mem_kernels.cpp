@@ -34,15 +34,15 @@ namespace {
 constexpr int64_t kGmAlignBytes = 32;
 // Single UB segment budget: the depth-2 queue must hold two segments, so one
 // segment may use at most half of the total budget.
-constexpr int64_t kUbSegmentBytes = kvcache_ops::kBlockTransferUbBytes /
-                                    kvcache_ops::kBlockTransferQueueDepth;
+constexpr int64_t kUbSegmentBytes =
+    kvcache_ops::kBlockTransferUbBytes / kvcache_ops::kBlockTransferQueueDepth;
 // DataCopyPad GM-side gap fields are uint32.
 constexpr int64_t kCopyGmGapMax =
     static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
 
 int64_t align_up32(int64_t v) { return (v + 31) & ~int64_t(31); }
 
-int64_t checked_mul(int64_t a, int64_t b, const char* what) {
+int64_t checked_mul(int64_t a, int64_t b, const char *what) {
   TORCH_CHECK(a >= 0 && b >= 0, what, " must be non-negative, got ", a, " * ",
               b);
   if (a != 0) {
@@ -52,7 +52,7 @@ int64_t checked_mul(int64_t a, int64_t b, const char* what) {
   return a * b;
 }
 
-int64_t checked_add(int64_t a, int64_t b, const char* what) {
+int64_t checked_add(int64_t a, int64_t b, const char *what) {
   TORCH_CHECK(a >= 0 && b >= 0 && b <= std::numeric_limits<int64_t>::max() - a,
               what, " overflows int64: ", a, " + ", b);
   return a + b;
@@ -62,8 +62,8 @@ int64_t checked_add(int64_t a, int64_t b, const char* what) {
 // reports the PHYSICAL UB size. Returns 0 on failure -- callers then use
 // the kernel's built-in 128KB default.
 int64_t query_ub_budget_bytes() {
-  auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance(
-      aclrtGetSocName());
+  auto *platform =
+      platform_ascendc::PlatformAscendCManager::GetInstance(aclrtGetSocName());
   if (platform == nullptr) {
     return 0;
   }
@@ -78,22 +78,21 @@ int64_t query_ub_budget_bytes() {
 
 struct PreparedGroup {
   kvcache_ops::BlockTransferLayout layout{};
-  bool separate_plane = false;  // format 16: (layer, plane, block) work items
+  bool separate_plane = false; // format 16: (layer, plane, block) work items
   int32_t nl = 0;
   int32_t nb = 0;
   int32_t bs = 0;
   int64_t slots_per_object = 0;
-  int64_t ub_bytes = 0;  // queried UB budget; 0 = kernel default
+  int64_t ub_bytes = 0; // queried UB budget; 0 = kernel default
 };
 
-PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
+PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
                             EngineKVFormat engine_kv_format,
                             int64_t slots_per_object, int64_t ub_bytes) {
   PageBufferShapeDesc sd = shape_desc;
   const bool separate =
       engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
-  const bool fmt17 =
-      engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
+  const bool fmt17 = engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
   TORCH_CHECK(separate || fmt17,
               "LMCache-Ascend block-level MP transfer currently supports "
               "NL_X_TWO_X_NB_BS_NH_HS (16) and NL_X_NP_X_NB_BS_ONE_HS (17), "
@@ -105,14 +104,13 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
   TORCH_CHECK(sd.element_size == 1 || sd.element_size == 2 ||
                   sd.element_size == 4,
               "element_size must be 1, 2 or 4, got ", sd.element_size);
-  TORCH_CHECK(sd.kv_size == (separate ? 2 : 1),
-              "kv_size must be ", (separate ? 2 : 1), " for format ",
+  TORCH_CHECK(sd.kv_size == (separate ? 2 : 1), "kv_size must be ",
+              (separate ? 2 : 1), " for format ",
               static_cast<int>(engine_kv_format), ", got ", sd.kv_size);
 
   // Both supported formats must carry explicit plane geometry filled at
   // registration (num_planes == 0 is the "unfilled" sentinel).
-  TORCH_CHECK(sd.num_planes >= 1 &&
-                  sd.num_planes <= kvcache_ops::kMaxPlanes,
+  TORCH_CHECK(sd.num_planes >= 1 && sd.num_planes <= kvcache_ops::kMaxPlanes,
               "num_planes must be in [1, ", kvcache_ops::kMaxPlanes,
               "] (explicit plane geometry from registration), got ",
               sd.num_planes);
@@ -122,11 +120,11 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
                 sd.num_planes);
   }
   if (fmt17) {
-    TORCH_CHECK(sd.nh == 1, "format 17 requires one head per plane, got nh=",
-                sd.nh);
+    TORCH_CHECK(sd.nh == 1,
+                "format 17 requires one head per plane, got nh=", sd.nh);
   }
-  TORCH_CHECK(slots_per_object > 0,
-              "slots per object must be positive, got ", slots_per_object);
+  TORCH_CHECK(slots_per_object > 0, "slots per object must be positive, got ",
+              slots_per_object);
 
   PreparedGroup group;
   group.layout.num_planes = sd.num_planes;
@@ -135,9 +133,9 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
   const int64_t ub_segment =
       ub_bytes > 0 ? ub_bytes / kvcache_ops::kBlockTransferQueueDepth
                    : kUbSegmentBytes;
-  const int64_t scalar_row = checked_mul(
-      checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
-      "LMC scalar row bytes");
+  const int64_t scalar_row =
+      checked_mul(checked_mul(sd.nh, sd.hs, "nh * hs"), sd.element_size,
+                  "LMC scalar row bytes");
   int64_t prefix = 0;
   for (int32_t p = 0; p < sd.num_planes; ++p) {
     const int64_t payload = sd.plane_slot_bytes[p];
@@ -146,12 +144,10 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
                 payload);
     TORCH_CHECK(align_up32(payload) <= ub_segment, "plane ", p,
                 " aligned row (", align_up32(payload),
-                " bytes) exceeds the per-segment UB budget (", ub_segment,
-                ")");
+                " bytes) exceeds the per-segment UB budget (", ub_segment, ")");
     const int64_t span = checked_mul(sd.bs, payload, "plane block span");
-    TORCH_CHECK(block_stride >= span, "plane ", p,
-                " block stride (", block_stride,
-                ") is below the dense block span (", span,
+    TORCH_CHECK(block_stride >= span, "plane ", p, " block stride (",
+                block_stride, ") is below the dense block span (", span,
                 "); blocks would overlap");
     TORCH_CHECK(block_stride % kGmAlignBytes == 0, "plane ", p,
                 " engine block stride (", block_stride,
@@ -162,24 +158,21 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
     checked_add(checked_mul(sd.nb - 1, block_stride, "plane address range"),
                 span, "plane address range");
     if (!fmt17) {
-      TORCH_CHECK(payload == scalar_row, "plane ", p,
-                  " payload (", payload,
+      TORCH_CHECK(payload == scalar_row, "plane ", p, " payload (", payload,
                   ") must equal the full scalar row (", scalar_row,
                   ") for format ", static_cast<int>(engine_kv_format));
     }
     // LMC packed-row gap = bytes of the OTHER planes in the row; it feeds a
     // uint32 DataCopyPad field (engine-side gap is always 0: dense rows).
-    TORCH_CHECK(scalar_row >= payload &&
-                    scalar_row - payload <= kCopyGmGapMax,
+    TORCH_CHECK(scalar_row >= payload && scalar_row - payload <= kCopyGmGapMax,
                 "plane ", p, " LMC row gap (", scalar_row - payload,
                 ") exceeds the DataCopyPad GM gap range");
-    group.layout.planes[p] = kvcache_ops::PlaneLayout{
-        payload, block_stride, fmt17 ? prefix : 0};
+    group.layout.planes[p] =
+        kvcache_ops::PlaneLayout{payload, block_stride, fmt17 ? prefix : 0};
     prefix = checked_add(prefix, payload, "LMC row prefix sum");
   }
   if (fmt17) {
-    TORCH_CHECK(prefix == scalar_row,
-                "sum of plane payloads (", prefix,
+    TORCH_CHECK(prefix == scalar_row, "sum of plane payloads (", prefix,
                 ") must equal nh * hs * element_size (", scalar_row,
                 ") for format 17");
   }
@@ -196,12 +189,10 @@ PreparedGroup prepare_group(const PageBufferShapeDesc& shape_desc,
     group.layout.planes[1].lmc_base_offset_bytes = slab;
   }
   // LMC pages must not share 32B lines.
-  TORCH_CHECK(checked_mul(sd.bs, scalar_row, "LMC page bytes") %
-                      kGmAlignBytes ==
-                  0,
-              "BS * LMC row bytes (", sd.bs * scalar_row,
-              ") must be a multiple of ", kGmAlignBytes,
-              "; otherwise adjacent LMC pages share a 32B line");
+  TORCH_CHECK(
+      checked_mul(sd.bs, scalar_row, "LMC page bytes") % kGmAlignBytes == 0,
+      "BS * LMC row bytes (", sd.bs * scalar_row, ") must be a multiple of ",
+      kGmAlignBytes, "; otherwise adjacent LMC pages share a 32B line");
 
   group.separate_plane = separate;
   group.nl = sd.nl;
@@ -223,7 +214,7 @@ struct CheckedLaunch {
   int32_t skip_prefix_n_blocks = 0;
 };
 
-CheckedLaunch validate_launch(const PreparedGroup& group, int64_t total_blocks,
+CheckedLaunch validate_launch(const PreparedGroup &group, int64_t total_blocks,
                               int num_objects, int64_t block_ids_offset,
                               int64_t block_ids_capacity,
                               int skip_prefix_n_blocks) {
@@ -232,21 +223,20 @@ CheckedLaunch validate_launch(const PreparedGroup& group, int64_t total_blocks,
   TORCH_CHECK(total_blocks >= 0, "total_blocks must be non-negative, got ",
               total_blocks);
   TORCH_CHECK(total_blocks % num_objects == 0, "block_ids length (",
-              total_blocks, ") must be divisible by num_objects (",
-              num_objects, ")");
+              total_blocks, ") must be divisible by num_objects (", num_objects,
+              ")");
   const int64_t blocks = total_blocks / num_objects;
   TORCH_CHECK(checked_mul(blocks, group.bs, "blocks * bs") ==
                   group.slots_per_object,
               "blocks_per_object * block_size (", blocks * group.bs,
               ") must equal slots per object (", group.slots_per_object, ")");
-  TORCH_CHECK(skip_prefix_n_blocks >= 0 &&
-                  skip_prefix_n_blocks <= blocks,
+  TORCH_CHECK(skip_prefix_n_blocks >= 0 && skip_prefix_n_blocks <= blocks,
               "skip_prefix_n_blocks (", skip_prefix_n_blocks,
               ") must be within [0, ", blocks, "]");
   // Subtraction form: offset + length itself may not overflow.
   TORCH_CHECK(block_ids_offset >= 0 && block_ids_offset <= block_ids_capacity,
-              "block_ids_offset (", block_ids_offset,
-              ") must be within [0, ", block_ids_capacity, "]");
+              "block_ids_offset (", block_ids_offset, ") must be within [0, ",
+              block_ids_capacity, "]");
   TORCH_CHECK(total_blocks <= block_ids_capacity - block_ids_offset,
               "block_ids slice [", block_ids_offset, ", ",
               block_ids_offset + total_blocks, ") exceeds block_ids capacity ",
@@ -267,12 +257,12 @@ CheckedLaunch validate_launch(const PreparedGroup& group, int64_t total_blocks,
 // Launch: one kernel launch per object.
 // ---------------------------------------------------------------------------
 
-void launch_prepared_objects(uint32_t aiv_num, void* stream,
-                             const PreparedGroup& group,
-                             uint8_t* paged_buffer_ptrs,
-                             const std::vector<int64_t>& obj_device_ptrs,
-                             int64_t* block_ids_base,
-                             const CheckedLaunch& launch, bool to_engine) {
+void launch_prepared_objects(uint32_t aiv_num, void *stream,
+                             const PreparedGroup &group,
+                             uint8_t *paged_buffer_ptrs,
+                             const std::vector<int64_t> &obj_device_ptrs,
+                             int64_t *block_ids_base,
+                             const CheckedLaunch &launch, bool to_engine) {
   // blockDim matches the ACTIVE work-item count (the kernel folds skip into
   // its index map). skip == blocks -> nothing to transfer; return early
   // because <<<0>>> would be an invalid launch.
@@ -288,11 +278,11 @@ void launch_prepared_objects(uint32_t aiv_num, void* stream,
   const uint32_t blockDim =
       static_cast<uint32_t>(std::min<int64_t>(aiv_num, work));
   for (int32_t i = 0; i < launch.num_objects; ++i) {
-    uint8_t* engine_block_ids = reinterpret_cast<uint8_t*>(
+    uint8_t *engine_block_ids = reinterpret_cast<uint8_t *>(
         block_ids_base + static_cast<int64_t>(i) * launch.blocks_per_object);
     kvcache_ops::multi_layer_block_transfer_kernel(
         blockDim, stream, paged_buffer_ptrs,
-        reinterpret_cast<uint8_t*>(obj_device_ptrs[i]), engine_block_ids,
+        reinterpret_cast<uint8_t *>(obj_device_ptrs[i]), engine_block_ids,
         launch.blocks_per_object, launch.skip_prefix_n_blocks, group.nl,
         group.nb, group.bs, group.separate_plane, group.layout, to_engine,
         group.ub_bytes);
@@ -307,7 +297,7 @@ void launch_prepared_objects(uint32_t aiv_num, void* stream,
 // device VA: registered aclrtMallocHost (get_device_ptr) or a true NPU
 // allocation. MixedMemoryAllocator SHM L1 is neither — stage on-device and
 // aclrtMemcpy.
-bool is_npu_memory_ptr(void* ptr) {
+bool is_npu_memory_ptr(void *ptr) {
   aclrtPtrAttributes attributes{};
   const aclError ret = aclrtPointerGetAttributes(ptr, &attributes);
   if (ret != ACL_ERROR_NONE) {
@@ -316,12 +306,12 @@ bool is_npu_memory_ptr(void* ptr) {
   return attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE;
 }
 
-std::vector<int64_t> device_lmc_ptrs(const std::vector<int64_t>& ptrs) {
+std::vector<int64_t> device_lmc_ptrs(const std::vector<int64_t> &ptrs) {
   std::vector<int64_t> out;
   out.reserve(ptrs.size());
   for (int64_t p : ptrs) {
-    void* mapped =
-        get_device_ptr(reinterpret_cast<void*>(static_cast<uintptr_t>(p)));
+    void *mapped =
+        get_device_ptr(reinterpret_cast<void *>(static_cast<uintptr_t>(p)));
     out.push_back(mapped != nullptr ? reinterpret_cast<int64_t>(mapped) : p);
   }
   return out;
@@ -333,28 +323,29 @@ struct HostStage {
   size_t nbytes = 0;
 };
 
-// Resolve LMCache object pointers to device VAs. SHM/host objects that are
-// neither registered aclrtMallocHost nor NPU memory get an on-device staging
-// tensor (HostStage); the caller memcpy-asyncs around the kernel. Allocations
-// happen BEFORE the OpCommand so the tensors can be captured by value.
+// Resolve LMCache object pointers to device virtual addresses. SHM/host
+// objects that are neither registered aclrtMallocHost nor NPU memory get an
+// on-device staging tensor (HostStage); the caller memcpy-asyncs around the
+// kernel. Allocations happen BEFORE the OpCommand so the tensors can be
+// captured by value.
 struct PreparedLmcPtrs {
   std::vector<int64_t> kernel_obj_ptrs;
   std::vector<HostStage> host_stages;
 };
 
-PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptrs,
-                                 const torch::Device& device,
-                                 const PreparedGroup& group) {
+PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t> &lmc_obj_ptrs,
+                                 const torch::Device &device,
+                                 const PreparedGroup &group) {
   PreparedLmcPtrs prepared;
-  prepared.kernel_obj_ptrs.reserve(lmcache_objects_ptrs.size());
+  prepared.kernel_obj_ptrs.reserve(lmc_obj_ptrs.size());
   const auto staging_opts =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
   // One capacity formula for every layout.
   const int64_t object_bytes = group.layout.lmc_object_bytes;
   TORCH_CHECK(object_bytes > 0, "LMCache object byte size must be positive");
-  for (int64_t p : lmcache_objects_ptrs) {
-    void* raw = reinterpret_cast<void*>(static_cast<uintptr_t>(p));
-    void* mapped = get_device_ptr(raw);
+  for (int64_t p : lmc_obj_ptrs) {
+    void *raw = reinterpret_cast<void *>(static_cast<uintptr_t>(p));
+    void *mapped = get_device_ptr(raw);
     if (mapped != nullptr) {
       prepared.kernel_obj_ptrs.push_back(reinterpret_cast<int64_t>(mapped));
       continue;
@@ -379,18 +370,19 @@ PreparedLmcPtrs prepare_lmc_ptrs(const std::vector<int64_t>& lmcache_objects_ptr
 // before the kernel, D2H stages after, and a partial D2H store first reads
 // the host object into staging so the untouched prefix is preserved when
 // the whole object is written back.
-int enqueue_block_transfer(void* stream, uint32_t aiv_num,
-                           uint8_t* paged_buffer_ptrs,
-                           const PreparedGroup& group,
-                           const PreparedLmcPtrs& prepared,
-                           int64_t* block_ids_base,
-                           const CheckedLaunch& launch, bool to_engine) {
+int enqueue_block_transfer(void *stream, uint32_t aiv_num,
+                           uint8_t *paged_buffer_ptrs,
+                           const PreparedGroup &group,
+                           const PreparedLmcPtrs &prepared,
+                           int64_t *block_ids_base, const CheckedLaunch &launch,
+                           bool to_engine) {
   if (to_engine || launch.skip_prefix_n_blocks > 0) {
-    for (const auto& stage : prepared.host_stages) {
-      const aclError ret = aclrtMemcpyAsync(
-          stage.buf.data_ptr(), stage.nbytes,
-          reinterpret_cast<const void*>(static_cast<uintptr_t>(stage.host_ptr)),
-          stage.nbytes, ACL_MEMCPY_HOST_TO_DEVICE, stream);
+    for (const auto &stage : prepared.host_stages) {
+      const aclError ret =
+          aclrtMemcpyAsync(stage.buf.data_ptr(), stage.nbytes,
+                           reinterpret_cast<const void *>(
+                               static_cast<uintptr_t>(stage.host_ptr)),
+                           stage.nbytes, ACL_MEMCPY_HOST_TO_DEVICE, stream);
       if (ret != ACL_ERROR_NONE) {
         return static_cast<int>(ret);
       }
@@ -400,9 +392,9 @@ int enqueue_block_transfer(void* stream, uint32_t aiv_num,
                           prepared.kernel_obj_ptrs, block_ids_base, launch,
                           to_engine);
   if (!to_engine) {
-    for (const auto& stage : prepared.host_stages) {
+    for (const auto &stage : prepared.host_stages) {
       const aclError ret = aclrtMemcpyAsync(
-          reinterpret_cast<void*>(static_cast<uintptr_t>(stage.host_ptr)),
+          reinterpret_cast<void *>(static_cast<uintptr_t>(stage.host_ptr)),
           stage.nbytes, stage.buf.data_ptr(), stage.nbytes,
           ACL_MEMCPY_DEVICE_TO_HOST, stream);
       if (ret != ACL_ERROR_NONE) {
@@ -413,27 +405,26 @@ int enqueue_block_transfer(void* stream, uint32_t aiv_num,
   return 0;
 }
 
-}  // namespace
+} // namespace
 
 void multi_layer_block_kv_transfer(
-    const torch::Tensor& paged_buffer_ptrs_tensor,
-    std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor& block_ids,
-    const torch::Device& device, TransferDirection direction,
+    const torch::Tensor &paged_buffer_ptrs_tensor,
+    std::vector<int64_t> lmcache_objects_ptrs, const torch::Tensor &block_ids,
+    const torch::Device &device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     EngineKVFormat engine_kv_format, int skip_prefix_n_blocks) {
   // Device guard first: the UB query below needs the current device's SoC.
   const c10::OptionalDeviceGuard device_guard(device);
   // --- Static geometry (prepare_group) + dynamic variables (validate_launch)
-  const PreparedGroup group = prepare_group(shape_desc, engine_kv_format,
-                                            lmcache_chunk_size,
-                                            query_ub_budget_bytes());
+  const PreparedGroup group =
+      prepare_group(shape_desc, engine_kv_format, lmcache_chunk_size,
+                    query_ub_budget_bytes());
   const int num_objects = static_cast<int>(lmcache_objects_ptrs.size());
   const int64_t total_blocks = block_ids.size(0);
-  const CheckedLaunch launch =
-      validate_launch(group, total_blocks, num_objects,
-                      /*block_ids_offset=*/0,
-                      /*block_ids_capacity=*/total_blocks,
-                      skip_prefix_n_blocks);
+  const CheckedLaunch launch = validate_launch(
+      group, total_blocks, num_objects,
+      /*block_ids_offset=*/0,
+      /*block_ids_capacity=*/total_blocks, skip_prefix_n_blocks);
 
   TORCH_CHECK(paged_buffer_ptrs_tensor.scalar_type() == at::kLong,
               "paged_buffer_ptrs_tensor must be int64");
@@ -458,11 +449,12 @@ void multi_layer_block_kv_transfer(
 
   const bool to_engine = (direction == TransferDirection::H2D);
 
-  PreparedLmcPtrs prepared = prepare_lmc_ptrs(lmcache_objects_ptrs, device, group);
+  PreparedLmcPtrs prepared =
+      prepare_lmc_ptrs(lmcache_objects_ptrs, device, group);
 
-  uint8_t* paged_buffer_ptrs =
-      static_cast<uint8_t*>(paged_buffer_ptrs_tensor.data_ptr());
-  int64_t* block_ids_base = block_ids.data_ptr<int64_t>();
+  uint8_t *paged_buffer_ptrs =
+      static_cast<uint8_t *>(paged_buffer_ptrs_tensor.data_ptr());
+  int64_t *block_ids_base = block_ids.data_ptr<int64_t>();
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
@@ -470,7 +462,7 @@ void multi_layer_block_kv_transfer(
   cmd.Name("multi_layer_block_transfer_kernel");
   cmd.SetCustomHandler([stream, paged_buffer_ptrs, group, prepared,
                         block_ids_base, launch, to_engine]() -> int {
-    const char* socName = aclrtGetSocName();
+    const char *socName = aclrtGetSocName();
     auto ascendcPlatform =
         platform_ascendc::PlatformAscendCManager::GetInstance(socName);
     const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
@@ -480,8 +472,8 @@ void multi_layer_block_kv_transfer(
   cmd.Run();
 }
 
-void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes,
-                                    TransferDirection direction,
+void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src,
+                                    size_t nbytes, TransferDirection direction,
                                     size_t host_buffer_offset,
                                     size_t host_buffer_alignments,
                                     aclrtStream stream) {
@@ -492,8 +484,8 @@ void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes
   size_t offset = 0;
   const size_t mask = host_buffer_alignments - 1;
   const aclrtMemcpyKind kind = (direction == TransferDirection::H2D)
-                                    ? ACL_MEMCPY_HOST_TO_DEVICE
-                                    : ACL_MEMCPY_DEVICE_TO_HOST;
+                                   ? ACL_MEMCPY_HOST_TO_DEVICE
+                                   : ACL_MEMCPY_DEVICE_TO_HOST;
 
   while (offset < nbytes) {
     const size_t aligned_area_end =
@@ -503,8 +495,8 @@ void lmcache_memcpy_async_on_stream(uintptr_t dest, uintptr_t src, size_t nbytes
     const size_t max_nbytes = real_end - offset - host_buffer_offset;
 
     const aclError ret = aclrtMemcpyAsync(
-        reinterpret_cast<void*>(dest + offset), max_nbytes,
-        reinterpret_cast<const void*>(src + offset), max_nbytes, kind, stream);
+        reinterpret_cast<void *>(dest + offset), max_nbytes,
+        reinterpret_cast<const void *>(src + offset), max_nbytes, kind, stream);
     TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpyAsync failed: ret=", ret);
 
     offset += max_nbytes;
@@ -515,16 +507,16 @@ void lmcache_memcpy_async(uintptr_t dest, uintptr_t src, size_t nbytes,
                           TransferDirection direction,
                           size_t host_buffer_offset,
                           size_t host_buffer_alignments) {
-  lmcache_memcpy_async_on_stream(
-      dest, src, nbytes, direction, host_buffer_offset, host_buffer_alignments,
-      c10_npu::getCurrentNPUStream().stream());
+  lmcache_memcpy_async_on_stream(dest, src, nbytes, direction,
+                                 host_buffer_offset, host_buffer_alignments,
+                                 c10_npu::getCurrentNPUStream().stream());
 }
 
 void execute_object_group_transfer(
-    TransferDirection direction, const torch::Device& device,
+    TransferDirection direction, const torch::Device &device,
     size_t host_buffer_alignment,
-    const std::vector<KernelGroupSpec>& kernel_group_specs,
-    const std::vector<BatchStep>& batch_steps) {
+    const std::vector<KernelGroupSpec> &kernel_group_specs,
+    const std::vector<BatchStep> &batch_steps) {
   // Set the device guard once for the whole plan so every staging copy and
   // kernel launch below is enqueued on this device's current stream, in
   // order (mirrors upstream execute_object_group_transfer).
@@ -542,7 +534,7 @@ void execute_object_group_transfer(
   const int64_t ub_bytes = query_ub_budget_bytes();
   std::vector<PreparedGroup> groups;
   groups.reserve(kernel_group_specs.size());
-  for (const auto& spec : kernel_group_specs) {
+  for (const auto &spec : kernel_group_specs) {
     groups.push_back(prepare_group(spec.shape_desc, spec.engine_kv_format,
                                    spec.lmcache_chunk_size, ub_bytes));
   }
@@ -554,8 +546,8 @@ void execute_object_group_transfer(
   };
   std::vector<std::vector<PreparedLaunch>> prepared_steps;
   prepared_steps.reserve(batch_steps.size());
-  for (const auto& step : batch_steps) {
-    for (const auto& copy : step.staging) {
+  for (const auto &step : batch_steps) {
+    for (const auto &copy : step.staging) {
       // Raw external pointers carry no derivable allocation capacity; the
       // plan builder owns pointer/size validity. What can be
       // checked cheaply here is checked.
@@ -565,12 +557,12 @@ void execute_object_group_transfer(
     }
     std::vector<PreparedLaunch> launches;
     launches.reserve(step.launches.size());
-    for (const auto& launch : step.launches) {
+    for (const auto &launch : step.launches) {
       TORCH_CHECK(launch.group_idx >= 0 &&
                       launch.group_idx <
                           static_cast<int>(kernel_group_specs.size()),
                   "LaunchVar.group_idx out of range: ", launch.group_idx);
-      const KernelGroupSpec& spec = kernel_group_specs[launch.group_idx];
+      const KernelGroupSpec &spec = kernel_group_specs[launch.group_idx];
       TORCH_CHECK(launch.num_objects <=
                       static_cast<int>(spec.lmcache_objects_ptrs.size()),
                   "LaunchVar.num_objects (", launch.num_objects,
@@ -588,7 +580,7 @@ void execute_object_group_transfer(
     prepared_steps.push_back(std::move(launches));
   }
 
-  const char* socName = aclrtGetSocName();
+  const char *socName = aclrtGetSocName();
   auto ascendcPlatform =
       platform_ascendc::PlatformAscendCManager::GetInstance(socName);
   const uint32_t aiv_num = ascendcPlatform->GetCoreNumAiv();
@@ -604,8 +596,8 @@ void execute_object_group_transfer(
   cmd.SetCustomHandler([direction, is_h2d, host_buffer_alignment, aiv_num,
                         stream, kernel_group_specs, batch_steps, groups,
                         prepared_steps]() -> int {
-    const auto do_staging = [&](const std::vector<StagingCopy>& staging) {
-      for (const auto& copy : staging) {
+    const auto do_staging = [&](const std::vector<StagingCopy> &staging) {
+      for (const auto &copy : staging) {
         lmcache_memcpy_async_on_stream(copy.dest, copy.src, copy.nbytes,
                                        direction, copy.host_offset,
                                        host_buffer_alignment, stream);
@@ -619,20 +611,19 @@ void execute_object_group_transfer(
       if (is_h2d) {
         do_staging(batch_steps[step_idx].staging);
       }
-      for (const auto& launch : prepared_steps[step_idx]) {
-        const KernelGroupSpec& spec = kernel_group_specs[launch.group_idx];
-        const PreparedGroup& group = groups[launch.group_idx];
+      for (const auto &launch : prepared_steps[step_idx]) {
+        const KernelGroupSpec &spec = kernel_group_specs[launch.group_idx];
+        const PreparedGroup &group = groups[launch.group_idx];
         std::vector<int64_t> obj_device_ptrs = device_lmc_ptrs(
-            std::vector<int64_t>(
-                spec.lmcache_objects_ptrs.begin(),
-                spec.lmcache_objects_ptrs.begin() +
-                    launch.checked.num_objects));
-        int64_t* block_ids_base = reinterpret_cast<int64_t*>(
+            std::vector<int64_t>(spec.lmcache_objects_ptrs.begin(),
+                                 spec.lmcache_objects_ptrs.begin() +
+                                     launch.checked.num_objects));
+        int64_t *block_ids_base = reinterpret_cast<int64_t *>(
             spec.block_ids_base +
             static_cast<uintptr_t>(launch.block_ids_offset) * sizeof(int64_t));
         launch_prepared_objects(
             aiv_num, stream, group,
-            reinterpret_cast<uint8_t*>(spec.paged_buffer_ptrs),
+            reinterpret_cast<uint8_t *>(spec.paged_buffer_ptrs),
             obj_device_ptrs, block_ids_base, launch.checked, is_h2d);
       }
       if (!is_h2d) {

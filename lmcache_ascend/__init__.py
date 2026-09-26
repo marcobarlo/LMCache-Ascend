@@ -455,9 +455,6 @@ def _patch_config():
 
 
 def _patch_ops():
-    # Third Party
-    import lmcache.v1.platform.torch_ops as python_ops_fallback
-
     # First Party
     import lmcache_ascend.c_ops as ascend_c_ops
 
@@ -467,7 +464,7 @@ def _patch_ops():
     if not hasattr(ascend_c_ops, "GPUKVFormat"):
         ascend_c_ops.GPUKVFormat = ascend_c_ops.EngineKVFormat
 
-    # Native host only admits fmt 16/17. Other formats stay on torch_ops.
+    # Native host only admits fmt 16/17.
     _native_block = ascend_c_ops.multi_layer_block_kv_transfer
     _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
     _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
@@ -483,19 +480,14 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
-        if int(engine_kv_format) in (_fmt_16, _fmt_17):
-            return _native_block(
-                paged_buffer_ptrs_tensor,
-                lmcache_objects_ptrs,
-                block_ids,
-                device,
-                direction,
-                shape_desc,
-                lmcache_chunk_size,
-                engine_kv_format,
-                skip_prefix_n_blocks,
+        if int(engine_kv_format) not in (_fmt_16, _fmt_17):
+            raise NotImplementedError(
+                f"engine_kv_format={int(engine_kv_format)} is not supported "
+                f"on NPU: the native block-transfer kernel only implements "
+                f"fmt {_fmt_16} (NL_X_TWO_X_NB_BS_NH_HS) and fmt {_fmt_17} "
+                f"(NL_X_NP_X_NB_BS_ONE_HS). Check the engine KV layout."
             )
-        return python_ops_fallback.multi_layer_block_kv_transfer(
+        return _native_block(
             paged_buffer_ptrs_tensor,
             lmcache_objects_ptrs,
             block_ids,
@@ -508,7 +500,19 @@ def _patch_ops():
         )
 
     ascend_c_ops.multi_layer_block_kv_transfer = multi_layer_block_kv_transfer
-    sys.modules["lmcache.c_ops"] = ascend_c_ops
+    # Legacy alias for pre-#4957 upstream, which ships its own lmcache.c_ops
+    # and dispatches through it. Newer upstream removed the module and asserts
+    # it stays unimportable (tests/v1/platform/test_device_ops.py), so only
+    # install the alias when the module actually exists.
+    # Standard
+    import importlib.util
+
+    try:
+        has_legacy_c_ops = importlib.util.find_spec("lmcache.c_ops") is not None
+    except ModuleNotFoundError:
+        has_legacy_c_ops = False
+    if has_legacy_c_ops:
+        sys.modules["lmcache.c_ops"] = ascend_c_ops
 
 
 def _patch_storage_backend_init():
