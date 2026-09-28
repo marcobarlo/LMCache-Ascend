@@ -10,9 +10,11 @@ re-exports onto it for names the extension lacks. Binding either through
 the class-level NPU overrides, so both are filtered out here.
 """
 
+# Third Party
+from lmcache.v1.platform import torch_ops as _torch_ops
+
 # First Party
 import lmcache_ascend.c_ops as _c_ops
-from lmcache.v1.platform import torch_ops as _torch_ops
 
 # Names upstream keeps on lmcache_native only; never on the ops facade.
 _FACADE_EXCLUDES = frozenset(

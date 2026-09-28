@@ -6,11 +6,11 @@ import sys
 import types
 
 # Third Party
+from lmcache.v1.platform import torch_ops
 import pytest
 
 # First Party
 import lmcache_ascend.c_ops as real_c_ops
-from lmcache.v1.platform import torch_ops
 
 _NATIVE_ONLY_NAMES = (
     "TransferDirection",
