@@ -34,7 +34,7 @@ from lmcache.v1.multiprocess.transfer_context.worker_transfer import (  # noqa: 
     LMCacheDrivenTransferContext,
     create_transfer_context,
 )
-from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
+from lmcache.v1.platform.devices.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 
 # First Party
@@ -214,8 +214,8 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         kv_caches: KVCache = list(decoder.decode(message["wrappers"]))
 
         # Third Party
-        from lmcache.v1.platform.npu import NpuDeviceSpec
-        from lmcache.v1.platform.npu.event_ipc import NpuEventIPCBackend
+        from lmcache.v1.platform.devices.npu import NpuDeviceSpec
+        from lmcache.v1.platform.devices.npu.event_ipc import NpuEventIPCBackend
 
         cache_context = NpuDeviceSpec().create_cache_context(
             kv_caches,

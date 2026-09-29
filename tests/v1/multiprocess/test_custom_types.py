@@ -20,7 +20,7 @@ prepare_environment()
 # LMC-A: upstream moved wrapper dispatch to DeviceSpec.ipc_wrapper_cls and
 # the plane-aggregating NPU wrapper itself upstream (npu/ipc_wrapper.py); the
 # plugin no longer ships its own wrapper class.
-from lmcache.v1.platform.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
+from lmcache.v1.platform.devices.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 from lmcache_tests.v1.multiprocess.test_custom_types import (  # noqa: F401, E402
     get_customized_decoder,
     get_customized_encoder,
