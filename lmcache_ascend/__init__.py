@@ -693,6 +693,14 @@ def _patch_gpu_connector():
         _manager_mod.CreateGPUConnector = CreateNPUConnector
 
 
+def _patch_gdn_state_planes():
+    """Re-view Ascend GDN conv/SSM slices as uint8 format-17 planes."""
+    # First Party
+    from lmcache_ascend.integration.vllm.gdn_state import install_gdn_state_planes
+
+    install_gdn_state_planes()
+
+
 def _patch_logical_block_size():
     """Wrap LMCache ``get_tokens_per_block`` when Ascend ``block_size`` is physical.
 
@@ -958,6 +966,7 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_lookup_client_factory()
         _patch_vllm_v1_adapter()
         _patch_logical_block_size()
+        _patch_gdn_state_planes()
 
         _patch_cache_engine()
 
