@@ -701,6 +701,16 @@ def _patch_gdn_state_planes():
     install_gdn_state_planes()
 
 
+def _patch_mamba_external_blocks():
+    """Skip Ascend's extra Mamba block on the async-load resume step."""
+    # First Party
+    from lmcache_ascend.integration.vllm.mamba_alloc import (
+        install_mamba_external_block_guard,
+    )
+
+    install_mamba_external_block_guard()
+
+
 def _patch_logical_block_size():
     """Wrap LMCache ``get_tokens_per_block`` when Ascend ``block_size`` is physical.
 
@@ -967,6 +977,7 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_vllm_v1_adapter()
         _patch_logical_block_size()
         _patch_gdn_state_planes()
+        _patch_mamba_external_blocks()
 
         _patch_cache_engine()
 
