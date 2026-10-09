@@ -59,11 +59,16 @@ void plane_array_set(int64_t* arr, const std::vector<int64_t>& v,
 }  // namespace
 
 void single_layer_kv_transfer_wrapper(torch::Tensor &lmc_key_value_cache,
-                                      const py::object &vllm_kv_caches_obj,
-                                      torch::Tensor &slot_mapping,
-                                      bool direction, int kvcache_format_raw,
-                                      bool token_major, bool vllm_two_major) {
+                                       const py::object &vllm_kv_caches_obj,
+                                       torch::Tensor &slot_mapping,
+                                       bool direction, int kvcache_format_raw,
+                                       bool token_major, bool vllm_two_major) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  // Direct launch path: release the GIL while we drain torch_npu's ACL task
+  // queue (getCurrentNPUStream().stream()) and enqueue kernels + memcpys.
+  // c10::Error from TORCH_CHECK re-acquires the GIL during unwinding, so
+  // failures still surface as Python exceptions.
+  py::gil_scoped_release release;
   single_layer_kv_transfer(lmc_key_value_cache, vllm_kv_caches, slot_mapping,
                            direction, kvcache_format_raw, token_major,
                            vllm_two_major);
@@ -76,6 +81,9 @@ void batched_fused_single_layer_kv_transfer_wrapper(
     bool direction, int kvcache_format_raw, bool token_major,
     bool vllm_two_major) {
   auto vllm_kv_caches = normalize_kv_caches(vllm_kv_caches_obj);
+  // Direct launch path: release the GIL during enqueue (see
+  // single_layer_kv_transfer_wrapper).
+  py::gil_scoped_release release;
   batched_fused_single_layer_kv_transfer(
       lmc_tensors, staging_cache, vllm_kv_caches, slot_mapping_full,
       chunk_offsets, chunk_sizes, direction, kvcache_format_raw, token_major,
@@ -106,7 +114,8 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("kvcache_format_raw"), py::arg("k_hidden_dims") = 0,
         py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
         py::arg("dsa_c8_scale_plane_bytes") = 0,
-        py::arg("paged_kv_block_size") = 0);
+        py::arg("paged_kv_block_size") = 0,
+        py::call_guard<py::gil_scoped_release>());
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer,
         py::arg("key_value"), py::arg("staging_cache"),
         py::arg("key_value_ptrs"), py::arg("slot_mapping"),
@@ -114,15 +123,21 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("direction"), py::arg("use_mla"), py::arg("kvcache_format_raw"),
         py::arg("k_hidden_dims") = 0, py::arg("v_hidden_dims") = 0,
         py::arg("dsa_hidden_dims") = 0, py::arg("dsa_c8_scale_plane_bytes") = 0,
-        py::arg("paged_kv_block_size") = 0);
-  m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
+        py::arg("paged_kv_block_size") = 0,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p,
+        py::call_guard<py::gil_scoped_release>());
+  // These two take py::object and normalize it under the GIL inside the
+  // wrapper, which then releases the GIL around the direct launches.
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);
   m.def("batched_fused_single_layer_kv_transfer",
         &batched_fused_single_layer_kv_transfer_wrapper);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
-  m.def("load_and_reshape_flash", &load_and_reshape_flash);
-  m.def("reshape_and_cache_back_flash", &reshape_and_cache_back_flash);
+  m.def("load_and_reshape_flash", &load_and_reshape_flash,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("reshape_and_cache_back_flash", &reshape_and_cache_back_flash,
+        py::call_guard<py::gil_scoped_release>());
   m.def("encode_fast_new", &encode_ascend_new);
   m.def("decode_fast_new", &decode_ascend_new);
   m.def("decode_fast_prefsum", &decode_ascend_prefsum);
@@ -229,8 +244,12 @@ PYBIND11_MODULE(c_ops, m) {
             py::int_(direction).cast<int>());
         const auto fmt = static_cast<EngineKVFormat>(
             py::int_(engine_kv_format).cast<int>());
-        // Keep the GIL through TORCH_CHECK so failures surface as Python
-        // exceptions instead of aborting the lmcache server.
+        // Direct launch path: release the GIL while the transfer drains
+        // torch_npu's ACL task queue (getCurrentNPUStream().stream()) and
+        // enqueues kernels + memcpys. A c10::Error from TORCH_CHECK
+        // re-acquires the GIL during unwinding, so failures still surface as
+        // Python exceptions (mp worker threads keep a clean error contract).
+        py::gil_scoped_release release;
         multi_layer_block_kv_transfer(
             paged_buffer_ptrs_tensor, std::move(lmcache_objects_ptrs),
             block_ids, device, dir, shape_desc, lmcache_chunk_size, fmt,
@@ -293,10 +312,12 @@ PYBIND11_MODULE(c_ops, m) {
             host_buffer_alignment, kernel_group_specs, batch_steps);
       },
       py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
-      py::arg("kernel_group_specs"), py::arg("batch_steps"));
-      // No gil_scoped_release: NPU OpCommand.Run() posts to torch_npu's
-      // Python task queue. Releasing the GIL here deadlocks (CUDA launches
-      // without that queue). One Run() still implies one stream wait.
+      py::arg("kernel_group_specs"), py::arg("batch_steps"),
+      // Direct launch path (CUDA parity): every kernel launch and memcpy is
+      // enqueued on the calling thread after draining torch_npu's ACL task
+      // queue (getCurrentNPUStream().stream()), so the GIL can be released
+      // for the whole enqueue.
+      py::call_guard<py::gil_scoped_release>());
   m.def("lmcache_memcpy_async", &lmcache_memcpy_async,
         py::call_guard<py::gil_scoped_release>());
 }
