@@ -33,6 +33,7 @@ requires_npu = pytest.mark.skipif(
 KG0_FMT = native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
 NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
+FMT2 = native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
 D2H = native.TransferDirection.D2H
 H2D = native.TransferDirection.H2D
 
@@ -473,6 +474,60 @@ def _build(
     with_planes: bool | None = None,
 ) -> dict[str, Any]:
     """Build engine layers + PageBufferShapeDesc for one named layout."""
+    if layout == "fmt2":
+        # One NVIDIA-style [NB, 2, BS, NH, HS] tensor per layer. Padded mode
+        # also starts the tensor after a nonzero storage offset.
+        nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
+        hidden = nh * hs
+        prefix = 32 if padded else 0
+        pad_elems = 16 if padded else 0
+        page_elems = 2 * bs * hidden + pad_elems
+        layers = []
+        for i in range(nl):
+            storage = torch.full(
+                (prefix + nb * page_elems,), -1, dtype=torch.float16, device=device
+            )
+            fused = storage.as_strided(
+                (nb, 2, bs, nh, hs),
+                (page_elems, bs * hidden, hidden, hs, 1),
+                storage_offset=prefix,
+            )
+            fused[:, 0].copy_(
+                _fill_arange((nb, bs, nh, hs), torch.float16, device, 10_000 * i)
+            )
+            fused[:, 1].copy_(
+                _fill_arange(
+                    (nb, bs, nh, hs), torch.float16, device, 10_000 * i + 5_000
+                )
+            )
+            layers.append((fused[:, 0], fused[:, 1]))
+        slot = hidden * 2
+        block_stride_bytes = page_elems * 2
+        return dict(
+            fmt=FMT2,
+            desc=_shape_desc(
+                kv_size=2,
+                nl=nl,
+                nb=nb,
+                bs=bs,
+                nh=nh,
+                hs=hs,
+                dtype=torch.float16,
+                block_stride_elems=page_elems if padded else 0,
+                plane_slot_bytes=(slot, slot),
+                plane_block_stride_bytes=(block_stride_bytes, block_stride_bytes),
+            ),
+            layers=layers,
+            pools=None,
+            table=_pointer_table(layers, device),
+            obj_dtype=torch.float16,
+            obj_width=hidden,
+            kv_leading=True,
+            packed=False,
+            bs=bs,
+            nl=nl,
+            pad_width=None,
+        )
     if layout == "sep_kv":
         nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
         hidden = nh * hs
@@ -672,6 +727,8 @@ def _fill_src_object(spec: dict[str, Any], device: torch.device) -> torch.Tensor
             .view(torch.uint8)
         )
         return obj
+    if spec["kv_leading"]:
+        return _fill_arange((2, nl, chunk, width), spec["obj_dtype"], device, 0)
     return _fill_arange((nl, chunk, width), spec["obj_dtype"], device, 0)
 
 
@@ -701,6 +758,8 @@ def _roundtrip_cases() -> list[Any]:
     rows: list[tuple] = [
         ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "sep-kv-tight-skip"),
         ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "sep-kv-padded-skip"),
+        ("fmt2", "npu", False, 1, 2, 2, [1, 3, 4, 6], "fmt2-tight-skip"),
+        ("fmt2", "npu", True, 1, 2, 2, [1, 3, 4, 6], "fmt2-padded-offset-skip"),
         ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
         ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
         ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
@@ -740,7 +799,7 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     block_ids: list[int],
 ) -> None:
     device = torch.device("npu:0")
-    nb = None if layout == "sep_kv" else max(32, max(block_ids) + 1)
+    nb = None if layout in ("sep_kv", "fmt2") else max(32, max(block_ids) + 1)
     spec = _build(layout, device, padded=padded, nl=nl, nb=nb)
     bs, bpo = spec["bs"], len(block_ids) // num_objects
     chunk = bpo * bs
@@ -873,6 +932,10 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
             _build("dsa_c8_4", device, nl=2, nb=4, bs=16),
             _build("dsa_c8_4", device, nl=2, nb=4, bs=16),
         ),
+        (
+            _build("fmt2", device, padded=True, nl=2, nb=4, bs=4),
+            _build("fmt2", device, padded=True, nl=2, nb=4, bs=4),
+        ),
     ]
     direction = D2H if direction_d2h else H2D
     ids = torch.tensor([0], dtype=torch.int64, device=device)
@@ -967,6 +1030,62 @@ def test_plan_staging_d2h_matches_direct(affinity: bool, num_objects: int) -> No
     _run(_store, affinity=affinity)
     for host, golden in zip(hosts, goldens, strict=True):
         assert torch.equal(host, golden.cpu())
+
+
+def test_format2_adapter_splits_one_tensor_into_two_pointers() -> None:
+    """Format 2 must not keep NVIDIA's one-base-pointer-per-layer contract."""
+    # First Party
+    from lmcache.v1.gpu_connector.utils import (
+        get_group_data_ptrs,
+        make_page_buffer_shape_desc,
+    )
+
+    storage = torch.arange(96, dtype=torch.float16)
+    layer = storage.as_strided(
+        (2, 2, 4, 2, 4), (32, 16, 4, 4, 1), storage_offset=16
+    )
+    layers = [layer, layer.clone()]
+    ptrs = get_group_data_ptrs(layers, FMT2, [0, 1])
+    assert ptrs == [
+        int(layers[0][:, 0].data_ptr()),
+        int(layers[0][:, 1].data_ptr()),
+        int(layers[1][:, 0].data_ptr()),
+        int(layers[1][:, 1].data_ptr()),
+    ]
+    assert ptrs[1] != ptrs[0]
+    assert int(layers[0][:, 0].storage_offset()) == 16
+
+    desc = make_page_buffer_shape_desc(
+        layers, FMT2, layer_idx=0, num_layers_in_group=2, num_blocks=2, block_size=4
+    )
+    assert int(desc.num_planes) == 2
+    assert tuple(desc.plane_slot_bytes) == (16, 16)
+    assert tuple(desc.plane_block_stride_bytes) == (64, 64)
+
+
+@requires_npu
+def test_format2_rejects_one_pointer_per_layer() -> None:
+    device = torch.device("npu:0")
+    spec = _build("fmt2", device, nl=2, nb=4, bs=4)
+    obj = torch.zeros(
+        _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
+    )
+    one_per_layer = torch.tensor(
+        [int(pair[0].data_ptr()) for pair in spec["layers"]],
+        dtype=torch.int64,
+        device=device,
+    )
+    with pytest.raises(RuntimeError, match="num_planes"):
+        _transfer(
+            one_per_layer,
+            [int(obj.data_ptr())],
+            torch.tensor([0], dtype=torch.int64, device=device),
+            device,
+            D2H,
+            spec["desc"],
+            spec["bs"],
+            spec["fmt"],
+        )
 
 
 @requires_npu

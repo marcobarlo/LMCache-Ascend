@@ -90,13 +90,17 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
                             EngineKVFormat engine_kv_format,
                             int64_t slots_per_object, int64_t ub_bytes) {
   PageBufferShapeDesc sd = shape_desc;
+  // Format 2 is one [NB, 2, BS, NH, HS] tensor per layer. After the host
+  // splits it into [:, 0] and [:, 1] pointers, it has the same two-plane
+  // geometry as format 16.
   const bool separate =
-      engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS;
+      engine_kv_format == EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS ||
+      engine_kv_format == EngineKVFormat::NL_X_NB_TWO_BS_NH_HS;
   const bool fmt17 = engine_kv_format == EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS;
   TORCH_CHECK(separate || fmt17,
               "LMCache-Ascend block-level MP transfer currently supports "
-              "NL_X_TWO_X_NB_BS_NH_HS (16) and NL_X_NP_X_NB_BS_ONE_HS (17), "
-              "got ",
+              "NL_X_NB_TWO_BS_NH_HS (2), NL_X_TWO_X_NB_BS_NH_HS (16), and "
+              "NL_X_NP_X_NB_BS_ONE_HS (17), got ",
               static_cast<int>(engine_kv_format));
   TORCH_CHECK(sd.nl > 0 && sd.nb > 0 && sd.bs > 0 && sd.nh > 0 && sd.hs > 0,
               "shape descriptor dims must be positive, got nl=", sd.nl,
@@ -116,7 +120,7 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
               sd.num_planes);
   if (separate) {
     TORCH_CHECK(sd.num_planes == 2,
-                "format 16 requires exactly 2 physical planes, got ",
+                "separate-plane formats require exactly 2 physical planes, got ",
                 sd.num_planes);
   }
   if (fmt17) {

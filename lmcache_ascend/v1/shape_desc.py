@@ -64,7 +64,9 @@ def install_plane_geometry_fill() -> None:
     - fmt 17 (``NL_X_NP_X_NB_BS_ONE_HS``): MLA/DSA planes
       ``[NB, BS, 1, HS]``;
     - fmt 16 (``NL_X_TWO_X_NB_BS_NH_HS``): per-layer ``(K, V)`` planes
-      ``[NB, BS, NH, HS]``.
+      ``[NB, BS, NH, HS]``;
+    - fmt 2 (``NL_X_NB_TWO_BS_NH_HS``): one ``[NB, 2, BS, NH, HS]`` tensor,
+      split into the same two planes as format 16.
 
     Both share the per-layer plane-tuple structure: the per-token row is
     the product of the trailing two dims (``shape[2] * shape[3] *
@@ -81,6 +83,7 @@ def install_plane_geometry_fill() -> None:
     import lmcache.v1.gpu_connector.utils as gpu_connector_utils
 
     original = gpu_connector_utils.make_page_buffer_shape_desc
+    fmt2 = lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
     plane_tuple_fmts = (
         lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
         lmcache_native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS,
@@ -104,16 +107,21 @@ def install_plane_geometry_fill() -> None:
             block_size,
             block_stride_elems,
         )
-        if engine_kv_format in plane_tuple_fmts:
+        if int(engine_kv_format) == int(fmt2):
+            layer = kv_caches[layer_idx]
+            planes = (layer[:, 0], layer[:, 1])
+        elif engine_kv_format in plane_tuple_fmts:
             planes = kv_caches[layer_idx]
-            desc.num_planes = len(planes)
-            desc.plane_slot_bytes = tuple(
-                int(t.shape[2]) * int(t.shape[3]) * int(t.element_size())
-                for t in planes
-            )
-            desc.plane_block_stride_bytes = tuple(
-                int(t.stride(0)) * int(t.element_size()) for t in planes
-            )
+        else:
+            return desc
+        desc.num_planes = len(planes)
+        desc.plane_slot_bytes = tuple(
+            int(t.shape[2]) * int(t.shape[3]) * int(t.element_size())
+            for t in planes
+        )
+        desc.plane_block_stride_bytes = tuple(
+            int(t.stride(0)) * int(t.element_size()) for t in planes
+        )
         return desc
 
     gpu_connector_utils.make_page_buffer_shape_desc = make_page_buffer_shape_desc

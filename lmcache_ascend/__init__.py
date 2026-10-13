@@ -461,8 +461,10 @@ def _patch_ops():
     if not hasattr(ascend_c_ops, "GPUKVFormat"):
         ascend_c_ops.GPUKVFormat = ascend_c_ops.EngineKVFormat
 
-    # Native host only admits fmt 16/17.
+    # Native host admits the NVIDIA 5D layout (fmt 2) plus fmt 16/17.
+    # Format 2 is normalized to the same two-plane geometry as format 16.
     _native_block = ascend_c_ops.multi_layer_block_kv_transfer
+    _fmt_2 = int(ascend_c_ops.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS)
     _fmt_16 = int(ascend_c_ops.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS)
     _fmt_17 = int(ascend_c_ops.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS)
 
@@ -477,11 +479,12 @@ def _patch_ops():
         engine_kv_format,
         skip_prefix_n_blocks,
     ):
-        if int(engine_kv_format) not in (_fmt_16, _fmt_17):
+        if int(engine_kv_format) not in (_fmt_2, _fmt_16, _fmt_17):
             raise NotImplementedError(
                 f"engine_kv_format={int(engine_kv_format)} is not supported "
                 f"on NPU: the native block-transfer kernel only implements "
-                f"fmt {_fmt_16} (NL_X_TWO_X_NB_BS_NH_HS) and fmt {_fmt_17} "
+                f"fmt {_fmt_2} (NL_X_NB_TWO_BS_NH_HS), fmt {_fmt_16} "
+                f"(NL_X_TWO_X_NB_BS_NH_HS), and fmt {_fmt_17} "
                 f"(NL_X_NP_X_NB_BS_ONE_HS). Check the engine KV layout."
             )
         return _native_block(
@@ -723,6 +726,41 @@ def _patch_vllm_v1_adapter():
             method(preempted_req_ids)
 
     vllm_lmcache_connector.LMCacheConnectorV1.handle_preemptions = handle_preemptions
+
+
+def _patch_format2_data_ptrs() -> None:
+    """Split each NVIDIA 5D layer into the two plane pointers Ascend consumes.
+
+    Upstream ``NL_X_NB_TWO_BS_NH_HS`` reports one base pointer per layer. The
+    block kernel indexes ``ptrs[layer * num_planes + plane]``, so format 2
+    must contribute ``layer[:, 0]`` and ``layer[:, 1]``. ``data_ptr()``
+    already includes each slice's storage offset.
+    """
+    # Third Party
+    import lmcache.lmcache_native as lmcache_native
+    import lmcache.v1.gpu_connector.utils as gpu_utils
+
+    original = gpu_utils.get_group_data_ptrs
+    fmt2 = int(lmcache_native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS)
+
+    def get_group_data_ptrs(kv_caches, engine_kv_format, layer_indices):
+        if int(engine_kv_format) != fmt2:
+            return original(kv_caches, engine_kv_format, layer_indices)
+        ptrs: list[int] = []
+        for index in layer_indices:
+            layer = kv_caches[index]
+            ptrs.append(int(layer[:, 0].data_ptr()))
+            ptrs.append(int(layer[:, 1].data_ptr()))
+        return ptrs
+
+    gpu_utils.get_group_data_ptrs = get_group_data_ptrs
+    for mod_name in (
+        "lmcache.v1.platform.devices.npu.cache_context",
+        "lmcache.v1.gpu_connector.gpu_connectors",
+    ):
+        module = sys.modules.get(mod_name)
+        if module is not None and hasattr(module, "get_group_data_ptrs"):
+            module.get_group_data_ptrs = get_group_data_ptrs
 
 
 def _patch_make_page_buffer_shape_desc():
@@ -1075,6 +1113,7 @@ if not LMCACHE_ASCEND_PATCHED:
         _patch_gpu_connector()
 
     _patch_hash_token()
+    _patch_format2_data_ptrs()
     _patch_make_page_buffer_shape_desc()
 
     _patch_cachegen()
