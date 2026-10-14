@@ -13,6 +13,7 @@ public:
   __aicore__ inline void Init(GM_ADDR pointers, GM_ADDR object, GM_ADDR ids,
                               int32_t blocks, int32_t skip, int32_t nl,
                               int32_t nb, int32_t bs, bool separate_plane,
+                              bool one_pointer_per_layer,
                               kvcache_ops::BlockTransferLayout layout,
                               int64_t ub_bytes, AscendC::TPipe* pipe) {
     paged_kv_ptrs_ = reinterpret_cast<__gm__ uint64_t*>(pointers);
@@ -25,6 +26,7 @@ public:
     engine_block_count_ = nb;
     tokens_per_block_ = bs;
     separate_plane_ = separate_plane;
+    one_pointer_per_layer_ = one_pointer_per_layer;
     layout_ = layout;
 
     // UB segmentation: every token row occupies AlignUp32(payload) in UB
@@ -100,13 +102,20 @@ private:
     return max_row;
   }
 
-  // Pointer table: ptrs[layer * num_planes + plane]; each entry already
-  // includes the view's storage_offset.
+  // Formats 16/17: ptrs[layer * num_planes + plane], already including the
+  // view's storage_offset. Format 2: ptrs[layer] is the 5D tensor base;
+  // plane p starts engine_base_offset_bytes later.
   __aicore__ inline __gm__ uint8_t* ResolveEnginePlanePtr(int32_t layer,
                                                           int32_t plane) const {
-    return reinterpret_cast<__gm__ uint8_t*>(
-        paged_kv_ptrs_[static_cast<int64_t>(layer) * layout_.num_planes +
-                       plane]);
+    const int64_t index =
+        one_pointer_per_layer_
+            ? layer
+            : static_cast<int64_t>(layer) * layout_.num_planes + plane;
+    auto* base = reinterpret_cast<__gm__ uint8_t*>(paged_kv_ptrs_[index]);
+    if (!one_pointer_per_layer_) {
+      return base;
+    }
+    return base + layout_.planes[plane].engine_base_offset_bytes;
   }
 
   // LMC side: plane column offset + layer stride + in-object block offset.
@@ -227,7 +236,7 @@ private:
     }
   }
 
-  __gm__ uint64_t* paged_kv_ptrs_;   // ptrs[layer * num_planes + plane]
+  __gm__ uint64_t* paged_kv_ptrs_;   // see ResolveEnginePlanePtr
   __gm__ int64_t* block_ids_;        // logical block -> engine physical block
   __gm__ uint8_t* lmcache_obj_base_; // LMC object base (device VA, staged?)
   AscendC::GlobalTensor<uint8_t> lmcache_obj_;
@@ -238,19 +247,22 @@ private:
   int32_t blocks_per_obj_, skip_blocks_, num_layers_, engine_block_count_,
       tokens_per_block_, tokens_per_segment_;
   bool separate_plane_;
+  bool one_pointer_per_layer_;
 };
 
 } // namespace
 
 extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
     GM_ADDR pointers, GM_ADDR object, GM_ADDR ids, int32_t blocks, int32_t skip,
-    int32_t nl, int32_t nb, int32_t bs, bool separate_plane, bool to_engine,
-    int32_t num_planes, int64_t lmc_row_bytes, int64_t lmc_layer_stride,
-    int64_t lmc_object_bytes, int64_t p0_payload, int64_t p0_block_stride,
-    int64_t p0_base, int64_t p1_payload, int64_t p1_block_stride,
-    int64_t p1_base, int64_t p2_payload, int64_t p2_block_stride,
-    int64_t p2_base, int64_t p3_payload, int64_t p3_block_stride,
-    int64_t p3_base, int64_t ub_bytes) {
+    int32_t nl, int32_t nb, int32_t bs, bool separate_plane,
+    bool one_pointer_per_layer, bool to_engine, int32_t num_planes,
+    int64_t lmc_row_bytes, int64_t lmc_layer_stride, int64_t lmc_object_bytes,
+    int64_t p0_payload, int64_t p0_block_stride, int64_t p0_base,
+    int64_t p0_engine_base, int64_t p1_payload, int64_t p1_block_stride,
+    int64_t p1_base, int64_t p1_engine_base, int64_t p2_payload,
+    int64_t p2_block_stride, int64_t p2_base, int64_t p2_engine_base,
+    int64_t p3_payload, int64_t p3_block_stride, int64_t p3_base,
+    int64_t p3_engine_base, int64_t ub_bytes) {
   kvcache_ops::BlockTransferLayout layout = {};
   layout.num_planes = num_planes;
   layout.lmc_token_stride_bytes = lmc_row_bytes;
@@ -262,14 +274,16 @@ extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
       p0_block_stride, p1_block_stride, p2_block_stride, p3_block_stride};
   const int64_t bases[kvcache_ops::kMaxPlanes] = {p0_base, p1_base, p2_base,
                                                   p3_base};
+  const int64_t engine_bases[kvcache_ops::kMaxPlanes] = {
+      p0_engine_base, p1_engine_base, p2_engine_base, p3_engine_base};
   for (int32_t p = 0; p < num_planes; ++p) {
-    layout.planes[p] =
-        kvcache_ops::PlaneLayout{payloads[p], block_strides[p], bases[p]};
+    layout.planes[p] = kvcache_ops::PlaneLayout{
+        payloads[p], block_strides[p], bases[p], engine_bases[p]};
   }
   AscendC::TPipe pipe;
   MultiLayerBlockTransfer op;
   op.Init(pointers, object, ids, blocks, skip, nl, nb, bs, separate_plane,
-          layout, ub_bytes, &pipe);
+          one_pointer_per_layer, layout, ub_bytes, &pipe);
   if (to_engine) {
     op.Process<true>();
   } else {
@@ -283,22 +297,29 @@ void multi_layer_block_transfer_kernel(
     uint32_t block_dim, void* stream, uint8_t* paged_buffer_ptrs,
     uint8_t* lmcache_obj, uint8_t* engine_block_ids,
     int32_t num_blocks_per_object, int32_t skip_prefix_n_blocks, int32_t nl,
-    int32_t nb, int32_t bs, bool separate_plane, BlockTransferLayout layout,
-    bool to_engine, int64_t ub_bytes) {
+    int32_t nb, int32_t bs, bool separate_plane, bool one_pointer_per_layer,
+    BlockTransferLayout layout, bool to_engine, int64_t ub_bytes) {
   ::multi_layer_block_transfer_kernel<<<block_dim, nullptr, stream>>>(
       paged_buffer_ptrs, lmcache_obj, engine_block_ids, num_blocks_per_object,
-      skip_prefix_n_blocks, nl, nb, bs, separate_plane, to_engine,
-      layout.num_planes, layout.lmc_token_stride_bytes,
+      skip_prefix_n_blocks, nl, nb, bs, separate_plane, one_pointer_per_layer,
+      to_engine, layout.num_planes, layout.lmc_token_stride_bytes,
       layout.lmc_layer_stride_bytes, layout.lmc_object_bytes,
       layout.planes[0].payload_bytes,
       layout.planes[0].engine_block_stride_bytes,
-      layout.planes[0].lmc_base_offset_bytes, layout.planes[1].payload_bytes,
+      layout.planes[0].lmc_base_offset_bytes,
+      layout.planes[0].engine_base_offset_bytes,
+      layout.planes[1].payload_bytes,
       layout.planes[1].engine_block_stride_bytes,
-      layout.planes[1].lmc_base_offset_bytes, layout.planes[2].payload_bytes,
+      layout.planes[1].lmc_base_offset_bytes,
+      layout.planes[1].engine_base_offset_bytes,
+      layout.planes[2].payload_bytes,
       layout.planes[2].engine_block_stride_bytes,
-      layout.planes[2].lmc_base_offset_bytes, layout.planes[3].payload_bytes,
+      layout.planes[2].lmc_base_offset_bytes,
+      layout.planes[2].engine_base_offset_bytes,
+      layout.planes[3].payload_bytes,
       layout.planes[3].engine_block_stride_bytes,
-      layout.planes[3].lmc_base_offset_bytes, ub_bytes);
+      layout.planes[3].lmc_base_offset_bytes,
+      layout.planes[3].engine_base_offset_bytes, ub_bytes);
 }
 
 } // namespace kvcache_ops

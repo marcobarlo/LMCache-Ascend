@@ -21,6 +21,7 @@ import torch
 # First Party
 from lmcache_ascend.v1.shape_desc import (
     attach_tuple_block_strides,
+    attach_tuple_engine_base_offsets,
     attach_tuple_planes,
 )
 import lmcache_ascend.c_ops as lmc_ops
@@ -54,6 +55,7 @@ def _shape_desc(
     block_stride_elems: int = 0,
     plane_slot_bytes: tuple[int, ...] | None = None,
     plane_block_stride_bytes: tuple[int, ...] | None = None,
+    plane_engine_base_offset_bytes: tuple[int, ...] | None = None,
 ) -> object:
     desc = lmc_ops.PageBufferShapeDesc()
     desc.kv_size = kv_size
@@ -69,6 +71,8 @@ def _shape_desc(
         attach_tuple_planes(desc, plane_slot_bytes)
     if plane_block_stride_bytes is not None:
         attach_tuple_block_strides(desc, plane_block_stride_bytes)
+    if plane_engine_base_offset_bytes is not None:
+        attach_tuple_engine_base_offsets(desc, plane_engine_base_offset_bytes)
     return desc
 
 
@@ -482,6 +486,7 @@ def _build(
         prefix = 32 if padded else 0
         pad_elems = 16 if padded else 0
         page_elems = 2 * bs * hidden + pad_elems
+        fused_layers = []
         layers = []
         for i in range(nl):
             storage = torch.full(
@@ -500,9 +505,15 @@ def _build(
                     (nb, bs, nh, hs), torch.float16, device, 10_000 * i + 5_000
                 )
             )
+            fused_layers.append(fused)
             layers.append((fused[:, 0], fused[:, 1]))
         slot = hidden * 2
         block_stride_bytes = page_elems * 2
+        base = int(fused_layers[0].data_ptr())
+        offsets = (
+            int(layers[0][0].data_ptr()) - base,
+            int(layers[0][1].data_ptr()) - base,
+        )
         return dict(
             fmt=FMT2,
             desc=_shape_desc(
@@ -516,10 +527,16 @@ def _build(
                 block_stride_elems=page_elems if padded else 0,
                 plane_slot_bytes=(slot, slot),
                 plane_block_stride_bytes=(block_stride_bytes, block_stride_bytes),
+                plane_engine_base_offset_bytes=offsets,
             ),
             layers=layers,
+            fused_layers=fused_layers,
             pools=None,
-            table=_pointer_table(layers, device),
+            table=torch.tensor(
+                [int(fused.data_ptr()) for fused in fused_layers],
+                dtype=torch.int64,
+                device=device,
+            ),
             obj_dtype=torch.float16,
             obj_width=hidden,
             kv_leading=True,
@@ -1032,8 +1049,8 @@ def test_plan_staging_d2h_matches_direct(affinity: bool, num_objects: int) -> No
         assert torch.equal(host, golden.cpu())
 
 
-def test_format2_adapter_splits_one_tensor_into_two_pointers() -> None:
-    """Format 2 must not keep NVIDIA's one-base-pointer-per-layer contract."""
+def test_format2_keeps_one_base_pointer_per_layer() -> None:
+    """Format 2 keeps upstream's one base pointer; offsets live on the desc."""
     # First Party
     from lmcache.v1.gpu_connector.utils import (
         get_group_data_ptrs,
@@ -1041,19 +1058,11 @@ def test_format2_adapter_splits_one_tensor_into_two_pointers() -> None:
     )
 
     storage = torch.arange(96, dtype=torch.float16)
-    layer = storage.as_strided(
-        (2, 2, 4, 2, 4), (32, 16, 4, 4, 1), storage_offset=16
-    )
+    layer = storage.as_strided((2, 2, 4, 2, 4), (32, 16, 4, 4, 1), storage_offset=16)
     layers = [layer, layer.clone()]
     ptrs = get_group_data_ptrs(layers, FMT2, [0, 1])
-    assert ptrs == [
-        int(layers[0][:, 0].data_ptr()),
-        int(layers[0][:, 1].data_ptr()),
-        int(layers[1][:, 0].data_ptr()),
-        int(layers[1][:, 1].data_ptr()),
-    ]
-    assert ptrs[1] != ptrs[0]
-    assert int(layers[0][:, 0].storage_offset()) == 16
+    assert ptrs == [int(layers[0].data_ptr()), int(layers[1].data_ptr())]
+    assert int(layers[0].storage_offset()) == 16
 
     desc = make_page_buffer_shape_desc(
         layers, FMT2, layer_idx=0, num_layers_in_group=2, num_blocks=2, block_size=4
@@ -1061,23 +1070,31 @@ def test_format2_adapter_splits_one_tensor_into_two_pointers() -> None:
     assert int(desc.num_planes) == 2
     assert tuple(desc.plane_slot_bytes) == (16, 16)
     assert tuple(desc.plane_block_stride_bytes) == (64, 64)
+    assert tuple(desc.plane_engine_base_offset_bytes) == (
+        int(layer[:, 0].data_ptr()) - int(layer.data_ptr()),
+        int(layer[:, 1].data_ptr()) - int(layer.data_ptr()),
+    )
+    assert tuple(desc.plane_engine_base_offset_bytes) == (0, 32)
 
 
 @requires_npu
-def test_format2_rejects_one_pointer_per_layer() -> None:
+def test_format2_rejects_two_pointers_per_layer() -> None:
+    """An expanded K/V pointer table is the old format-2 contract."""
     device = torch.device("npu:0")
     spec = _build("fmt2", device, nl=2, nb=4, bs=4)
+    assert spec["table"].numel() == spec["nl"]
     obj = torch.zeros(
         _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
     )
-    one_per_layer = torch.tensor(
-        [int(pair[0].data_ptr()) for pair in spec["layers"]],
+    two_per_layer = torch.tensor(
+        [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
         dtype=torch.int64,
         device=device,
     )
-    with pytest.raises(RuntimeError, match="num_planes"):
+    assert two_per_layer.numel() == spec["nl"] * 2
+    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
         _transfer(
-            one_per_layer,
+            two_per_layer,
             [int(obj.data_ptr())],
             torch.tensor([0], dtype=torch.int64, device=device),
             device,
@@ -1085,6 +1102,34 @@ def test_format2_rejects_one_pointer_per_layer() -> None:
             spec["desc"],
             spec["bs"],
             spec["fmt"],
+        )
+
+
+@requires_npu
+def test_format16_and_17_keep_per_plane_pointer_counts() -> None:
+    """Formats 16 and 17 still index one pointer per physical plane."""
+    device = torch.device("npu:0")
+    sep = _build("sep_kv", device, nl=2, nb=4, bs=4)
+    packed = _build("kg0", device, nl=2, nb=4, bs=16)
+    assert sep["table"].numel() == sep["nl"] * int(sep["desc"].num_planes)
+    assert packed["table"].numel() == packed["nl"] * int(packed["desc"].num_planes)
+    assert tuple(sep["desc"].plane_engine_base_offset_bytes) == (0, 0)
+    obj = torch.zeros(_obj_shape(sep, sep["bs"]), dtype=sep["obj_dtype"], device=device)
+    one_per_layer = torch.tensor(
+        [int(pair[0].data_ptr()) for pair in sep["layers"]],
+        dtype=torch.int64,
+        device=device,
+    )
+    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
+        _transfer(
+            one_per_layer,
+            [int(obj.data_ptr())],
+            torch.tensor([0], dtype=torch.int64, device=device),
+            device,
+            D2H,
+            sep["desc"],
+            sep["bs"],
+            sep["fmt"],
         )
 
 

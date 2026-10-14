@@ -53,6 +53,30 @@ def attach_tuple_block_strides(
     desc.plane_block_stride_bytes = strides
 
 
+def attach_tuple_engine_base_offsets(
+    desc: object,
+    plane_engine_base_offset_bytes: Sequence[int],
+) -> None:
+    """Record bytes from a format-2 layer base pointer to each plane.
+
+    Formats whose pointer table already has one entry per plane leave this
+    at zero. ``plane_engine_base_offset_bytes[i]`` is
+    ``plane.data_ptr() - layer.data_ptr()``.
+    """
+    offsets = tuple(int(b) for b in plane_engine_base_offset_bytes)
+    if len(offsets) > _MAX_PLANES:
+        raise ValueError(
+            "attach_tuple_engine_base_offsets: "
+            f"{len(offsets)} planes exceeds max {_MAX_PLANES}"
+        )
+    if any(offset < 0 for offset in offsets):
+        raise ValueError(
+            "attach_tuple_engine_base_offsets: offsets must be non-negative, "
+            f"got {offsets}"
+        )
+    desc.plane_engine_base_offset_bytes = offsets
+
+
 def install_plane_geometry_fill() -> None:
     """Wrap upstream ``make_page_buffer_shape_desc`` with plane geometry.
 
@@ -65,13 +89,13 @@ def install_plane_geometry_fill() -> None:
       ``[NB, BS, 1, HS]``;
     - fmt 16 (``NL_X_TWO_X_NB_BS_NH_HS``): per-layer ``(K, V)`` planes
       ``[NB, BS, NH, HS]``;
-    - fmt 2 (``NL_X_NB_TWO_BS_NH_HS``): one ``[NB, 2, BS, NH, HS]`` tensor,
-      split into the same two planes as format 16.
+    - fmt 2 (``NL_X_NB_TWO_BS_NH_HS``): one ``[NB, 2, BS, NH, HS]`` tensor.
+      The pointer table stays one base pointer per layer. Each plane's
+      address is that base plus ``plane.data_ptr() - layer.data_ptr()``.
 
-    Both share the per-layer plane-tuple structure: the per-token row is
-    the product of the trailing two dims (``shape[2] * shape[3] *
-    element_size``; ``shape[2] == 1`` for fmt 17, reducing to its plane
-    width) and the per-block stride is ``stride(0) * element_size``.
+    Plane tuples share the per-token row ``shape[2] * shape[3] *
+    element_size`` (``shape[2] == 1`` for fmt 17) and the per-block stride
+    ``stride(0) * element_size``.
 
     Upstream call sites (``kv_layer_groups`` and the MP transfer-context
     gather/scatter utilities) import the function lazily inside the call,
@@ -110,18 +134,21 @@ def install_plane_geometry_fill() -> None:
         if int(engine_kv_format) == int(fmt2):
             layer = kv_caches[layer_idx]
             planes = (layer[:, 0], layer[:, 1])
+            base = int(layer.data_ptr())
+            offsets = tuple(int(plane.data_ptr()) - base for plane in planes)
         elif engine_kv_format in plane_tuple_fmts:
             planes = kv_caches[layer_idx]
+            offsets = (0,) * len(planes)
         else:
             return desc
         desc.num_planes = len(planes)
         desc.plane_slot_bytes = tuple(
-            int(t.shape[2]) * int(t.shape[3]) * int(t.element_size())
-            for t in planes
+            int(t.shape[2]) * int(t.shape[3]) * int(t.element_size()) for t in planes
         )
         desc.plane_block_stride_bytes = tuple(
             int(t.stride(0)) * int(t.element_size()) for t in planes
         )
+        attach_tuple_engine_base_offsets(desc, offsets)
         return desc
 
     gpu_connector_utils.make_page_buffer_shape_desc = make_page_buffer_shape_desc
