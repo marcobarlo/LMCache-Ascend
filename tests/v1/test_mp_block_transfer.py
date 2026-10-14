@@ -616,6 +616,39 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+    if layout == "nh_cs_fmt17_tp1":
+        nl = nl or 2
+        nb, bs, hs = nb or 32, bs or 32, 4096
+        dtype = torch.uint8
+        layers = [
+            _fill_arange((nb, bs, 1, hs), dtype, device, 1000 * i) for i in range(nl)
+        ]
+        block_stride_bytes = bs * hs
+        desc = _shape_desc(
+            kv_size=1,
+            nl=nl,
+            nb=nb,
+            bs=bs,
+            nh=1,
+            hs=hs,
+            dtype=dtype,
+            plane_slot_bytes=(hs,),
+            plane_block_stride_bytes=(block_stride_bytes,),
+        )
+        return dict(
+            fmt=KG0_FMT,
+            desc=desc,
+            layers=layers,
+            pools=None,
+            table=_pointer_table(layers, device),
+            obj_dtype=dtype,
+            obj_width=hs,
+            kv_leading=False,
+            packed=False,
+            bs=bs,
+            nl=nl,
+            pad_width=None,
+        )
     if layout in ("nh_cs", "nh_cs_fmt17", "nh_cs_padded"):
         padded_layout = layout == "nh_cs_padded" or padded
         nl = nl or 2
@@ -780,6 +813,7 @@ def _roundtrip_cases() -> list[Any]:
         ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
         ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
         ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
+        ("nh_cs_fmt17_tp1", "npu", False, 0, 2, 1, [0, 1], "nh_cs-fmt17-tp1-wide"),
         ("kg0_indep", "npu", False, 0, 2, 1, [0], "kg0-indep-mini"),
         ("kg0_bs16", "npu", False, 0, 2, 1, [0], "kg0-bs16-chunk16"),
         ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], "kg0-bs64-chunk128"),
