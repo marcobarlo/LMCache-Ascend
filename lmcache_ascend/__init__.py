@@ -526,7 +526,7 @@ def _patch_vllm_v1_adapter():
 
 
 def _patch_make_page_buffer_shape_desc():
-    """Attach per-plane byte geometry to upstream's desc factory (fmt 16/17)."""
+    """Attach per-plane byte geometry to upstream's desc factory (fmt 2/16/17)."""
     # First Party
     from lmcache_ascend.v1.shape_desc import install_plane_geometry_fill
 
