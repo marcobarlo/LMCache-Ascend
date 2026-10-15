@@ -263,8 +263,10 @@ extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
     int64_t p1_base, int64_t p2_payload, int64_t p2_block_stride,
     int64_t p2_base, int64_t p3_payload, int64_t p3_block_stride,
     int64_t p3_base, int64_t ub_bytes, bool one_pointer_per_layer,
-    int64_t p0_engine_base, int64_t p1_engine_base, int64_t p2_engine_base,
-    int64_t p3_engine_base) {
+    // Only format 2 adds an offset to the layer base pointer, and it has
+    // exactly two planes. Formats 16 and 17 already pass one pointer per
+    // plane, so planes 2 and 3 stay at offset 0 and are not launched.
+    int64_t p0_engine_base, int64_t p1_engine_base) {
   kvcache_ops::BlockTransferLayout layout = {};
   layout.num_planes = num_planes;
   layout.lmc_token_stride_bytes = lmc_row_bytes;
@@ -276,13 +278,12 @@ extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
       p0_block_stride, p1_block_stride, p2_block_stride, p3_block_stride};
   const int64_t bases[kvcache_ops::kMaxPlanes] = {p0_base, p1_base, p2_base,
                                                   p3_base};
-  const int64_t engine_bases[kvcache_ops::kMaxPlanes] = {
-      p0_engine_base, p1_engine_base, p2_engine_base, p3_engine_base};
   for (int32_t p = 0; p < num_planes; ++p) {
     layout.planes[p] =
         kvcache_ops::PlaneLayout{payloads[p], block_strides[p], bases[p]};
-    layout.planes[p].engine_base_offset_bytes = engine_bases[p];
   }
+  layout.planes[0].engine_base_offset_bytes = p0_engine_base;
+  layout.planes[1].engine_base_offset_bytes = p1_engine_base;
   AscendC::TPipe pipe;
   MultiLayerBlockTransfer op;
   op.Init(pointers, object, ids, blocks, skip, nl, nb, bs, separate_plane,
@@ -317,9 +318,7 @@ void multi_layer_block_transfer_kernel(
       layout.planes[3].engine_block_stride_bytes,
       layout.planes[3].lmc_base_offset_bytes, ub_bytes, one_pointer_per_layer,
       layout.planes[0].engine_base_offset_bytes,
-      layout.planes[1].engine_base_offset_bytes,
-      layout.planes[2].engine_base_offset_bytes,
-      layout.planes[3].engine_base_offset_bytes);
+      layout.planes[1].engine_base_offset_bytes);
 }
 
 } // namespace kvcache_ops
