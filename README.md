@@ -47,7 +47,7 @@ Please ensure your environment matches the versions below.
 | LMCache-Ascend | LMCache | vLLM Version |
 | :--- | :--- | :--- |
 | **main** | **dev** | **>=v0.23.0** |
-| **v0.5.6rc5** | **v0.5.6rc5** | **>=v0.23.0** |
+| **v0.5.6** | **v0.5.6** | **>=v0.23.0** |
 
 ## Getting Started
 
