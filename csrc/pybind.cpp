@@ -166,6 +166,9 @@ PYBIND11_MODULE(c_ops, m) {
       .value("NL_X_TWO_X_NB_BS_NH_HS", EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS)
       .value("NL_X_NP_X_NB_BS_ONE_HS", EngineKVFormat::NL_X_NP_X_NB_BS_ONE_HS)
       .export_values();
+  // Match upstream lmcache_native / CUDA pybind: tests and connectors use
+  // GPUKVFormat as an alias of EngineKVFormat.
+  m.attr("GPUKVFormat") = m.attr("EngineKVFormat");
   // Factory constructs this class via device_ops.PageBufferShapeDesc()
   // after NpuDeviceOps.bind_native. Kernels take it by value (same as CUDA
   // + lmcache_native). dynamic_attr keeps torch dtype for the Python
