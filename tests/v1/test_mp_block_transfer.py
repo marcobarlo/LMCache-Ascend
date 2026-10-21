@@ -34,17 +34,9 @@ requires_npu = pytest.mark.skipif(
 KG0_FMT = native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
 NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
-FMT2 = native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
+INTERLEAVED_KV_FMT = native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
 D2H = native.TransferDirection.D2H
 H2D = native.TransferDirection.H2D
-
-# Layout keys for one fused [NB, 2, BS, …] page per layer (one base pointer;
-# K/V planes via offsets). Contrasts with ``sep_kv`` (separate K/V tensors).
-_INTERLEAVED_KV_LAYOUTS = (
-    "interleaved_kv",
-    "interleaved_attn_tp4",
-    "interleaved_attn_tp1",
-)
 
 
 def _planes(item: Any) -> tuple[torch.Tensor, ...]:
@@ -111,7 +103,7 @@ def _assert_pointer_table_contract(spec: dict[str, Any]) -> None:
     desc = spec["desc"]
     nl = spec["nl"]
     fmt = spec["fmt"]
-    if fmt == FMT2:
+    if fmt == INTERLEAVED_KV_FMT:
         assert table.numel() == nl
         fused = spec["fused_layers"][0]
         base = int(fused.data_ptr())
@@ -570,7 +562,7 @@ def _build(
             int(layers[0][1].data_ptr()) - base,
         )
         spec = dict(
-            fmt=FMT2,
+            fmt=INTERLEAVED_KV_FMT,
             desc=_shape_desc(
                 kv_size=2,
                 nl=nl,
@@ -642,7 +634,7 @@ def _build(
         )
         assert offsets == (0, page_bytes // 2)
         spec = dict(
-            fmt=FMT2,
+            fmt=INTERLEAVED_KV_FMT,
             desc=_shape_desc(
                 kv_size=2,
                 nl=nl,
@@ -959,7 +951,12 @@ def _run_roundtrip_restores_unskipped_selected_blocks(
     golden; used for interleaved attention pages with storage prefix).
     """
     device = torch.device("npu:0")
-    small_nb = layout in ("sep_kv", *_INTERLEAVED_KV_LAYOUTS)
+    small_nb = layout in (
+        "sep_kv",
+        "interleaved_kv",
+        "interleaved_attn_tp4",
+        "interleaved_attn_tp1",
+    )
     nb = None if small_nb else max(32, max(block_ids) + 1)
     spec = _build(layout, device, padded=padded, nl=nl, nb=nb)
     bs, bpo = spec["bs"], len(block_ids) // num_objects
