@@ -38,6 +38,14 @@ FMT2 = native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
 D2H = native.TransferDirection.D2H
 H2D = native.TransferDirection.H2D
 
+# Layout keys for one fused [NB, 2, BS, …] page per layer (one base pointer;
+# K/V planes via offsets). Contrasts with ``sep_kv`` (separate K/V tensors).
+_INTERLEAVED_KV_LAYOUTS = (
+    "interleaved_kv",
+    "interleaved_attn_tp4",
+    "interleaved_attn_tp1",
+)
+
 
 def _planes(item: Any) -> tuple[torch.Tensor, ...]:
     return item if isinstance(item, tuple) else (item,)
@@ -523,9 +531,9 @@ def _build(
     with_planes: bool | None = None,
 ) -> dict[str, Any]:
     """Build engine layers + PageBufferShapeDesc for one named layout."""
-    if layout == "fmt2":
-        # One NVIDIA-style [NB, 2, BS, NH, HS] tensor per layer. Padded mode
-        # also starts the tensor after a nonzero storage offset.
+    if layout == "interleaved_kv":
+        # Fused interleaved K/V: one [NB, 2, BS, NH, HS] tensor per layer.
+        # Padded mode also starts the tensor after a nonzero storage offset.
         nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
         hidden = nh * hs
         prefix = 32 if padded else 0
@@ -597,15 +605,15 @@ def _build(
             spec["prefix_elems"] = prefix
         _assert_pointer_table_contract(spec)
         return spec
-    if layout in ("fmt2_attn_tp4", "fmt2_attn_tp1"):
-        # Post-edit v0.30 interleaved attention: one original-dtype
-        # [NB, 2, 1024, 1, HS] page. HS is the synthetic head, 256 at TP4
-        # (1024-byte uint8 rows) and 1024 at TP1 (4096-byte uint8 rows).
+    if layout in ("interleaved_attn_tp4", "interleaved_attn_tp1"):
+        # Hybrid interleaved attention page (v0.30 edit): one original-dtype
+        # [NB, 2, 1024, 1, HS] tensor per layer. HS is the synthetic head:
+        # 256 at TP4 (1024-byte rows) and 1024 at TP1 (4096-byte rows).
         # Storage is kernel-page order, so plane 1 starts at half a page.
         nl = nl or 2
         nb = nb or 4
         bs = bs or 1024
-        hs = 256 if layout == "fmt2_attn_tp4" else 1024
+        hs = 256 if layout == "interleaved_attn_tp4" else 1024
         dtype = torch.bfloat16
         elem = torch.empty((), dtype=dtype).element_size()
         page_elems = 2 * bs * hs
@@ -901,48 +909,38 @@ _HOSTS = ("npu", "cpu", "pinned", "affinity")
 
 def _roundtrip_cases() -> list[Any]:
     rows: list[tuple] = [
-        ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], False, "sep-kv-tight-skip"),
-        ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], False, "sep-kv-padded-skip"),
-        ("fmt2", "npu", False, 1, 2, 2, [1, 3, 4, 6], False, "fmt2-tight-skip"),
-        ("fmt2", "npu", True, 1, 2, 2, [1, 3, 4, 6], False, "fmt2-padded-offset-skip"),
-        ("fmt2_attn_tp4", "npu", True, 0, 2, 1, [0, 2], False, "fmt2-attn-tp4-prefix"),
-        ("fmt2_attn_tp1", "npu", True, 0, 2, 1, [0, 2], False, "fmt2-attn-tp1-prefix"),
-        # H2D of one block must not clobber storage prefix or unselected blocks.
-        ("fmt2_attn_tp4", "npu", True, 0, 2, 1, [0], True, "fmt2-attn-tp4-h2d-scoped"),
-        ("fmt2_attn_tp1", "npu", True, 0, 2, 1, [0], True, "fmt2-attn-tp1-h2d-scoped"),
-        ("kg0", "npu", False, 1, 2, 1, [1, 3], False, "kg0-npu-skip"),
-        ("kg0", "npu", False, 0, 21, 2, list(range(64)), False, "kg0-npu-2chunk"),
-        ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], False, "nh_cs-fmt17"),
-        ("kg0_indep", "npu", False, 0, 2, 1, [0], False, "kg0-indep-mini"),
-        ("kg0_bs16", "npu", False, 0, 2, 1, [0], False, "kg0-bs16-chunk16"),
-        ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], False, "kg0-bs64-chunk128"),
-        ("mla_bf16", "npu", False, 0, 2, 1, [0, 1], False, "mla-bf16-bs16"),
-        ("mla_bf16_bs128", "npu", False, 0, 2, 1, [0, 1], False, "mla-bf16-bs128-segsplit"),
-        ("dsa3", "npu", False, 0, 2, 1, [0, 1], False, "dsa3-bs16"),
-        ("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], False, "dsa-c8-4plane"),
-        ("dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], False, "dsa-c8-4plane-skip"),
+        ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "sep-kv-tight-skip"),
+        ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "sep-kv-padded-skip"),
+        ("interleaved_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "interleaved-kv-skip"),
+        ("interleaved_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "interleaved-kv-padded"),
+        ("interleaved_attn_tp4", "npu", True, 0, 2, 1, [0, 2], "interleaved-attn-tp4"),
+        ("interleaved_attn_tp1", "npu", True, 0, 2, 1, [0, 2], "interleaved-attn-tp1"),
+        ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
+        ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
+        ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
+        ("kg0_indep", "npu", False, 0, 2, 1, [0], "kg0-indep-mini"),
+        ("kg0_bs16", "npu", False, 0, 2, 1, [0], "kg0-bs16-chunk16"),
+        ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], "kg0-bs64-chunk128"),
+        ("mla_bf16", "npu", False, 0, 2, 1, [0, 1], "mla-bf16-bs16"),
+        ("mla_bf16_bs128", "npu", False, 0, 2, 1, [0, 1], "mla-bf16-bs128-segsplit"),
+        ("dsa3", "npu", False, 0, 2, 1, [0, 1], "dsa3-bs16"),
+        ("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], "dsa-c8-4plane"),
+        ("dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], "dsa-c8-4plane-skip"),
         # skip == blocks_per_object: host must skip the launch (<<<0>>> is
         # invalid) and leave every byte untouched.
-        ("kg0", "npu", False, 2, 2, 1, [1, 3], False, "kg0-npu-skip-all-blocks"),
-        ("kg0", "cpu", False, 2, 2, 1, [1, 3], False, "kg0-cpu-skip-all-blocks"),
+        ("kg0", "npu", False, 2, 2, 1, [1, 3], "kg0-npu-skip-all-blocks"),
+        ("kg0", "cpu", False, 2, 2, 1, [1, 3], "kg0-cpu-skip-all-blocks"),
         # 2B row fit = 4096; bs=4096 must split 4095+1 instead of overflowing
         # DataCopyPad blockCount.
-        ("thin2b_bs4096", "npu", False, 0, 2, 1, [0], False, "thin2b-bs4096-rowclamp"),
+        ("thin2b_bs4096", "npu", False, 0, 2, 1, [0], "thin2b-bs4096-rowclamp"),
     ]
     for host in _HOSTS:
-        rows.append(("kg0", host, False, 0, 2, 1, [0], False, f"kg0-{host}-mini"))
-        rows.append(
-            ("kg0", host, False, 0, 21, 1, list(range(32)), False, f"kg0-{host}-live")
-        )
+        rows.append(("kg0", host, False, 0, 2, 1, [0], f"kg0-{host}-mini"))
+        rows.append(("kg0", host, False, 0, 21, 1, list(range(32)), f"kg0-{host}-live"))
     return [pytest.param(*row[:-1], id=row[-1]) for row in rows]
 
 
-@requires_npu
-@pytest.mark.parametrize(
-    "layout,host,padded,skip,nl,num_objects,block_ids,partial_h2d",
-    _roundtrip_cases(),
-)
-def test_roundtrip_restores_unskipped_selected_blocks(
+def _run_roundtrip_restores_unskipped_selected_blocks(
     layout: str,
     host: str,
     padded: bool,
@@ -950,14 +948,19 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     nl: int,
     num_objects: int,
     block_ids: list[int],
-    partial_h2d: bool,
+    *,
+    zero_before_h2d: str,
 ) -> None:
+    """D2H then H2D roundtrip contract.
+
+    ``zero_before_h2d`` is ``"engine"`` (default roundtrip: wipe all blocks, then
+    expect only transferred ids restored) or ``"transferred_only"`` (zero only
+    blocks listed for H2D, then expect every block—including unselected—to match
+    golden; used for interleaved attention pages with storage prefix).
+    """
     device = torch.device("npu:0")
-    nb = (
-        None
-        if layout in ("sep_kv", "fmt2", "fmt2_attn_tp1", "fmt2_attn_tp4")
-        else max(32, max(block_ids) + 1)
-    )
+    small_nb = layout in ("sep_kv", *_INTERLEAVED_KV_LAYOUTS)
+    nb = None if small_nb else max(32, max(block_ids) + 1)
     spec = _build(layout, device, padded=padded, nl=nl, nb=nb)
     bs, bpo = spec["bs"], len(block_ids) // num_objects
     chunk = bpo * bs
@@ -985,7 +988,7 @@ def test_roundtrip_restores_unskipped_selected_blocks(
                 num_objects=num_objects,
                 kv_leading=spec["kv_leading"],
             )
-        if partial_h2d:
+        if zero_before_h2d == "transferred_only":
             transferred = _transferred_block_ids(block_ids, num_objects, skip)
             _zero_blocks(spec["layers"], transferred)
         else:
@@ -994,7 +997,7 @@ def test_roundtrip_restores_unskipped_selected_blocks(
             lambda: _launch(spec, spec["table"], ptrs, ids, device, H2D, chunk, skip),
             affinity=host == "affinity",
         )
-    if partial_h2d:
+    if zero_before_h2d == "transferred_only":
         _assert_engine_equal(spec["layers"], golden)
     else:
         _assert_h2d_engine(
@@ -1002,6 +1005,52 @@ def test_roundtrip_restores_unskipped_selected_blocks(
         )
     if prefix_snapshots is not None:
         _assert_storage_prefixes_unchanged(spec, prefix_snapshots)
+
+
+@requires_npu
+@pytest.mark.parametrize(
+    "layout,host,padded,skip,nl,num_objects,block_ids", _roundtrip_cases()
+)
+def test_roundtrip_restores_unskipped_selected_blocks(
+    layout: str,
+    host: str,
+    padded: bool,
+    skip: int,
+    nl: int,
+    num_objects: int,
+    block_ids: list[int],
+) -> None:
+    _run_roundtrip_restores_unskipped_selected_blocks(
+        layout,
+        host,
+        padded,
+        skip,
+        nl,
+        num_objects,
+        block_ids,
+        zero_before_h2d="engine",
+    )
+
+
+@requires_npu
+@pytest.mark.parametrize(
+    "layout",
+    ["interleaved_attn_tp4", "interleaved_attn_tp1"],
+    ids=["interleaved-attn-tp4", "interleaved-attn-tp1"],
+)
+def test_interleaved_attn_h2d_does_not_clobber_unselected_blocks(
+    layout: str,
+) -> None:
+    _run_roundtrip_restores_unskipped_selected_blocks(
+        layout,
+        "npu",
+        True,
+        0,
+        2,
+        1,
+        [0],
+        zero_before_h2d="transferred_only",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1073,15 +1122,17 @@ def test_native_matches_reference(
     "layout,table_kind",
     [
         ("kg0", "scalar"),
-        ("fmt2", "expanded_kv"),
+        ("interleaved_kv", "expanded_kv"),
         ("sep_kv", "collapsed_layer"),
     ],
-    ids=["kg0-scalar", "fmt2-two-per-layer", "sep-kv-one-per-layer"],
+    ids=["kg0-scalar", "interleaved-kv-two-per-layer", "sep-kv-one-per-layer"],
 )
 def test_torch_check_raises_python_exception(layout: str, table_kind: str) -> None:
     device = torch.device("npu:0")
     spec = _build(layout, device, nl=2, nb=4, bs=4 if layout != "kg0" else 32)
-    obj = torch.zeros(_obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device)
+    obj = torch.zeros(
+        _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
+    )
     if table_kind == "scalar":
         bad_table = torch.tensor([obj.data_ptr()], dtype=torch.int64, device=device)
     elif table_kind == "expanded_kv":
@@ -1136,8 +1187,8 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
             _build("dsa_c8_4", device, nl=2, nb=4, bs=16),
         ),
         (
-            _build("fmt2", device, padded=True, nl=2, nb=4, bs=4),
-            _build("fmt2", device, padded=True, nl=2, nb=4, bs=4),
+            _build("interleaved_kv", device, padded=True, nl=2, nb=4, bs=4),
+            _build("interleaved_kv", device, padded=True, nl=2, nb=4, bs=4),
         ),
     ]
     direction = D2H if direction_d2h else H2D
