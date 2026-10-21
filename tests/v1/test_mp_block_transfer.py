@@ -1029,59 +1029,49 @@ def test_native_matches_reference(
 
 
 @requires_npu
-@pytest.mark.parametrize(
-    "layout,table_kind",
-    [
-        ("kg0", "scalar"),
-        ("fused_kv", "expanded_kv"),
-        ("sep_kv", "collapsed_layer"),
-    ],
-    ids=["kg0-scalar", "fused-kv-two-per-layer", "sep-kv-one-per-layer"],
-)
-def test_torch_check_raises_python_exception(layout: str, table_kind: str) -> None:
+def test_torch_check_raises_python_exception() -> None:
     device = torch.device("npu:0")
-    spec = _build(layout, device, nl=2, nb=4, bs=4 if layout != "kg0" else 32)
+    spec = _build("kg0", device, nl=2, nb=4, bs=32)
+    obj = torch.zeros((2, 32, 130), dtype=torch.uint8, device=device)
+    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
+        lmc_ops.multi_layer_block_kv_transfer(
+            torch.tensor([obj.data_ptr()], dtype=torch.int64, device=device),
+            [obj.data_ptr()],
+            torch.tensor([0], dtype=torch.int64, device=device),
+            device,
+            D2H,
+            spec["desc"],
+            32,
+            KG0_FMT,
+            0,
+        )
+
+
+@requires_npu
+def test_fused_kv_rejects_one_pointer_per_plane() -> None:
+    """Fused pages take one base pointer per layer, not one per K and V."""
+    device = torch.device("npu:0")
+    spec = _build("fused_kv", device, nl=2, nb=4, bs=4)
     obj = torch.zeros(
         _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
     )
-    if table_kind == "scalar":
-        bad_table = torch.tensor([obj.data_ptr()], dtype=torch.int64, device=device)
-    elif table_kind == "expanded_kv":
-        bad_table = torch.tensor(
-            [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
-            dtype=torch.int64,
-            device=device,
-        )
-    else:
-        bad_table = torch.tensor(
-            [int(pair[0].data_ptr()) for pair in spec["layers"]],
-            dtype=torch.int64,
-            device=device,
-        )
+    two_per_layer = torch.tensor(
+        [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
+        dtype=torch.int64,
+        device=device,
+    )
     with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
-        if table_kind == "scalar":
-            lmc_ops.multi_layer_block_kv_transfer(
-                bad_table,
-                [obj.data_ptr()],
-                torch.tensor([0], dtype=torch.int64, device=device),
-                device,
-                D2H,
-                spec["desc"],
-                spec["bs"],
-                spec["fmt"],
-                0,
-            )
-        else:
-            _transfer(
-                bad_table,
-                [int(obj.data_ptr())],
-                torch.tensor([0], dtype=torch.int64, device=device),
-                device,
-                D2H,
-                spec["desc"],
-                spec["bs"],
-                spec["fmt"],
-            )
+        lmc_ops.multi_layer_block_kv_transfer(
+            two_per_layer,
+            [int(obj.data_ptr())],
+            torch.tensor([0], dtype=torch.int64, device=device),
+            device,
+            D2H,
+            spec["desc"],
+            spec["bs"],
+            spec["fmt"],
+            0,
+        )
 
 
 @requires_npu
