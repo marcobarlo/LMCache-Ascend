@@ -56,13 +56,11 @@ public:
   }
 
   template <bool ToEngine> __aicore__ inline void Process() {
-    //   true  -> format 16 (NL_X_TWO_X_NB_BS_NH_HS): K/V are disjoint LMC
-    //            slabs, work item = (layer, plane, block);
-    //            Format 2 uses the same work item; each slab is the layer
-    //            base plus the plane offset.
-    //   false -> format 17 (NL_X_NP_X_NB_BS_ONE_HS): packed multi-plane LMC
-    //            rows, work item = (layer, block); one core moves every
-    //            plane of the page so no two cores share a 32B LMC line.
+    //   separate_plane_ true  -> work item = (layer, plane, block); each
+    //            plane column is copied independently (disjoint LMC slabs, or
+    //            one_pointer_per_layer_ with per-plane GM offsets).
+    //   separate_plane_ false -> work item = (layer, block); one core moves
+    //            every plane of the page so no two cores share a 32B LMC line.
     const int32_t plane_slots = separate_plane_ ? layout_.num_planes : 1;
     const int32_t active_blocks = blocks_per_obj_ - skip_blocks_;
     const int64_t work =
@@ -104,9 +102,9 @@ private:
     return max_row;
   }
 
-  // Formats 16/17: ptrs[layer * num_planes + plane], already including the
-  // view's storage_offset. Format 2: ptrs[layer] is the 5D tensor base;
-  // plane p starts engine_base_offset_bytes later.
+  // one_pointer_per_layer_: ptrs[layer] plus planes[p].engine_base_offset_bytes.
+  // Otherwise ptrs[layer * num_planes + plane] (each view's storage_offset
+  // is already in the stored pointer).
   __aicore__ inline __gm__ uint8_t* ResolveEnginePlanePtr(int32_t layer,
                                                           int32_t plane) const {
     const int64_t index =
@@ -263,9 +261,9 @@ extern "C" __global__ __aicore__ void multi_layer_block_transfer_kernel(
     int64_t p1_base, int64_t p2_payload, int64_t p2_block_stride,
     int64_t p2_base, int64_t p3_payload, int64_t p3_block_stride,
     int64_t p3_base, int64_t ub_bytes, bool one_pointer_per_layer,
-    // Only format 2 adds an offset to the layer base pointer, and it has
-    // exactly two planes. Formats 16 and 17 already pass one pointer per
-    // plane, so planes 2 and 3 stay at offset 0 and are not launched.
+    // When one_pointer_per_layer, plane GM bases use engine_base_offset_bytes
+    // on the layer entry; only the first two offsets are launch arguments.
+    // Per-plane pointer tables keep engine_base_offset_bytes at zero.
     int64_t p0_engine_base, int64_t p1_engine_base) {
   kvcache_ops::BlockTransferLayout layout = {};
   layout.num_planes = num_planes;

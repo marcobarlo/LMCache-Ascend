@@ -6,12 +6,13 @@ construct ``device_ops.PageBufferShapeDesc()`` (``c_ops``). NPU kernels
 take that class by value. Also hosts the wrap that attaches per-plane
 byte geometry to upstream's desc factory (:func:`install_plane_geometry_fill`).
 
-Format **2** plane offsets here are a **temporary** MP bridge: axis 1 is
-not guaranteed to be semantic K/V on vLLM-Ascend hybrid pages (see
-``vllm_ascend/worker/model_runner_v1.py`` ``_reshape_kv_cache_tensors``,
-``use_hybrid_blocks`` / ``(k_cache, v_cache)``). A future **format 18**
-should use ``kv_size == 1`` and one pointer per layer like format 17; see
-``csrc/kernels/kernels/multi_layer/block_transfer_contract.md`` §7.
+Plane engine-base offsets support the **one pointer per layer, multiple
+planes** MP bridge (often registered as enum format **2**), including
+synthetic views for hybrid interleaved attention that do not match
+vLLM-Ascend's true page bytes (see ``vllm_ascend/worker/model_runner_v1.py``
+``_reshape_kv_cache_tensors``, ``use_hybrid_blocks`` / ``(k_cache,
+v_cache)``). A dedicated single-plane format (proposed enum **18**) should
+replace that registration; see ``block_transfer_contract.md`` §7.
 """
 
 # Future
