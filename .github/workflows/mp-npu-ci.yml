@@ -1,10 +1,12 @@
 name: MP NPU tests (910B3)
 
-# Self-hosted on 910B3-03. Does not use the Huawei-lab 910b4/910c jobs.
-# repository_dispatch (mp-npu-ci) is fired by marcobarlo/LMCache on MP_dsv4_3_split pushes.
+# Self-hosted runner 910B3-03 on marcobarlo/LMCache-Ascend (label: 910b3).
+# repository_dispatch (mp-npu-ci) is fired from marcobarlo/LMCache pushes.
 on:
   push:
-    branches: [MP_dsv4_3_split]
+    branches: [MP_dsv4_3_split, main]
+  pull_request:
+    branches: [MP_dsv4_3_split, main, '*-dev']
   workflow_dispatch:
   repository_dispatch:
     types: [mp-npu-ci]
@@ -12,7 +14,9 @@ on:
 run-name: >-
   ${{ github.event_name == 'repository_dispatch'
       && format('LMCache {0}', github.event.client_payload.sha)
-      || github.event.head_commit.message || github.sha }}
+      || github.event.pull_request.title
+      || github.event.head_commit.message
+      || github.sha }}
 
 permissions:
   contents: read
@@ -20,7 +24,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: mp-npu-910b3
+  group: mp-npu-910b3-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -63,10 +67,6 @@ jobs:
           python3 -c '
           import re, subprocess, sys
           out = subprocess.check_output(["npu-smi", "info"], text=True)
-          # Chip rows list Memory-Usage then HBM-Usage as "used / total".
-          # re.search() hits the first pair (often "0 / 0"), so take the last
-          # pair whose total looks like device HBM. Empty parse must fail closed:
-          # npu-smi inside this container also hides host processes.
           hbms = []
           for line in out.splitlines():
               pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
@@ -85,8 +85,10 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
-          # repository_dispatch checks out the default branch unless ref is set.
-          ref: ${{ github.event_name == 'repository_dispatch' && 'MP_dsv4_3_split' || github.sha }}
+          ref: >-
+            ${{ github.event_name == 'repository_dispatch' && 'MP_dsv4_3_split'
+                || github.event.pull_request.head.sha
+                || github.sha }}
 
       - name: Checkout LMCache MP branch
         uses: actions/checkout@v4
