@@ -1132,7 +1132,8 @@ def test_format2_keeps_one_base_pointer_per_layer() -> None:
     )
 
     storage = torch.arange(96, dtype=torch.float16)
-    layer = storage.as_strided((2, 2, 4, 2, 4), (32, 16, 4, 4, 1), storage_offset=16)
+    # NH=1 so token rows are dense (stride BS == NH*HS); launchable fmt-2 geometry.
+    layer = storage.as_strided((2, 2, 4, 1, 4), (32, 16, 4, 4, 1), storage_offset=16)
     layers = [layer, layer.clone()]
     ptrs = get_group_data_ptrs(layers, FMT2, [0, 1])
     assert ptrs == [int(layers[0].data_ptr()), int(layers[1].data_ptr())]
@@ -1142,7 +1143,7 @@ def test_format2_keeps_one_base_pointer_per_layer() -> None:
         layers, FMT2, layer_idx=0, num_layers_in_group=2, num_blocks=2, block_size=4
     )
     assert int(desc.num_planes) == 2
-    assert tuple(desc.plane_slot_bytes) == (16, 16)
+    assert tuple(desc.plane_slot_bytes) == (8, 8)
     assert tuple(desc.plane_block_stride_bytes) == (64, 64)
     assert tuple(desc.plane_engine_base_offset_bytes) == (
         int(layer[:, 0].data_ptr()) - int(layer.data_ptr()),
