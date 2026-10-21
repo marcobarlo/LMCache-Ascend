@@ -97,6 +97,51 @@ def _engine_nb(layers: Sequence[Any]) -> int:
     return int(_planes(layers[0])[0].shape[0])
 
 
+def _assert_pointer_table_contract(spec: dict[str, Any]) -> None:
+    """Pointer-table width and plane offsets expected per engine format."""
+    table = spec["table"]
+    desc = spec["desc"]
+    nl = spec["nl"]
+    fmt = spec["fmt"]
+    if fmt == FMT2:
+        assert table.numel() == nl
+        fused = spec["fused_layers"][0]
+        base = int(fused.data_ptr())
+        expected = tuple(
+            int(plane.data_ptr()) - base for layer in spec["layers"] for plane in layer
+        )[:2]
+        assert tuple(desc.plane_engine_base_offset_bytes) == expected
+        return
+    if fmt == SEP_KV_FMT:
+        assert table.numel() == nl * int(desc.num_planes)
+        assert tuple(desc.plane_engine_base_offset_bytes) == (0, 0)
+        return
+    if fmt == KG0_FMT and int(desc.num_planes) > 0:
+        assert table.numel() == nl * int(desc.num_planes)
+
+
+def _storage_prefix_snapshots(spec: dict[str, Any]) -> list[torch.Tensor] | None:
+    storages = spec.get("storages")
+    prefix_elems = spec.get("prefix_elems")
+    if not storages or not prefix_elems:
+        return None
+    return [storage[:prefix_elems].clone() for storage in storages]
+
+
+def _assert_storage_prefixes_unchanged(
+    spec: dict[str, Any], snapshots: list[torch.Tensor]
+) -> None:
+    prefix_elems = spec["prefix_elems"]
+    for storage, prefix in zip(spec["storages"], snapshots, strict=True):
+        assert torch.equal(storage[:prefix_elems], prefix)
+
+
+def _zero_blocks(layers: Sequence[Any], block_ids: set[int]) -> None:
+    for bid in block_ids:
+        for tensor in (t for item in layers for t in _planes(item)):
+            tensor[bid].zero_()
+
+
 def _paged_ptr_tensor(paged: object, device: torch.device) -> torch.Tensor:
     """Native host wants a 1-D int64 pointer table, not nested layer tensors."""
     if isinstance(paged, torch.Tensor):
@@ -488,10 +533,12 @@ def _build(
         page_elems = 2 * bs * hidden + pad_elems
         fused_layers = []
         layers = []
+        storages: list[torch.Tensor] = []
         for i in range(nl):
             storage = torch.full(
                 (prefix + nb * page_elems,), -1, dtype=torch.float16, device=device
             )
+            storages.append(storage)
             fused = storage.as_strided(
                 (nb, 2, bs, nh, hs),
                 (page_elems, bs * hidden, hidden, hs, 1),
@@ -514,7 +561,7 @@ def _build(
             int(layers[0][0].data_ptr()) - base,
             int(layers[0][1].data_ptr()) - base,
         )
-        return dict(
+        spec = dict(
             fmt=FMT2,
             desc=_shape_desc(
                 kv_size=2,
@@ -545,6 +592,11 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        if prefix:
+            spec["storages"] = storages
+            spec["prefix_elems"] = prefix
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout in ("fmt2_attn_tp4", "fmt2_attn_tp1"):
         # Post-edit v0.30 interleaved attention: one original-dtype
         # [NB, 2, 1024, 1, HS] page. HS is the synthetic head, 256 at TP4
@@ -581,7 +633,7 @@ def _build(
             int(layers[0][1].data_ptr()) - base,
         )
         assert offsets == (0, page_bytes // 2)
-        return dict(
+        spec = dict(
             fmt=FMT2,
             desc=_shape_desc(
                 kv_size=2,
@@ -613,6 +665,8 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout == "sep_kv":
         nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
         hidden = nh * hs
@@ -632,7 +686,7 @@ def _build(
         ]
         stride = (bs + int(padded)) * hidden
         slot = nh * hs * 2
-        return dict(
+        spec = dict(
             fmt=SEP_KV_FMT,
             desc=_shape_desc(
                 kv_size=2,
@@ -657,6 +711,8 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout in _PACKED_PLANE_SPECS:
         plane_specs = _PACKED_PLANE_SPECS[layout]
         nl = nl or 2
@@ -669,7 +725,7 @@ def _build(
             nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
         )
         row = _plane_row_bytes(plane_specs)
-        return dict(
+        spec = dict(
             fmt=KG0_FMT,
             desc=_packed_planes_desc(nl=nl, nb=nb, bs=bs, plane_specs=plane_specs),
             layers=layers,
@@ -684,6 +740,8 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout in ("nh_cs", "nh_cs_fmt17", "nh_cs_padded"):
         padded_layout = layout == "nh_cs_padded" or padded
         nl = nl or 2
@@ -760,7 +818,7 @@ def _build(
     layers, pools, block_stride, plane_strides = _kg0_planes(
         nl=nl, nb=nb, bs=bs, device=device, independent=independent
     )
-    return dict(
+    spec = dict(
         fmt=KG0_FMT,
         desc=_shape_desc(
             kv_size=1,
@@ -785,6 +843,8 @@ def _build(
         nl=nl,
         pad_width=None,
     )
+    _assert_pointer_table_contract(spec)
+    return spec
 
 
 def _obj_shape(spec: dict[str, Any], chunk: int) -> tuple[int, ...]:
@@ -841,40 +901,46 @@ _HOSTS = ("npu", "cpu", "pinned", "affinity")
 
 def _roundtrip_cases() -> list[Any]:
     rows: list[tuple] = [
-        ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "sep-kv-tight-skip"),
-        ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "sep-kv-padded-skip"),
-        ("fmt2", "npu", False, 1, 2, 2, [1, 3, 4, 6], "fmt2-tight-skip"),
-        ("fmt2", "npu", True, 1, 2, 2, [1, 3, 4, 6], "fmt2-padded-offset-skip"),
-        ("fmt2_attn_tp4", "npu", True, 0, 2, 1, [0, 2], "fmt2-attn-tp4-prefix"),
-        ("fmt2_attn_tp1", "npu", True, 0, 2, 1, [0, 2], "fmt2-attn-tp1-prefix"),
-        ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
-        ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
-        ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
-        ("kg0_indep", "npu", False, 0, 2, 1, [0], "kg0-indep-mini"),
-        ("kg0_bs16", "npu", False, 0, 2, 1, [0], "kg0-bs16-chunk16"),
-        ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], "kg0-bs64-chunk128"),
-        ("mla_bf16", "npu", False, 0, 2, 1, [0, 1], "mla-bf16-bs16"),
-        ("mla_bf16_bs128", "npu", False, 0, 2, 1, [0, 1], "mla-bf16-bs128-segsplit"),
-        ("dsa3", "npu", False, 0, 2, 1, [0, 1], "dsa3-bs16"),
-        ("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], "dsa-c8-4plane"),
-        ("dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], "dsa-c8-4plane-skip"),
+        ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], False, "sep-kv-tight-skip"),
+        ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], False, "sep-kv-padded-skip"),
+        ("fmt2", "npu", False, 1, 2, 2, [1, 3, 4, 6], False, "fmt2-tight-skip"),
+        ("fmt2", "npu", True, 1, 2, 2, [1, 3, 4, 6], False, "fmt2-padded-offset-skip"),
+        ("fmt2_attn_tp4", "npu", True, 0, 2, 1, [0, 2], False, "fmt2-attn-tp4-prefix"),
+        ("fmt2_attn_tp1", "npu", True, 0, 2, 1, [0, 2], False, "fmt2-attn-tp1-prefix"),
+        # H2D of one block must not clobber storage prefix or unselected blocks.
+        ("fmt2_attn_tp4", "npu", True, 0, 2, 1, [0], True, "fmt2-attn-tp4-h2d-scoped"),
+        ("fmt2_attn_tp1", "npu", True, 0, 2, 1, [0], True, "fmt2-attn-tp1-h2d-scoped"),
+        ("kg0", "npu", False, 1, 2, 1, [1, 3], False, "kg0-npu-skip"),
+        ("kg0", "npu", False, 0, 21, 2, list(range(64)), False, "kg0-npu-2chunk"),
+        ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], False, "nh_cs-fmt17"),
+        ("kg0_indep", "npu", False, 0, 2, 1, [0], False, "kg0-indep-mini"),
+        ("kg0_bs16", "npu", False, 0, 2, 1, [0], False, "kg0-bs16-chunk16"),
+        ("kg0_bs64", "npu", False, 0, 2, 1, [0, 1], False, "kg0-bs64-chunk128"),
+        ("mla_bf16", "npu", False, 0, 2, 1, [0, 1], False, "mla-bf16-bs16"),
+        ("mla_bf16_bs128", "npu", False, 0, 2, 1, [0, 1], False, "mla-bf16-bs128-segsplit"),
+        ("dsa3", "npu", False, 0, 2, 1, [0, 1], False, "dsa3-bs16"),
+        ("dsa_c8_4", "npu", False, 0, 2, 1, [0, 1], False, "dsa-c8-4plane"),
+        ("dsa_c8_4", "npu", False, 1, 2, 1, [0, 1], False, "dsa-c8-4plane-skip"),
         # skip == blocks_per_object: host must skip the launch (<<<0>>> is
         # invalid) and leave every byte untouched.
-        ("kg0", "npu", False, 2, 2, 1, [1, 3], "kg0-npu-skip-all-blocks"),
-        ("kg0", "cpu", False, 2, 2, 1, [1, 3], "kg0-cpu-skip-all-blocks"),
+        ("kg0", "npu", False, 2, 2, 1, [1, 3], False, "kg0-npu-skip-all-blocks"),
+        ("kg0", "cpu", False, 2, 2, 1, [1, 3], False, "kg0-cpu-skip-all-blocks"),
         # 2B row fit = 4096; bs=4096 must split 4095+1 instead of overflowing
         # DataCopyPad blockCount.
-        ("thin2b_bs4096", "npu", False, 0, 2, 1, [0], "thin2b-bs4096-rowclamp"),
+        ("thin2b_bs4096", "npu", False, 0, 2, 1, [0], False, "thin2b-bs4096-rowclamp"),
     ]
     for host in _HOSTS:
-        rows.append(("kg0", host, False, 0, 2, 1, [0], f"kg0-{host}-mini"))
-        rows.append(("kg0", host, False, 0, 21, 1, list(range(32)), f"kg0-{host}-live"))
+        rows.append(("kg0", host, False, 0, 2, 1, [0], False, f"kg0-{host}-mini"))
+        rows.append(
+            ("kg0", host, False, 0, 21, 1, list(range(32)), False, f"kg0-{host}-live")
+        )
     return [pytest.param(*row[:-1], id=row[-1]) for row in rows]
 
 
 @requires_npu
 @pytest.mark.parametrize(
-    "layout,host,padded,skip,nl,num_objects,block_ids", _roundtrip_cases()
+    "layout,host,padded,skip,nl,num_objects,block_ids,partial_h2d",
+    _roundtrip_cases(),
 )
 def test_roundtrip_restores_unskipped_selected_blocks(
     layout: str,
@@ -884,6 +950,7 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     nl: int,
     num_objects: int,
     block_ids: list[int],
+    partial_h2d: bool,
 ) -> None:
     device = torch.device("npu:0")
     nb = (
@@ -896,6 +963,7 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     chunk = bpo * bs
     ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
     golden = _clone_engine(spec["layers"])
+    prefix_snapshots = _storage_prefix_snapshots(spec)
     with _host_objects(
         host, [_obj_shape(spec, chunk)] * num_objects, spec["obj_dtype"], device
     ) as (
@@ -917,14 +985,23 @@ def test_roundtrip_restores_unskipped_selected_blocks(
                 num_objects=num_objects,
                 kv_leading=spec["kv_leading"],
             )
-        _zero_engine(spec["layers"])
+        if partial_h2d:
+            transferred = _transferred_block_ids(block_ids, num_objects, skip)
+            _zero_blocks(spec["layers"], transferred)
+        else:
+            _zero_engine(spec["layers"])
         _run(
             lambda: _launch(spec, spec["table"], ptrs, ids, device, H2D, chunk, skip),
             affinity=host == "affinity",
         )
-    _assert_h2d_engine(
-        spec["layers"], golden, block_ids, skip=skip, num_objects=num_objects
-    )
+    if partial_h2d:
+        _assert_engine_equal(spec["layers"], golden)
+    else:
+        _assert_h2d_engine(
+            spec["layers"], golden, block_ids, skip=skip, num_objects=num_objects
+        )
+    if prefix_snapshots is not None:
+        _assert_storage_prefixes_unchanged(spec, prefix_snapshots)
 
 
 # ---------------------------------------------------------------------------
@@ -992,22 +1069,57 @@ def test_native_matches_reference(
 
 
 @requires_npu
-def test_torch_check_raises_python_exception() -> None:
+@pytest.mark.parametrize(
+    "layout,table_kind",
+    [
+        ("kg0", "scalar"),
+        ("fmt2", "expanded_kv"),
+        ("sep_kv", "collapsed_layer"),
+    ],
+    ids=["kg0-scalar", "fmt2-two-per-layer", "sep-kv-one-per-layer"],
+)
+def test_torch_check_raises_python_exception(layout: str, table_kind: str) -> None:
     device = torch.device("npu:0")
-    spec = _build("kg0", device, nl=2, nb=4, bs=32)
-    obj = torch.zeros((2, 32, 130), dtype=torch.uint8, device=device)
-    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
-        lmc_ops.multi_layer_block_kv_transfer(
-            torch.tensor([obj.data_ptr()], dtype=torch.int64, device=device),
-            [obj.data_ptr()],
-            torch.tensor([0], dtype=torch.int64, device=device),
-            device,
-            D2H,
-            spec["desc"],
-            32,
-            KG0_FMT,
-            0,
+    spec = _build(layout, device, nl=2, nb=4, bs=4 if layout != "kg0" else 32)
+    obj = torch.zeros(_obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device)
+    if table_kind == "scalar":
+        bad_table = torch.tensor([obj.data_ptr()], dtype=torch.int64, device=device)
+    elif table_kind == "expanded_kv":
+        bad_table = torch.tensor(
+            [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
+            dtype=torch.int64,
+            device=device,
         )
+    else:
+        bad_table = torch.tensor(
+            [int(pair[0].data_ptr()) for pair in spec["layers"]],
+            dtype=torch.int64,
+            device=device,
+        )
+    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
+        if table_kind == "scalar":
+            lmc_ops.multi_layer_block_kv_transfer(
+                bad_table,
+                [obj.data_ptr()],
+                torch.tensor([0], dtype=torch.int64, device=device),
+                device,
+                D2H,
+                spec["desc"],
+                spec["bs"],
+                spec["fmt"],
+                0,
+            )
+        else:
+            _transfer(
+                bad_table,
+                [int(obj.data_ptr())],
+                torch.tensor([0], dtype=torch.int64, device=device),
+                device,
+                D2H,
+                spec["desc"],
+                spec["bs"],
+                spec["fmt"],
+            )
 
 
 @requires_npu
@@ -1121,155 +1233,6 @@ def test_plan_staging_d2h_matches_direct(affinity: bool, num_objects: int) -> No
     _run(_store, affinity=affinity)
     for host, golden in zip(hosts, goldens, strict=True):
         assert torch.equal(host, golden.cpu())
-
-
-def test_format2_keeps_one_base_pointer_per_layer() -> None:
-    """Format 2 keeps upstream's one base pointer; offsets live on the desc."""
-    # First Party
-    from lmcache.v1.gpu_connector.utils import (
-        get_group_data_ptrs,
-        make_page_buffer_shape_desc,
-    )
-
-    storage = torch.arange(96, dtype=torch.float16)
-    # NH=1 so token rows are dense (stride BS == NH*HS); launchable fmt-2 geometry.
-    layer = storage.as_strided((2, 2, 4, 1, 4), (32, 16, 4, 4, 1), storage_offset=16)
-    layers = [layer, layer.clone()]
-    ptrs = get_group_data_ptrs(layers, FMT2, [0, 1])
-    assert ptrs == [int(layers[0].data_ptr()), int(layers[1].data_ptr())]
-    assert int(layers[0].storage_offset()) == 16
-
-    desc = make_page_buffer_shape_desc(
-        layers, FMT2, layer_idx=0, num_layers_in_group=2, num_blocks=2, block_size=4
-    )
-    assert int(desc.num_planes) == 2
-    assert tuple(desc.plane_slot_bytes) == (8, 8)
-    assert tuple(desc.plane_block_stride_bytes) == (64, 64)
-    assert tuple(desc.plane_engine_base_offset_bytes) == (
-        int(layer[:, 0].data_ptr()) - int(layer.data_ptr()),
-        int(layer[:, 1].data_ptr()) - int(layer.data_ptr()),
-    )
-    assert tuple(desc.plane_engine_base_offset_bytes) == (0, 32)
-
-
-def test_format2_interleaved_attention_shape_desc() -> None:
-    """Synthetic attention pages use one pointer and half-page plane offsets."""
-    # First Party
-    from lmcache.v1.gpu_connector.utils import (
-        get_group_data_ptrs,
-        make_page_buffer_shape_desc,
-    )
-
-    bs, hs, nb, prefix = 1024, 256, 2, 64
-    page_elems = 2 * bs * hs
-    storage = torch.arange(prefix + nb * page_elems, dtype=torch.bfloat16)
-    layer = storage.as_strided(
-        (nb, 2, bs, 1, hs),
-        (page_elems, page_elems // 2, hs, hs, 1),
-        storage_offset=prefix,
-    )
-    layers = [layer, layer.clone()]
-    ptrs = get_group_data_ptrs(layers, FMT2, [0, 1])
-    assert ptrs == [int(layers[0].data_ptr()), int(layers[1].data_ptr())]
-    assert len(ptrs) == len(layers)
-
-    desc = make_page_buffer_shape_desc(
-        layers, FMT2, layer_idx=0, num_layers_in_group=2, num_blocks=nb, block_size=bs
-    )
-    page_bytes = page_elems * layer.element_size()
-    assert int(desc.kv_size) == 2
-    assert int(desc.num_planes) == 2
-    assert tuple(desc.plane_slot_bytes) == (hs * layer.element_size(),) * 2
-    assert tuple(desc.plane_block_stride_bytes) == (page_bytes, page_bytes)
-    assert tuple(desc.plane_engine_base_offset_bytes) == (0, page_bytes // 2)
-
-
-@requires_npu
-@pytest.mark.parametrize("layout", ["fmt2_attn_tp4", "fmt2_attn_tp1"])
-def test_format2_interleaved_attention_leaves_prefix_and_other_blocks(
-    layout: str,
-) -> None:
-    """H2D of one block must not change the storage prefix or other blocks."""
-    device = torch.device("npu:0")
-    spec = _build(layout, device, padded=True, nl=2, nb=4, bs=1024)
-    assert spec["table"].numel() == spec["nl"]
-    golden = _clone_engine(spec["layers"])
-    prefixes = [storage[: spec["prefix_elems"]].clone() for storage in spec["storages"]]
-    ids = torch.tensor([0], dtype=torch.int64, device=device)
-    with _host_object("npu", _obj_shape(spec, spec["bs"]), spec["obj_dtype"], device) as (
-        ptrs,
-        _obj,
-    ):
-        _transfer(
-            spec["table"], ptrs, ids, device, D2H, spec["desc"], spec["bs"], spec["fmt"]
-        )
-        for layer in spec["layers"]:
-            for plane in layer:
-                plane[0].zero_()
-        _transfer(
-            spec["table"], ptrs, ids, device, H2D, spec["desc"], spec["bs"], spec["fmt"]
-        )
-    _assert_block_equal(spec["layers"], golden, 0)
-    for bid in (1, 2, 3):
-        _assert_block_equal(spec["layers"], golden, bid)
-    for storage, prefix in zip(spec["storages"], prefixes, strict=True):
-        assert torch.equal(storage[: spec["prefix_elems"]], prefix)
-
-
-@requires_npu
-def test_format2_rejects_two_pointers_per_layer() -> None:
-    """An expanded K/V pointer table is the old format-2 contract."""
-    device = torch.device("npu:0")
-    spec = _build("fmt2", device, nl=2, nb=4, bs=4)
-    assert spec["table"].numel() == spec["nl"]
-    obj = torch.zeros(
-        _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
-    )
-    two_per_layer = torch.tensor(
-        [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
-        dtype=torch.int64,
-        device=device,
-    )
-    assert two_per_layer.numel() == spec["nl"] * 2
-    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
-        _transfer(
-            two_per_layer,
-            [int(obj.data_ptr())],
-            torch.tensor([0], dtype=torch.int64, device=device),
-            device,
-            D2H,
-            spec["desc"],
-            spec["bs"],
-            spec["fmt"],
-        )
-
-
-@requires_npu
-def test_format16_and_17_keep_per_plane_pointer_counts() -> None:
-    """Formats 16 and 17 still index one pointer per physical plane."""
-    device = torch.device("npu:0")
-    sep = _build("sep_kv", device, nl=2, nb=4, bs=4)
-    packed = _build("kg0", device, nl=2, nb=4, bs=16)
-    assert sep["table"].numel() == sep["nl"] * int(sep["desc"].num_planes)
-    assert packed["table"].numel() == packed["nl"] * int(packed["desc"].num_planes)
-    assert tuple(sep["desc"].plane_engine_base_offset_bytes) == (0, 0)
-    obj = torch.zeros(_obj_shape(sep, sep["bs"]), dtype=sep["obj_dtype"], device=device)
-    one_per_layer = torch.tensor(
-        [int(pair[0].data_ptr()) for pair in sep["layers"]],
-        dtype=torch.int64,
-        device=device,
-    )
-    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
-        _transfer(
-            one_per_layer,
-            [int(obj.data_ptr())],
-            torch.tensor([0], dtype=torch.int64, device=device),
-            device,
-            D2H,
-            sep["desc"],
-            sep["bs"],
-            sep["fmt"],
-        )
 
 
 @requires_npu
