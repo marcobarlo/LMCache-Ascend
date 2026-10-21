@@ -127,3 +127,40 @@ opaque logical page after a sub-paged attention edit. Address calculation
 is the same in both cases.
 
 The table must live on the NPU.
+
+## 7. Format 2 is a temporary bridge (not the long-term hybrid layout)
+
+Format **2** (`NL_X_NB_TWO_BS_NH_HS`) treats axis 1 as two equal slabs and
+copies them with `plane_engine_base_offset_bytes`. That matches **semantic
+K/V** on a fused flash-style cache and the **synthetic sub-paged attention
+view** LMCache builds for MP parity, but it does **not** describe the bytes
+inside vLLM-Ascend's hybrid interleaved page.
+
+On vLLM-Ascend v0.30 hybrid stacks, the runner still owns the physical
+layout. See `vllm_ascend/worker/model_runner_v1.py`,
+`_reshape_kv_cache_tensors` (from ~4351): when `use_hybrid_blocks` is set
+(~3856, ~4559), attention layers use kernel block sizes from
+`get_supported_kernel_block_sizes` / `get_kv_cache_shape`, then expose
+`(k_cache, v_cache)` tuple views (~4680) over the same raw allocation—not
+a single `[NB, 2, BS, NH, HS]` tensor whose axis-1 halves are independent
+K and V planes.
+
+**Implication:** Ascend MP block transfer for hybrid interleaved attention
+should move to a dedicated engine format (proposed **18**) rather than
+stretching format 2 forever.
+
+**Proposed format 18 (sketch):**
+
+- `kv_size == 1`, `num_planes == 1`, one `data_ptr()` per layer (`nl`
+  pointers), same scheduling as format **17** (one work item per
+  `(layer, block)`).
+- One opaque byte span per logical page (interleaved K/V as the runner
+  laid it out), copied in one shot to the matching LMC row—no
+  `plane_engine_base_offset_bytes`, no `one_pointer_per_layer` special
+  case in the device kernel.
+- LMCache registration would follow the real page width from the runner
+  instead of reinterpreting axis 1 of a format-2 tensor.
+
+Until format 18 exists upstream, format **2** on Ascend remains the
+supported bridge: `nl` pointer table, host `prepare_group` validation, and
+kernel offsets documented in sections 1–6 above.
