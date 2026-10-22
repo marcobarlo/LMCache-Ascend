@@ -2,13 +2,18 @@
 
 In `lmcache_driven` mode the LMCache server pulls and pushes KV cache through device IPC handles: the engine submits a lookup/retrieve request, and the server performs the data movement on the engine's behalf. This mode supports standard GQA/MHA layouts as well as vLLM **MLA/DSA multi-plane** packed KV (`(latent, scale)` layouts) and is the required mode for DeepSeek-V4.
 
-> **Important — `--chunk-size 4096` is a DeepSeek-V4 requirement, not a general one.** DeepSeek-V4's packed MLA/DSA KV layout is designed for 4096-token chunks, and the connector expects this size for that model family. Other models with a single KV-cache format (GQA/MHA, e.g. Qwen) do not need 4096 and can use a different chunk size (for example 128, which matches the vLLM block size). Do not apply the 4096 value to other models, and do not run DeepSeek-V4 with any other value.
+## Configuration constraints
 
-Hybrid Mamba models (for example Qwen3.5, Qwen3.6, and Qwen3.8) are also served in this mode. The flags they share with the [LMCache recipe](https://docs.lmcache.ai/recipes/qwen3_5.html) are `--mamba-cache-mode align`, `--enable-prefix-caching`, `--separate-object-groups`, and `LMCacheMPConnector` with `kv_role: kv_both`. CacheBlend and CacheGen stay unsupported there as well. The DeepSeek command below (`--chunk-size 4096`) and the dense Qwen command in the repository README (`--chunk-size 128`) are different families. Where the hybrid recipe itself differs on Ascend:
+This section lists the configuration constraints for each model. Refer to [LMCache recipes](https://docs.lmcache.ai/recipes) for a complete list of recipes.
 
-- **Chunk size.** The LMCache page sets `--chunk-size` to vLLM's unified block size and lists the sizes measured on one CUDA GPU: 784 for the 27B models and 544 for Qwen3.5-0.8B. Those figures are aligned to CUDA's 16-token attention kernel block. Ascend attention uses a 128-token block, and vLLM logs the block it selected (`Setting attention block size to N tokens to ensure that attention page size is >= mamba page size.`). `--chunk-size` is that `N`, and `--max-num-batched-tokens` is `2N - 1`. Do not pass `--block-size`. On vLLM-Ascend v0.30, Qwen3.8-27B logs 896. On v0.23 the same model logs 1536, because that release sizes the block with a different rule in `vllm_ascend/patch/platform/patch_mamba_config.py`. A chunk that is not a multiple of `N` is rejected at connector startup. The mechanism and the other measured models are in [qwen3_5.md](qwen3_5.md).
-- **L1.** `--l1-size-gb 100` in the LMCache example is not an Ascend requirement. On Qwen3.8-27B at TP2, LongBench qasper evicted a 16 GB pool during the first pass and held the second pass in 64 GB. Tensor parallel does not split that pool: every rank writes the same L1.
-- **Transfer mode.** `engine_driven` does not support this family. On NPU an unset mode already resolves to `lmcache_driven`, and the server address defaults to `localhost:5555`. Pass `lmcache.mp.host`, `lmcache.mp.port`, and `lmcache.mp.mp_transfer_mode` only when those defaults are wrong.
+**Model/ model family:**
+
+- **DeepSeek-V4.** `--chunk-size 4096` is a DeepSeek-V4 requirement, not a general one. DeepSeek-V4's packed MLA/DSA KV layout is designed for 4096-token chunks, and the connector expects this size for that model family.
+- **Dense GQA/MHA (for example Qwen).** Models with a single KV-cache format do not need 4096 and can use a different chunk size (for example 128, which matches the vLLM block size).
+- **Hybrid Mamba models (for example Qwen3.5, Qwen3.6, and Qwen3.8).** Served in this mode. Use the [LMCache recipe](https://docs.lmcache.ai/recipes/qwen3_5.html) for `--mamba-cache-mode align`, `--enable-prefix-caching`, `--separate-object-groups`, and `LMCacheMPConnector` with `kv_role: kv_both`. CacheBlend and CacheGen stay unsupported. `--mamba-cache-mode all` is not supported.
+  - Leave `--block-size` unset. Set `--chunk-size` and `--max-num-batched-tokens` from the table in [qwen3_5.md](qwen3_5.md) for your model and vLLM-Ascend version. Do not copy the chunk size from the CUDA recipe.
+  - If you set `--block-size`, change the cache dtype, or enable speculative decoding, that table does not apply. `--chunk-size` is the block size vLLM prints at startup (`Setting attention block size to ...`), and `--max-num-batched-tokens` is `2N - 1`.
+  - `--l1-size-gb` has no fixed value. Every rank stores a full copy of the pool.
 
 ## 1. Environment Preparation
 
