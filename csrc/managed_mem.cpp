@@ -1,20 +1,21 @@
 #include "managed_mem.h"
+#include "driver/ascend_hal.h"
+#include "driver/ascend_hal_define.h"
 #include <acl/acl.h>
+#include <dlfcn.h>
+#include <iostream>
+#include <string>
+#include <sys/mman.h>
+
 // Only required for old driver version (look at registerHostPtr)
 #ifdef PROF_ERROR
 // You can add a pragma message to see this in your build log if you want:
 // #pragma message("Undefining PROF_ERROR from ascend_hal.h before NPU headers")
 #undef PROF_ERROR
 #endif
-#include "driver/ascend_hal.h"
-#include "driver/ascend_hal_define.h"
-#include <dlfcn.h>
-#include <iostream>
-#include <string>
-#include <sys/mman.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 
-#include "exception.h"
-#include "framework_hal.h"
+#include "torch/extension.h"
 
 namespace lmc {
 // Signatures for internal helper functions
@@ -48,7 +49,7 @@ void HostRegisteredMemoryManager::unregisterAll() {
 RegisteredMemoryRecord *HostRegisteredMemoryManager::registerHostPtr(
     void *hostPtr, size_t bufferSize) { // torch::Tensor& tensor){
 
-  LMCACHE_ASCEND_CHECK(
+  TORCH_CHECK(
       !(hostPtr == nullptr || bufferSize == 0),
       "Error: hostPtr cannot be null and bufferSize must be greater than 0.");
   const std::unique_lock<std::shared_mutex> guard(this->mux);
@@ -80,16 +81,15 @@ RegisteredMemoryRecord *HostRegisteredMemoryManager::registerHostPtr(
 RegisteredMemoryRecord *
 HostRegisteredMemoryManager::registerMappedMem(void *hostPtr, void *devPtr,
                                                size_t bufferSize) {
-  LMCACHE_ASCEND_CHECK(
+  TORCH_CHECK(
       !(hostPtr == nullptr || devPtr == nullptr || bufferSize == 0),
       "Error: hostPtr and devPtr cannot be null and bufferSize must be greater "
       "than 0.");
   const std::unique_lock<std::shared_mutex> guard(this->mux);
 
   // Check if the host pointer is already registered
-  LMCACHE_ASCEND_CHECK(
-      !(this->allocatedMap.count(hostPtr)),
-      "Error: hostPtr already registered to host memory manager.");
+  TORCH_CHECK(!(this->allocatedMap.count(hostPtr)),
+              "Error: hostPtr already registered to host memory manager.");
 
   this->allocatedMap.emplace(
       hostPtr, RegisteredMemoryRecord{reinterpret_cast<uintptr_t>(hostPtr),
@@ -107,8 +107,7 @@ HostRegisteredMemoryManager::halRegisterHostPtr(void *hostPtr,
                                                 size_t bufferSize) {
   // We allocate a new chunk of memory, register it, and replace the tensor.
   // Essentially, the halHostRegister function requires a ptr given by mmap.
-  LMCACHE_ASCEND_CHECK((bufferSize >= 0),
-                       "Error: bufferSize must be greater than 0.");
+  TORCH_CHECK((bufferSize >= 0), "Error: bufferSize must be greater than 0.");
   const std::unique_lock<std::shared_mutex> guard(this->mux);
 
   void *devPtr;
@@ -131,13 +130,13 @@ HostRegisteredMemoryManager::halRegisterHostPtr(void *hostPtr,
     auto ret = halHostUnregisterEx(reinterpret_cast<void *>(hostPtr),
                                    static_cast<UINT32>(device),
                                    HOST_MEM_MAP_DEV_PCIE_TH);
-    LMCACHE_ASCEND_CHECK(
+    TORCH_CHECK(
         ret == 0,
         "Unable to pin host memory, unable to unregister. Error code: " +
             std::to_string(ret))
     auto mret = munmap(reinterpret_cast<void *>(hostPtr), bufferSize);
-    LMCACHE_ASCEND_CHECK(false, "Unable to pin host memory with error code: " +
-                                    std::to_string(lockErr))
+    TORCH_CHECK(false, "Unable to pin host memory with error code: " +
+                           std::to_string(lockErr))
   }
 
   this->allocatedMap.emplace(
@@ -150,7 +149,7 @@ HostRegisteredMemoryManager::halRegisterHostPtr(void *hostPtr,
 };
 
 int HostRegisteredMemoryManager::aclUnregisterHostPtr(void *hostPtr) {
-  LMCACHE_ASCEND_CHECK(hostPtr != nullptr, "Error: hostPtr cannot be null.");
+  TORCH_CHECK(hostPtr != nullptr, "Error: hostPtr cannot be null.");
 
   // we don't actually mind if it doesn't unregister,
   // at context destroy it should be unregister anyway.
@@ -165,7 +164,7 @@ int HostRegisteredMemoryManager::aclUnregisterHostPtr(void *hostPtr) {
 };
 
 int HostRegisteredMemoryManager::halUnregisterHostPtr(void *hostPtr) {
-  LMCACHE_ASCEND_CHECK(hostPtr != nullptr, "Error: hostPtr cannot be null.");
+  TORCH_CHECK(hostPtr != nullptr, "Error: hostPtr cannot be null.");
   const std::unique_lock<std::shared_mutex> guard(this->mux);
   if (this->allocatedMap.count(hostPtr) == 0) {
     // we probably did not register anyway
@@ -234,8 +233,8 @@ std::string get_driver_version() {
 
   handle = dlopen("libdrvdsmi_host.so", RTLD_LAZY);
   if (!handle) {
-    LMCACHE_ASCEND_CHECK(
-        false, std::string("Error opening libdrvdsmi_host.so: ") + dlerror());
+    TORCH_CHECK(false,
+                std::string("Error opening libdrvdsmi_host.so: ") + dlerror());
     return result;
   }
   dlerror();
@@ -245,13 +244,13 @@ std::string get_driver_version() {
   const char *dlsym_error = dlerror();
   if (dlsym_error) {
     dlclose(handle);
-    LMCACHE_ASCEND_CHECK(
-        false, std::string("Error loading dsmi_get_version: ") + dlsym_error);
+    TORCH_CHECK(false,
+                std::string("Error loading dsmi_get_version: ") + dlsym_error);
     return result;
   }
 
   // Call the function
-  int device_id = framework_hal::GetDeviceIdx();
+  int device_id = c10_npu::getCurrentNPUStream().device_index();
   const unsigned int buffer_size = 256;
   std::vector<char> version_buffer(buffer_size);
   unsigned int ret_len = 0;
@@ -262,12 +261,12 @@ std::string get_driver_version() {
       version_buffer[ret_len] = '\0'; // Ensure null-termination
       result = version_buffer.data();
     } else {
-      LMCACHE_ASCEND_CHECK(false, "Error: Invalid length returned: " +
-                                      std::to_string(ret_len));
+      TORCH_CHECK(false,
+                  "Error: Invalid length returned: " + std::to_string(ret_len));
     }
   } else {
-    LMCACHE_ASCEND_CHECK(false, "Error: dsmi_get_version returned " +
-                                    std::to_string(ret));
+    TORCH_CHECK(false,
+                "Error: dsmi_get_version returned " + std::to_string(ret));
   }
 
   dlclose(handle);
@@ -297,7 +296,7 @@ bool is_version_at_least_25(const std::string &version_str) {
 }
 
 int get_device() {
-  int device = framework_hal::GetDeviceIdx();
+  int device = c10_npu::getCurrentNPUStream().device_index();
   const char *env_visible_devices_p = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
   // If we are using a custom list of visible devices, the index refers to that
   if (env_visible_devices_p != nullptr) {
@@ -346,7 +345,7 @@ void hal_host_unregister_ptr(void *ptr) {
  */
 void *register_ptr(void *ptr, size_t size) {
   // assumed this is a host ptr
-  LMCACHE_ASCEND_CHECK(ptr != nullptr, "ptr is a nullptr.");
+  TORCH_CHECK(ptr != nullptr, "ptr is a nullptr.");
   auto &hmm = lmc::HostRegisteredMemoryManager::GetInstance();
   std::string verString = lmc::get_driver_version();
   lmc::RegisteredMemoryRecord *record;
@@ -366,8 +365,8 @@ void *register_ptr(void *ptr, size_t size) {
 }
 
 void *register_mapping(void *hostPtr, void *devPtr, size_t size) {
-  LMCACHE_ASCEND_CHECK(hostPtr != nullptr, "hostPtr is a nullptr.");
-  LMCACHE_ASCEND_CHECK(devPtr != nullptr, "devPtr is a nullptr.");
+  TORCH_CHECK(hostPtr != nullptr, "hostPtr is a nullptr.");
+  TORCH_CHECK(devPtr != nullptr, "devPtr is a nullptr.");
   auto &hmm = lmc::HostRegisteredMemoryManager::GetInstance();
   lmc::RegisteredMemoryRecord *record =
       hmm.registerMappedMem(hostPtr, devPtr, size);
@@ -380,7 +379,7 @@ void *register_mapping(void *hostPtr, void *devPtr, size_t size) {
 }
 
 int unregister_ptr(void *ptr) {
-  LMCACHE_ASCEND_CHECK(ptr != nullptr, "ptr is a nullptr.");
+  TORCH_CHECK(ptr != nullptr, "ptr is a nullptr.");
   auto &hmm = lmc::HostRegisteredMemoryManager::GetInstance();
   std::string verString = lmc::get_driver_version();
   if (lmc::is_version_at_least_25(verString)) {

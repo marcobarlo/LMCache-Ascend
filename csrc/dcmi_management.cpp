@@ -1,6 +1,6 @@
 #include "dcmi_management.h"
 #include "dlfcn.h"
-#include "exception.h"
+#include "torch/extension.h"
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -12,11 +12,11 @@ using initFunc = int (*)(void);
 
 DCMIManager::DCMIManager() {
   this->libHandle_ = dlopen("libdcmi.so", RTLD_LAZY | RTLD_GLOBAL);
-  LMCACHE_ASCEND_CHECK(this->libHandle_ != nullptr, "dlopen libdcmi.so failed");
+  TORCH_CHECK(this->libHandle_ != nullptr, "dlopen libdcmi.so failed");
   auto init_func =
       reinterpret_cast<initFunc>(dlsym(this->libHandle_, "dcmi_init"));
   auto ret = init_func();
-  LMCACHE_ASCEND_CHECK(ret == 0, "dcmi_init failed, ret = ", ret);
+  TORCH_CHECK(ret == 0, "dcmi_init failed, ret = ", ret);
 };
 
 DCMIManager::~DCMIManager() {
@@ -30,8 +30,7 @@ std::string DCMIManager::getDevicePcieInfoV2(int cardId, int deviceId,
   auto func = reinterpret_cast<pcieInfoV2Func>(
       dlsym(this->libHandle_, "dcmi_get_device_pcie_info_v2"));
   auto ret = func(cardId, deviceId, pcieInfo);
-  LMCACHE_ASCEND_CHECK(ret == 0,
-                       "dcmi_get_device_pcie_info_v2 failed, ret = ", ret);
+  TORCH_CHECK(ret == 0, "dcmi_get_device_pcie_info_v2 failed, ret = ", ret);
   std::ostringstream oss;
   oss << std::setfill('0') << std::hex << std::setw(4) << pcieInfo->domain
       << ":" << std::setw(2) << pcieInfo->bdf_busId << ":" << std::setw(2)
