@@ -114,16 +114,42 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
               (separate ? 2 : 1), " for format ",
               static_cast<int>(engine_kv_format), ", got ", sd.kv_size);
 
-  // Both supported formats must carry explicit plane geometry filled at
-  // registration (num_planes == 0 is the "unfilled" sentinel).
+  // Format 2 is one [NB, 2, BS, NH, HS] tensor. The scalar descriptor
+  // fixes both plane addresses, so fill them here.
+  if (fmt2) {
+    const int64_t row =
+        checked_mul(checked_mul(static_cast<int64_t>(sd.nh), sd.hs, "nh * hs"),
+                    sd.element_size, "format 2 row bytes");
+    const int64_t half = checked_mul(sd.bs, row, "format 2 half page");
+    const int64_t tight_elems = checked_mul(
+        int64_t{2},
+        checked_mul(sd.bs,
+                    checked_mul(static_cast<int64_t>(sd.nh), sd.hs, "nh * hs"),
+                    "bs * nh * hs"),
+        "format 2 tight block elems");
+    const int64_t block_elems =
+        sd.block_stride_elems > 0 ? sd.block_stride_elems : tight_elems;
+    const int64_t block_bytes = checked_mul(block_elems, sd.element_size,
+                                            "format 2 block stride bytes");
+    sd.num_planes = 2;
+    sd.plane_slot_bytes[0] = sd.plane_slot_bytes[1] = row;
+    sd.plane_block_stride_bytes[0] = sd.plane_block_stride_bytes[1] =
+        block_bytes;
+    sd.plane_engine_base_offset_bytes[0] = 0;
+    sd.plane_engine_base_offset_bytes[1] = half;
+  }
+
+  // Formats 16/17 must carry explicit plane geometry filled at registration
+  // (num_planes == 0 is the "unfilled" sentinel). Format 2 is filled above.
   TORCH_CHECK(sd.num_planes >= 1 && sd.num_planes <= kvcache_ops::kMaxPlanes,
               "num_planes must be in [1, ", kvcache_ops::kMaxPlanes,
               "] (explicit plane geometry from registration), got ",
               sd.num_planes);
   if (separate) {
-    TORCH_CHECK(sd.num_planes == 2,
-                "separate-plane formats require exactly 2 physical planes, got ",
-                sd.num_planes);
+    TORCH_CHECK(
+        sd.num_planes == 2,
+        "separate-plane formats require exactly 2 physical planes, got ",
+        sd.num_planes);
   }
   if (fmt17) {
     TORCH_CHECK(sd.nh == 1,
@@ -196,7 +222,8 @@ PreparedGroup prepare_group(const PageBufferShapeDesc &shape_desc,
     prefix = checked_add(prefix, payload, "LMC row prefix sum");
   }
   if (fmt2) {
-    TORCH_CHECK(sd.plane_block_stride_bytes[0] == sd.plane_block_stride_bytes[1],
+    TORCH_CHECK(sd.plane_block_stride_bytes[0] ==
+                    sd.plane_block_stride_bytes[1],
                 "format 2 planes must share one block stride, got ",
                 sd.plane_block_stride_bytes[0], " and ",
                 sd.plane_block_stride_bytes[1]);

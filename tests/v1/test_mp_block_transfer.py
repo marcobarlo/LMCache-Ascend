@@ -21,7 +21,6 @@ import torch
 # First Party
 from lmcache_ascend.v1.shape_desc import (
     attach_tuple_block_strides,
-    attach_tuple_engine_base_offsets,
     attach_tuple_planes,
 )
 import lmcache_ascend.c_ops as lmc_ops
@@ -57,7 +56,6 @@ def _shape_desc(
     block_stride_elems: int = 0,
     plane_slot_bytes: tuple[int, ...] | None = None,
     plane_block_stride_bytes: tuple[int, ...] | None = None,
-    plane_engine_base_offset_bytes: tuple[int, ...] | None = None,
 ) -> object:
     desc = lmc_ops.PageBufferShapeDesc()
     desc.kv_size = kv_size
@@ -73,8 +71,6 @@ def _shape_desc(
         attach_tuple_planes(desc, plane_slot_bytes)
     if plane_block_stride_bytes is not None:
         attach_tuple_block_strides(desc, plane_block_stride_bytes)
-    if plane_engine_base_offset_bytes is not None:
-        attach_tuple_engine_base_offsets(desc, plane_engine_base_offset_bytes)
     return desc
 
 
@@ -106,17 +102,13 @@ def _assert_pointer_table_contract(spec: dict[str, Any]) -> None:
     nl = spec["nl"]
     fmt = spec["fmt"]
     if fmt == FUSED_KV_FMT:
+        # Format 2 leaves plane offsets unset. prepare_group derives
+        # (0, bs * nh * hs * element_size) from the scalar descriptor.
         assert table.numel() == nl
-        fused = spec["fused_layers"][0]
-        base = int(fused.data_ptr())
-        expected = tuple(
-            int(plane.data_ptr()) - base for layer in spec["layers"] for plane in layer
-        )[:2]
-        assert tuple(desc.plane_engine_base_offset_bytes) == expected
+        assert int(desc.num_planes) == 0
         return
     if fmt == SEP_KV_FMT:
         assert table.numel() == nl * int(desc.num_planes)
-        assert tuple(desc.plane_engine_base_offset_bytes) == (0, 0)
         return
     if fmt == KG0_FMT and int(desc.num_planes) > 0:
         assert table.numel() == nl * int(desc.num_planes)
@@ -482,18 +474,15 @@ def _fused_kv_page_spec(
     layers: Sequence[Any],
     fused_layers: Sequence[torch.Tensor],
     block_stride_elems: int,
-    plane_slot_bytes: tuple[int, int],
-    plane_block_stride_bytes: tuple[int, int],
     obj_width: int,
     storages: Sequence[torch.Tensor] | None = None,
     prefix_elems: int = 0,
 ) -> dict[str, Any]:
-    """Register one fused page per layer: one base pointer, planes via offsets."""
-    base = int(fused_layers[0].data_ptr())
-    offsets = (
-        int(layers[0][0].data_ptr()) - base,
-        int(layers[0][1].data_ptr()) - base,
-    )
+    """Register one fused page per layer: one base pointer, planes via offsets.
+
+    Plane arrays stay empty. ``prepare_group`` derives them from ``bs``,
+    ``nh``, ``hs``, ``element_size``, and ``block_stride_elems``.
+    """
     spec = dict(
         fmt=FUSED_KV_FMT,
         desc=_shape_desc(
@@ -505,9 +494,6 @@ def _fused_kv_page_spec(
             hs=hs,
             dtype=dtype,
             block_stride_elems=block_stride_elems,
-            plane_slot_bytes=plane_slot_bytes,
-            plane_block_stride_bytes=plane_block_stride_bytes,
-            plane_engine_base_offset_bytes=offsets,
         ),
         layers=layers,
         fused_layers=fused_layers,
@@ -579,8 +565,6 @@ def _build(
             layers=layers,
             fused_layers=fused_layers,
             block_stride_elems=page_elems if padded else 0,
-            plane_slot_bytes=(hidden * 2, hidden * 2),
-            plane_block_stride_bytes=(page_elems * 2, page_elems * 2),
             obj_width=hidden,
             storages=storages,
             prefix_elems=prefix,
@@ -593,7 +577,6 @@ def _build(
         bs = bs or 1024
         hs = 256 if layout == "interleaved_attn_tp4" else 1024
         dtype = torch.bfloat16
-        elem = torch.empty((), dtype=dtype).element_size()
         page_elems = 2 * bs * hs
         prefix = 64 if padded else 0
         fused_layers, layers, storages = [], [], []
@@ -611,7 +594,6 @@ def _build(
             fused_layers.append(fused)
             layers.append((fused[:, 0], fused[:, 1]))
             storages.append(storage)
-        page_bytes = page_elems * elem
         spec = _fused_kv_page_spec(
             dtype=dtype,
             nl=nl,
@@ -622,15 +604,9 @@ def _build(
             layers=layers,
             fused_layers=fused_layers,
             block_stride_elems=0,
-            plane_slot_bytes=(hs * elem, hs * elem),
-            plane_block_stride_bytes=(page_bytes, page_bytes),
             obj_width=hs,
             storages=storages,
             prefix_elems=prefix,
-        )
-        assert tuple(spec["desc"].plane_engine_base_offset_bytes) == (
-            0,
-            page_bytes // 2,
         )
         return spec
     if layout == "sep_kv":

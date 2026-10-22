@@ -122,11 +122,15 @@ format **17**).
 
 **One pointer per layer with multiple planes:** `ptrs[layer]` only (`nl`
 entries). Plane `p` is reached at
-`ptrs[layer] + plane_engine_base_offset_bytes[p]`, with offsets
-`plane.data_ptr() - layer.data_ptr()`. A nonzero `storage_offset` on the
-layer tensor is already folded into the base pointer. The planes are
-equal-width slabs inside one engine tensor (for example axis-1 halves of a
-5D cache, enum format **2**). They may be semantic K and V, or the first
+`ptrs[layer] + plane_engine_base_offset_bytes[p]`. For format **2**,
+`prepare_group` derives those offsets from the scalar descriptor: plane 0
+is `0`, plane 1 is
+`bs * nh * hs * element_size`, and both planes share
+`block_stride_elems * element_size` (or the tight
+`2 * bs * nh * hs * element_size` when `block_stride_elems` is 0). A
+nonzero `storage_offset` on the layer tensor is already folded into the
+base pointer. The planes are equal-width slabs inside one engine tensor
+(axis-1 halves of a 5D cache). They may be semantic K and V, or the first
 and second halves of an opaque logical page after a sub-paged attention
 edit; address calculation is the same.
 

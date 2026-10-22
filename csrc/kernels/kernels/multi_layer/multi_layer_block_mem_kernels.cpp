@@ -106,9 +106,9 @@ private:
     return max_row;
   }
 
-  // one_pointer_per_layer_: ptrs[layer] plus planes[p].engine_base_offset_bytes.
-  // Otherwise ptrs[layer * num_planes + plane] (each view's storage_offset
-  // is already in the stored pointer).
+  // one_pointer_per_layer_: ptrs[layer] plus
+  // planes[p].engine_base_offset_bytes. Otherwise ptrs[layer * num_planes +
+  // plane] (each view's storage_offset is already in the stored pointer).
   __aicore__ inline __gm__ uint8_t* ResolveEnginePlanePtr(int32_t layer,
                                                           int32_t plane) const {
     const int64_t index =

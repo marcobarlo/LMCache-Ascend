@@ -52,9 +52,8 @@ struct PageBufferShapeDesc {
   int hs;
   int element_size;
   int block_stride_elems;
-  // Ascend-only: physical plane count per layer, filled at registration for
-  // both supported formats (16/17). >0 = validated geometry, doubles as the
-  // "fields complete" sentinel (no separate protocol version); 0 = unfilled,
+  // Ascend-only plane count. Formats 16/17 set it at registration.
+  // prepare_group sets it to 2 for format 2. Unset 16/17 stays 0 and is
   // rejected at group prepare.
   int32_t num_planes = 0;
   // Per-plane payload bytes per token slot (64-bit byte addressing). The
