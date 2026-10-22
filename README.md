@@ -105,10 +105,11 @@ The server address defaults to `localhost:5555` on both sides; on NPU the transf
 
 For the `engine_driven` transfer mode (workers copy KV from a named SHM pool), see [docs/mp_mode/engine_driven.md](docs/mp_mode/engine_driven.md).
 
-> **Mamba / GDN models (e.g. Qwen3.5-27B) are not supported with `LMCacheMPConnector`.** Use in-process `LMCacheAscendConnectorV1Dynamic` instead. Details: [docs/mp_mode/README.md#supported-models-and-limitations](docs/mp_mode/README.md#supported-models-and-limitations).
+> **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrids** use `lmcache_driven` and a chunk size taken from the vLLM-Ascend log, not the CUDA table in the LMCache recipe. See [docs/mp_mode/qwen3_5.md](docs/mp_mode/qwen3_5.md). `engine_driven` does not support this family.
 
 ## Documentation
 
 - [docs/mp_mode/README.md](docs/mp_mode/README.md) — MP mode overview.
 - [docs/mp_mode/lmcache_driven.md](docs/mp_mode/lmcache_driven.md) — `lmcache_driven` full deployment guide (environment preparation, container, installation, server, vLLM, verification).
 - [docs/mp_mode/engine_driven.md](docs/mp_mode/engine_driven.md) — `engine_driven` deployment guide (Qwen3 example).
+- [docs/mp_mode/qwen3_5.md](docs/mp_mode/qwen3_5.md) — Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid recipe, and where Ascend differs from the LMCache recipe.

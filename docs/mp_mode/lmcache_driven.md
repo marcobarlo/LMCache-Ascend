@@ -2,7 +2,7 @@
 
 In `lmcache_driven` mode the LMCache server pulls and pushes KV cache through device IPC handles: the engine submits a lookup/retrieve request, and the server performs the data movement on the engine's behalf. This mode supports standard GQA/MHA layouts as well as vLLM **MLA/DSA multi-plane** packed KV (`(latent, scale)` layouts) and is the required mode for DeepSeek-V4.
 
-> **Not supported — Mamba / GDN hybrids (for example Qwen3.5-27B).** MP mode does not support models with vLLM `MambaSpec` state that must be snapshotted for reuse. Those models fail LMCache KV group validation at startup. Use the in-process Ascend connector for single-process serving, or see [README.md](README.md#supported-models-and-limitations).
+> **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrids** are served in this mode. Use the LMCache recipe, with the Ascend chunk size from the vLLM log: [qwen3_5.md](qwen3_5.md).
 
 > **Important — `--chunk-size 4096` is a DeepSeek-V4 requirement, not a general one.** DeepSeek-V4's packed MLA/DSA KV layout is designed for 4096-token chunks, and the connector expects this size for that model family. Other models with a single KV-cache format (GQA/MHA, e.g. Qwen) do not need 4096 and can use a different chunk size (for example 128, which matches the vLLM block size). Do not apply the 4096 value to other models, and do not run DeepSeek-V4 with any other value.
 
