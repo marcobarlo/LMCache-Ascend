@@ -105,8 +105,6 @@ The server address defaults to `localhost:5555` on both sides; on NPU the transf
 
 For the `engine_driven` transfer mode (workers copy KV from a named SHM pool), see [docs/mp_mode/engine_driven.md](docs/mp_mode/engine_driven.md).
 
-> **Hybrid Mamba models** (for example Qwen3.5, Qwen3.6, and Qwen3.8) use `lmcache_driven`. The chunk size is the attention block size vLLM-Ascend prints at startup. See [docs/mp_mode/qwen3_5.md](docs/mp_mode/qwen3_5.md). `engine_driven` does not support this family.
-
 ## Documentation
 
 - [docs/mp_mode/README.md](docs/mp_mode/README.md) — MP mode overview.
