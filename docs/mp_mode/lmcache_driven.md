@@ -2,9 +2,18 @@
 
 In `lmcache_driven` mode the LMCache server pulls and pushes KV cache through device IPC handles: the engine submits a lookup/retrieve request, and the server performs the data movement on the engine's behalf. This mode supports standard GQA/MHA layouts as well as vLLM **MLA/DSA multi-plane** packed KV (`(latent, scale)` layouts) and is the required mode for DeepSeek-V4.
 
-> **Not supported — Mamba / GDN hybrids (for example Qwen3.5-27B).** MP mode does not support models with vLLM `MambaSpec` state that must be snapshotted for reuse. Those models fail LMCache KV group validation at startup. Use the in-process Ascend connector for single-process serving, or see [README.md](README.md#supported-models-and-limitations).
+## Configuration constraints
 
-> **Important — `--chunk-size 4096` is a DeepSeek-V4 requirement, not a general one.** DeepSeek-V4's packed MLA/DSA KV layout is designed for 4096-token chunks, and the connector expects this size for that model family. Other models with a single KV-cache format (GQA/MHA, e.g. Qwen) do not need 4096 and can use a different chunk size (for example 128, which matches the vLLM block size). Do not apply the 4096 value to other models, and do not run DeepSeek-V4 with any other value.
+This section lists the configuration constraints for each model. Refer to [LMCache recipes](https://docs.lmcache.ai/recipes) for a complete list of recipes.
+
+**Model/ model family:**
+
+- **DeepSeek-V4.** `--chunk-size 4096` is a DeepSeek-V4 requirement, not a general one. DeepSeek-V4's packed MLA/DSA KV layout is designed for 4096-token chunks, and the connector expects this size for that model family.
+- **Dense GQA/MHA (for example Qwen).** Models with a single KV-cache format do not need 4096 and can use a different chunk size (for example 128, which matches the vLLM block size).
+- **Hybrid Mamba models (for example Qwen3.5, Qwen3.6, and Qwen3.8).** Served in this mode. Use the [LMCache recipe](https://docs.lmcache.ai/recipes/qwen3_5.html) for `--mamba-cache-mode align`, `--enable-prefix-caching`, `--separate-object-groups`, and `LMCacheMPConnector` with `kv_role: kv_both`. CacheBlend and CacheGen stay unsupported. `--mamba-cache-mode all` is not supported.
+  - Leave `--block-size` unset. Set `--chunk-size` and `--max-num-batched-tokens` from the table in [qwen3_5.md](qwen3_5.md) for your model and vLLM-Ascend version. Do not copy the chunk size from the CUDA recipe.
+  - If you set `--block-size`, change the cache dtype, or enable speculative decoding, that table does not apply. `--chunk-size` is the block size vLLM prints at startup (`Setting attention block size to ...`), and `--max-num-batched-tokens` is `2N - 1`.
+  - `--l1-size-gb` has no fixed value. Every rank stores a full copy of the pool.
 
 ## 1. Environment Preparation
 
