@@ -33,6 +33,9 @@ requires_npu = pytest.mark.skipif(
 KG0_FMT = native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS
 NH_CS_FMT = native.EngineKVFormat.NL_X_NB_BS_NH_CS
 SEP_KV_FMT = native.EngineKVFormat.NL_X_TWO_X_NB_BS_NH_HS
+# One [NB, 2, BS, NH, HS] tensor per layer. fused_kv is semantic K then V.
+# interleaved_attn_* reuses it for the two halves of an opaque page.
+FUSED_KV_FMT = native.EngineKVFormat.NL_X_NB_TWO_BS_NH_HS
 D2H = native.TransferDirection.D2H
 H2D = native.TransferDirection.H2D
 
@@ -90,6 +93,25 @@ def _clone_engine(layers: Sequence[Any]) -> list[Any]:
 
 def _engine_nb(layers: Sequence[Any]) -> int:
     return int(_planes(layers[0])[0].shape[0])
+
+
+def _assert_pointer_table_contract(spec: dict[str, Any]) -> None:
+    """Pointer-table width and plane offsets expected per engine format."""
+    table = spec["table"]
+    desc = spec["desc"]
+    nl = spec["nl"]
+    fmt = spec["fmt"]
+    if fmt == FUSED_KV_FMT:
+        # Format 2 leaves plane offsets unset. prepare_group derives
+        # (0, bs * nh * hs * element_size) from the scalar descriptor.
+        assert table.numel() == nl
+        assert int(desc.num_planes) == 0
+        return
+    if fmt == SEP_KV_FMT:
+        assert table.numel() == nl * int(desc.num_planes)
+        return
+    if fmt == KG0_FMT and int(desc.num_planes) > 0:
+        assert table.numel() == nl * int(desc.num_planes)
 
 
 def _paged_ptr_tensor(paged: object, device: torch.device) -> torch.Tensor:
@@ -206,11 +228,6 @@ def _assert_close_or_equal(got: torch.Tensor, exp: torch.Tensor) -> None:
         assert torch.equal(got.cpu(), exp.cpu())
 
 
-def _assert_block_zero(layers: Sequence[Any], bid: int) -> None:
-    for tensor in (t for item in layers for t in _planes(item)):
-        assert torch.count_nonzero(tensor[bid]) == 0
-
-
 def _assert_block_equal(left: Sequence[Any], right: Sequence[Any], bid: int) -> None:
     for a, b in zip(left, right, strict=True):
         for ta, tb in zip(_planes(a), _planes(b), strict=True):
@@ -270,22 +287,6 @@ def _assert_d2h_object(
                 for layer, exp in enumerate(expected):
                     got = obj[layer, sl].cpu().reshape_as(exp.cpu())
                     _assert_close_or_equal(got, exp.cpu())
-
-
-def _assert_h2d_engine(
-    layers: Sequence[Any],
-    golden: Sequence[Any],
-    ids: list[int],
-    *,
-    skip: int,
-    num_objects: int,
-) -> None:
-    transferred = _transferred_block_ids(ids, num_objects, skip)
-    for bid in range(_engine_nb(layers)):
-        if bid in transferred:
-            _assert_block_equal(layers, golden, bid)
-        else:
-            _assert_block_zero(layers, bid)
 
 
 def _fill_arange(
@@ -462,6 +463,61 @@ def _kg0_planes(
     return layers, pools, stride, (stride, stride)
 
 
+def _fused_kv_page_spec(
+    *,
+    dtype: torch.dtype,
+    nl: int,
+    nb: int,
+    bs: int,
+    nh: int,
+    hs: int,
+    layers: Sequence[Any],
+    fused_layers: Sequence[torch.Tensor],
+    block_stride_elems: int,
+    obj_width: int,
+    storages: Sequence[torch.Tensor] | None = None,
+    prefix_elems: int = 0,
+) -> dict[str, Any]:
+    """Register one fused page per layer: one base pointer, planes via offsets.
+
+    Plane arrays stay empty. ``prepare_group`` derives them from ``bs``,
+    ``nh``, ``hs``, ``element_size``, and ``block_stride_elems``.
+    """
+    spec = dict(
+        fmt=FUSED_KV_FMT,
+        desc=_shape_desc(
+            kv_size=2,
+            nl=nl,
+            nb=nb,
+            bs=bs,
+            nh=nh,
+            hs=hs,
+            dtype=dtype,
+            block_stride_elems=block_stride_elems,
+        ),
+        layers=layers,
+        fused_layers=fused_layers,
+        pools=None,
+        table=torch.tensor(
+            [int(fused.data_ptr()) for fused in fused_layers],
+            dtype=torch.int64,
+            device=fused_layers[0].device,
+        ),
+        obj_dtype=dtype,
+        obj_width=obj_width,
+        kv_leading=True,
+        packed=False,
+        bs=bs,
+        nl=nl,
+        pad_width=None,
+    )
+    if prefix_elems:
+        spec["storages"] = list(storages or ())
+        spec["prefix_elems"] = prefix_elems
+    _assert_pointer_table_contract(spec)
+    return spec
+
+
 def _build(
     layout: str,
     device: torch.device,
@@ -473,6 +529,86 @@ def _build(
     with_planes: bool | None = None,
 ) -> dict[str, Any]:
     """Build engine layers + PageBufferShapeDesc for one named layout."""
+    if layout == "fused_kv":
+        # Semantic K then V in one [NB, 2, BS, NH, HS] tensor per layer.
+        # Padded mode adds a storage prefix and a tail gap inside each page.
+        nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
+        hidden = nh * hs
+        prefix = 32 if padded else 0
+        pad_elems = 16 if padded else 0
+        page_elems = 2 * bs * hidden + pad_elems
+        dtype = torch.float16
+        fused_layers, layers, storages = [], [], []
+        for i in range(nl):
+            storage = torch.full(
+                (prefix + nb * page_elems,), -1, dtype=dtype, device=device
+            )
+            fused = storage.as_strided(
+                (nb, 2, bs, nh, hs),
+                (page_elems, bs * hidden, hidden, hs, 1),
+                storage_offset=prefix,
+            )
+            fused[:, 0].copy_(_fill_arange((nb, bs, nh, hs), dtype, device, 10_000 * i))
+            fused[:, 1].copy_(
+                _fill_arange((nb, bs, nh, hs), dtype, device, 10_000 * i + 5_000)
+            )
+            fused_layers.append(fused)
+            layers.append((fused[:, 0], fused[:, 1]))
+            storages.append(storage)
+        return _fused_kv_page_spec(
+            dtype=dtype,
+            nl=nl,
+            nb=nb,
+            bs=bs,
+            nh=nh,
+            hs=hs,
+            layers=layers,
+            fused_layers=fused_layers,
+            block_stride_elems=page_elems if padded else 0,
+            obj_width=hidden,
+            storages=storages,
+            prefix_elems=prefix,
+        )
+    if layout in ("interleaved_attn_tp4", "interleaved_attn_tp1"):
+        # v0.30 opaque page: [NB, 2, 1024, 1, HS]. The two slabs are half-pages,
+        # not K and V. HS is 256 at TP4 and 1024 at TP1.
+        nl = nl or 2
+        nb = nb or 4
+        bs = bs or 1024
+        hs = 256 if layout == "interleaved_attn_tp4" else 1024
+        dtype = torch.bfloat16
+        page_elems = 2 * bs * hs
+        prefix = 64 if padded else 0
+        fused_layers, layers, storages = [], [], []
+        for i in range(nl):
+            storage = torch.full(
+                (prefix + nb * page_elems,), -1, dtype=dtype, device=device
+            )
+            pages = _fill_arange((nb, page_elems), dtype, device, 10_000 * i)
+            storage[prefix:].copy_(pages.reshape(-1))
+            fused = storage.as_strided(
+                (nb, 2, bs, 1, hs),
+                (page_elems, page_elems // 2, hs, hs, 1),
+                storage_offset=prefix,
+            )
+            fused_layers.append(fused)
+            layers.append((fused[:, 0], fused[:, 1]))
+            storages.append(storage)
+        spec = _fused_kv_page_spec(
+            dtype=dtype,
+            nl=nl,
+            nb=nb,
+            bs=bs,
+            nh=1,
+            hs=hs,
+            layers=layers,
+            fused_layers=fused_layers,
+            block_stride_elems=0,
+            obj_width=hs,
+            storages=storages,
+            prefix_elems=prefix,
+        )
+        return spec
     if layout == "sep_kv":
         nl, nb, bs, nh, hs = nl or 2, nb or 8, bs or 4, 2, 8
         hidden = nh * hs
@@ -492,7 +628,7 @@ def _build(
         ]
         stride = (bs + int(padded)) * hidden
         slot = nh * hs * 2
-        return dict(
+        spec = dict(
             fmt=SEP_KV_FMT,
             desc=_shape_desc(
                 kv_size=2,
@@ -517,6 +653,8 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout in _PACKED_PLANE_SPECS:
         plane_specs = _PACKED_PLANE_SPECS[layout]
         nl = nl or 2
@@ -529,7 +667,7 @@ def _build(
             nl=nl, nb=nb, bs=bs, plane_specs=plane_specs, device=device
         )
         row = _plane_row_bytes(plane_specs)
-        return dict(
+        spec = dict(
             fmt=KG0_FMT,
             desc=_packed_planes_desc(nl=nl, nb=nb, bs=bs, plane_specs=plane_specs),
             layers=layers,
@@ -544,6 +682,8 @@ def _build(
             nl=nl,
             pad_width=None,
         )
+        _assert_pointer_table_contract(spec)
+        return spec
     if layout in ("nh_cs", "nh_cs_fmt17", "nh_cs_padded"):
         padded_layout = layout == "nh_cs_padded" or padded
         nl = nl or 2
@@ -620,7 +760,7 @@ def _build(
     layers, pools, block_stride, plane_strides = _kg0_planes(
         nl=nl, nb=nb, bs=bs, device=device, independent=independent
     )
-    return dict(
+    spec = dict(
         fmt=KG0_FMT,
         desc=_shape_desc(
             kv_size=1,
@@ -645,6 +785,8 @@ def _build(
         nl=nl,
         pad_width=None,
     )
+    _assert_pointer_table_contract(spec)
+    return spec
 
 
 def _obj_shape(spec: dict[str, Any], chunk: int) -> tuple[int, ...]:
@@ -672,6 +814,8 @@ def _fill_src_object(spec: dict[str, Any], device: torch.device) -> torch.Tensor
             .view(torch.uint8)
         )
         return obj
+    if spec["kv_leading"]:
+        return _fill_arange((2, nl, chunk, width), spec["obj_dtype"], device, 0)
     return _fill_arange((nl, chunk, width), spec["obj_dtype"], device, 0)
 
 
@@ -701,6 +845,10 @@ def _roundtrip_cases() -> list[Any]:
     rows: list[tuple] = [
         ("sep_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "sep-kv-tight-skip"),
         ("sep_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "sep-kv-padded-skip"),
+        ("fused_kv", "npu", False, 1, 2, 2, [1, 3, 4, 6], "fused-kv-skip"),
+        ("fused_kv", "npu", True, 1, 2, 2, [1, 3, 4, 6], "fused-kv-padded"),
+        ("interleaved_attn_tp4", "npu", True, 0, 2, 1, [0, 2], "interleaved-attn-tp4"),
+        ("interleaved_attn_tp1", "npu", True, 0, 2, 1, [0, 2], "interleaved-attn-tp1"),
         ("kg0", "npu", False, 1, 2, 1, [1, 3], "kg0-npu-skip"),
         ("kg0", "npu", False, 0, 21, 2, list(range(64)), "kg0-npu-2chunk"),
         ("nh_cs_fmt17", "npu", False, 0, 2, 1, [0], "nh_cs-fmt17"),
@@ -740,12 +888,24 @@ def test_roundtrip_restores_unskipped_selected_blocks(
     block_ids: list[int],
 ) -> None:
     device = torch.device("npu:0")
-    nb = None if layout == "sep_kv" else max(32, max(block_ids) + 1)
+    nb = (
+        None
+        if layout
+        in ("sep_kv", "fused_kv", "interleaved_attn_tp4", "interleaved_attn_tp1")
+        else max(32, max(block_ids) + 1)
+    )
     spec = _build(layout, device, padded=padded, nl=nl, nb=nb)
     bs, bpo = spec["bs"], len(block_ids) // num_objects
     chunk = bpo * bs
     ids = torch.tensor(block_ids, dtype=torch.int64, device=device)
     golden = _clone_engine(spec["layers"])
+    prefix_elems = spec.get("prefix_elems") or 0
+    storages = spec.get("storages")
+    prefixes = (
+        [storage[:prefix_elems].clone() for storage in storages]
+        if storages and prefix_elems
+        else None
+    )
     with _host_objects(
         host, [_obj_shape(spec, chunk)] * num_objects, spec["obj_dtype"], device
     ) as (
@@ -767,14 +927,17 @@ def test_roundtrip_restores_unskipped_selected_blocks(
                 num_objects=num_objects,
                 kv_leading=spec["kv_leading"],
             )
-        _zero_engine(spec["layers"])
+        for bid in _transferred_block_ids(block_ids, num_objects, skip):
+            for tensor in (t for item in spec["layers"] for t in _planes(item)):
+                tensor[bid].zero_()
         _run(
             lambda: _launch(spec, spec["table"], ptrs, ids, device, H2D, chunk, skip),
             affinity=host == "affinity",
         )
-    _assert_h2d_engine(
-        spec["layers"], golden, block_ids, skip=skip, num_objects=num_objects
-    )
+    _assert_engine_equal(spec["layers"], golden)
+    if prefixes is not None:
+        for storage, prefix in zip(storages, prefixes, strict=True):
+            assert torch.equal(storage[:prefix_elems], prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1024,33 @@ def test_torch_check_raises_python_exception() -> None:
 
 
 @requires_npu
+def test_fused_kv_rejects_one_pointer_per_plane() -> None:
+    """Fused pages take one base pointer per layer, not one per K and V."""
+    device = torch.device("npu:0")
+    spec = _build("fused_kv", device, nl=2, nb=4, bs=4)
+    obj = torch.zeros(
+        _obj_shape(spec, spec["bs"]), dtype=spec["obj_dtype"], device=device
+    )
+    two_per_layer = torch.tensor(
+        [int(plane.data_ptr()) for pair in spec["layers"] for plane in pair],
+        dtype=torch.int64,
+        device=device,
+    )
+    with pytest.raises(RuntimeError, match="paged_buffer_ptrs_tensor"):
+        lmc_ops.multi_layer_block_kv_transfer(
+            two_per_layer,
+            [int(obj.data_ptr())],
+            torch.tensor([0], dtype=torch.int64, device=device),
+            device,
+            D2H,
+            spec["desc"],
+            spec["bs"],
+            spec["fmt"],
+            0,
+        )
+
+
+@requires_npu
 @pytest.mark.parametrize("direction_d2h", [True, False], ids=["d2h", "h2d"])
 def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
     device = torch.device("npu:0")
@@ -872,6 +1062,10 @@ def test_object_group_plan_matches_direct_launches(direction_d2h: bool) -> None:
         (
             _build("dsa_c8_4", device, nl=2, nb=4, bs=16),
             _build("dsa_c8_4", device, nl=2, nb=4, bs=16),
+        ),
+        (
+            _build("fused_kv", device, padded=True, nl=2, nb=4, bs=4),
+            _build("fused_kv", device, padded=True, nl=2, nb=4, bs=4),
         ),
     ]
     direction = D2H if direction_d2h else H2D
