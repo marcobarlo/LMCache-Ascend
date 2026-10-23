@@ -169,7 +169,8 @@ jobs:
         id: test-step
         shell: bash
         run: |
-          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib"
+          ASCEND_ARCH="$(uname -i)"
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${ASCEND_ARCH}-linux/devlib"
           set +e
           python3 -u -m pytest -v tests/v1 \
             --tb=short \
