@@ -3,10 +3,10 @@
 from typing import Optional
 
 # Third Party
+from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.utils import LayoutHints, need_gpu_interm_buffer
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
@@ -66,34 +66,9 @@ def CreateNPUConnector(
             )
             return conn
     elif engine == EngineType.SGLANG:
-        # First Party
-        from lmcache_ascend.v1.npu_connector.npu_connectors import (
-            SGLangLayerwiseNPUConnector,
-            SGLangNPUConnector,
+        raise NotImplementedError(
+            "SGLang NPU connectors are unsupported on LMCache dev: "
+            "SGLangGPUConnector was removed upstream."
         )
-
-        num_layer, _, chunk_size, num_kv_head, head_dim = metadata.kv_shape
-        hidden_dim_size = num_kv_head * head_dim
-        kv_dtype = metadata.kv_dtype
-
-        if config.use_layerwise:
-            conn = SGLangLayerwiseNPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
-            )
-        else:
-            conn = SGLangNPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
-            )
-        return conn
     else:
         raise RuntimeError(f"Unsupported engine type for Ascend: {engine}")

@@ -62,8 +62,8 @@ def build_llm_with_lmcache_ascend(model: str):
     finally:
         # Clean up lmcache backend
         # Third Party
+        from lmcache.inprocess.v1.cache_engine import LMCacheEngineBuilder
         from lmcache.integration.vllm.utils import ENGINE_NAME
-        from lmcache.v1.cache_engine import LMCacheEngineBuilder
 
         LMCacheEngineBuilder.destroy(ENGINE_NAME)
 

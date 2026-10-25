@@ -20,6 +20,7 @@ import time
 
 # Third Party
 from lmcache import utils
+from lmcache.inprocess.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -40,7 +41,6 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
 )
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
-from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector import GPUConnectorInterface

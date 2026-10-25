@@ -9,9 +9,9 @@ import urllib.request
 
 # Third Party
 from fastapi import APIRouter
+from lmcache.inprocess.v1.cache_engine import LMCacheEngine
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.cache_engine import LMCacheEngine
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
