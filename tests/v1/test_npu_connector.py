@@ -32,9 +32,7 @@ import lmcache_ascend.c_ops as lmc_ops
     ],
 )
 def test_layerwise_vllm_paged_connector_with_npu(use_npu, gpu_kv_format):
-    target_patch = (
-        "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
-    )
+    target_patch = "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
 
     with patch(target_patch, new=VLLMPagedMemLayerwiseNPUConnector):
         original_test_layerwise_vllm_paged_connector_with_gpu(use_npu, gpu_kv_format)
@@ -42,16 +40,16 @@ def test_layerwise_vllm_paged_connector_with_npu(use_npu, gpu_kv_format):
 
 @pytest.mark.parametrize("use_npu", [True])
 def test_batched_layerwise_vllm_paged_connector_with_npu(use_npu):
-    target_patch = (
-        "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
-    )
+    target_patch = "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
 
     with patch(target_patch, new=VLLMPagedMemLayerwiseNPUConnector):
         original_test_batched_layerwise_vllm_paged_connector_with_gpu(use_npu)
 
 
 def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
-    target_patch = "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemGPUConnectorV2"
+    target_patch = (
+        "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemGPUConnectorV2"
+    )
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
