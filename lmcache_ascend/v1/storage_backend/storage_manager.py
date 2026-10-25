@@ -64,9 +64,9 @@ no-op for missing keys instead of aborting the lookup.
 from typing import List, Optional, cast
 
 # Third Party
+from lmcache.inprocess.v1.event_manager import EventStatus, EventType
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.event_manager import EventStatus, EventType
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
