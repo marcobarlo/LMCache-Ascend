@@ -4,8 +4,8 @@
 # Standard
 from typing import Optional, Union
 
-# Third Party
-from lmcache.v1.trace_utils import emit_layer_timer, emit_request_timer
+# First Party
+from lmcache_ascend.v1.trace_utils_compat import emit_layer_timer, emit_request_timer
 
 
 def emit_timer(

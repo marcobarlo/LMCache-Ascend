@@ -55,14 +55,6 @@ from lmcache.v1.rpc.zmq_transport import (
     ZmqReqRepClientTransport,
     ZmqRouterServerTransport,
 )
-from lmcache.v1.trace_utils import (
-    advance_layerwise_storers_with_timing,
-    mask_to_string,
-    summarize_ranges,
-    summarize_slot_mapping,
-    trace_flow,
-    trace_flow_enabled,
-)
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -83,6 +75,14 @@ from lmcache_ascend.v1.npu_hole_connector import (
     VLLMBufferLayerwiseNPULegacyHoleConnector,
 )
 from lmcache_ascend.v1.timer import emit_timer
+from lmcache_ascend.v1.trace_utils_compat import (
+    advance_layerwise_storers_with_timing,
+    mask_to_string,
+    summarize_ranges,
+    summarize_slot_mapping,
+    trace_flow,
+    trace_flow_enabled,
+)
 
 if TYPE_CHECKING:
     # Third Party

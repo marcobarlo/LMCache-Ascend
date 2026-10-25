@@ -6,13 +6,17 @@ import threading
 # Third Party
 from lmcache.inprocess.v1.rpc_utils import get_zmq_rpc_path_lmcache, get_zmq_socket
 from lmcache.logging import init_logger
-from lmcache.v1.trace_utils import summarize_key, summarize_ranges, trace_flow
 import msgspec
 import zmq
 
 # First Party
 from lmcache_ascend.v1.hole_segment_utils import HoleSegmentHelper, derive_lookup_result
 from lmcache_ascend.v1.hole_types import HoleLookupResult
+from lmcache_ascend.v1.trace_utils_compat import (
+    summarize_key,
+    summarize_ranges,
+    trace_flow,
+)
 
 logger = init_logger(__name__)
 

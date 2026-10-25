@@ -23,7 +23,14 @@ import time
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.trace_utils import (
+import torch
+
+# First Party
+from lmcache_ascend.v1.blend.models.hole import infer_hole_model_from_vllm
+from lmcache_ascend.v1.hole_segment_utils import HoleSegmentHelper
+from lmcache_ascend.v1.npu_hole_connector import VLLMBufferLayerwiseNPUHoleConnector
+from lmcache_ascend.v1.timer import emit_timer as emit_trace_timer
+from lmcache_ascend.v1.trace_utils_compat import (
     mask_to_string,
     summarize_key,
     summarize_kv_tensor_stats,
@@ -32,13 +39,6 @@ from lmcache.v1.trace_utils import (
     trace_flow,
     trace_flow_enabled,
 )
-import torch
-
-# First Party
-from lmcache_ascend.v1.blend.models.hole import infer_hole_model_from_vllm
-from lmcache_ascend.v1.hole_segment_utils import HoleSegmentHelper
-from lmcache_ascend.v1.npu_hole_connector import VLLMBufferLayerwiseNPUHoleConnector
-from lmcache_ascend.v1.timer import emit_timer as emit_trace_timer
 
 logger = init_logger(__name__)
 

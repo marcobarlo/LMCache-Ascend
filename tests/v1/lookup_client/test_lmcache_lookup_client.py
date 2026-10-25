@@ -3,7 +3,7 @@
 import os
 
 # Third Party
-from lmcache_tests.v1.lookup_client.test_lmcache_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_lmcache_lookup_client import (
     TestLMCacheLookupClientServer as UpstreamLMCacheLookupClientServerTests,
 )
 import pytest

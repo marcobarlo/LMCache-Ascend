@@ -36,8 +36,8 @@ os.environ.setdefault("PYTHONHASHSEED", "2026")
 
 logger = init_logger(__name__)
 try:
-    # Third Party
-    from lmcache.v1.trace_utils import trace_flow, trace_request_selected
+    # First Party
+    from lmcache_ascend.v1.trace_utils_compat import trace_flow, trace_request_selected
 except Exception:  # pragma: no cover - tracing is optional
 
     def trace_flow(*args, **kwargs):

@@ -21,7 +21,7 @@ from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
 
 if TYPE_CHECKING:
     # Third Party
-    from lmcache.v1.cache_controller.worker import LMCacheWorker
+    from lmcache.inprocess.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
 

@@ -1,24 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 # Third Party
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestBloomFilter as UpstreamBloomFilterTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestChunkStatisticsBasic as UpstreamChunkStatisticsBasicTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestChunkStatisticsLifecycle as UpstreamChunkStatisticsLifecycleTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestChunkStatisticsMetrics as UpstreamChunkStatisticsMetricsTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestChunkStatisticsPerformance as UpstreamChunkStatsticsPerformanceTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestFileHashStrategy as UpstreamTestFileHashStrategyTests,
 )
-from lmcache_tests.v1.lookup_client.test_chunk_statistics_lookup_client import (
+from lmcache_tests.inprocess.v1.lookup_client.test_chunk_statistics_lookup_client import (
     TestStrategyDiscovery as UpstreamStrategyDiscoveryTests,
 )
 

@@ -21,7 +21,12 @@ import time
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.trace_utils import (
+import torch
+
+# First Party
+from lmcache_ascend.v1.npu_connector import VLLMBufferLayerwiseNPUConnector
+from lmcache_ascend.v1.timer import emit_timer
+from lmcache_ascend.v1.trace_utils_compat import (
     mask_to_string,
     summarize_kv_tensor_stats,
     summarize_slot_mapping,
@@ -30,11 +35,6 @@ from lmcache.v1.trace_utils import (
     trace_flow_enabled,
     trace_layer_enabled,
 )
-import torch
-
-# First Party
-from lmcache_ascend.v1.npu_connector import VLLMBufferLayerwiseNPUConnector
-from lmcache_ascend.v1.timer import emit_timer
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)

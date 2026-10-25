@@ -10,6 +10,12 @@ import time
 import uuid
 
 # Third Party
+from lmcache.inprocess.v1.cache_controller.message import (
+    BatchedP2PLookupMsg,
+    BatchedP2PLookupRetMsg,
+    ErrorMsg,
+    Msg,
+)
 from lmcache.inprocess.v1.rpc_utils import (
     DEFAULT_SOCKET_RECV_TIMEOUT_MS,
     DEFAULT_SOCKET_SEND_TIMEOUT_MS,
@@ -25,12 +31,6 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import (
     CacheEngineKey,
     start_loop_in_thread_with_exceptions,
-)
-from lmcache.v1.cache_controller.message import (
-    BatchedP2PLookupMsg,
-    BatchedP2PLookupRetMsg,
-    ErrorMsg,
-    Msg,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
@@ -65,7 +65,7 @@ from lmcache_ascend.v1.transfer_context import P2PTransferContext
 
 if TYPE_CHECKING:
     # Third Party
-    from lmcache.v1.cache_controller import LMCacheWorker
+    from lmcache.inprocess.v1.cache_controller import LMCacheWorker
 
 logger = init_logger(__name__)
 

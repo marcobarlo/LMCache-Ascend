@@ -22,13 +22,13 @@ from typing import Any
 import asyncio
 
 # Third Party
-from lmcache.logging import init_logger
-from lmcache.v1.cache_controller.message import (
+from lmcache.inprocess.v1.cache_controller.message import (
     HeartbeatMsg,
     Msg,
     WorkerReqMsg,
     WorkerReqRetMsg,
 )
+from lmcache.logging import init_logger
 import msgspec
 import zmq
 

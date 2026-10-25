@@ -13,6 +13,7 @@ import time
 # Third Party
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.inprocess.v1.token_database import TokenDatabase
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.utils import (
@@ -23,7 +24,6 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.token_database import TokenDatabase
 import torch
 
 logger = init_logger(__name__)

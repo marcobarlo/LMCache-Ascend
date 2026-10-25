@@ -3,9 +3,9 @@
 from typing import Iterable, Optional, Union
 
 # Third Party
+from lmcache.inprocess.v1.token_database import SegmentTokenDatabase
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.token_database import SegmentTokenDatabase
 import torch
 
 # First Party

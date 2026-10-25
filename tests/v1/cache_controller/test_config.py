@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: F401
 # Third Party
-from lmcache_tests.v1.cache_controller.test_config import (
+from lmcache_tests.inprocess.v1.cache_controller.test_config import (
     test_controller_monitor_ports_json_parsing,
     test_from_env,
     test_from_file,

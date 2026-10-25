@@ -5,13 +5,13 @@ from unittest.mock import patch
 
 # Third Party
 # TODO (gingfung): once we have sglang kernel, re-enable test_sglang_connector_with_gpu_and_mla
-from lmcache_tests.v1.test_gpu_connector import (
+from lmcache_tests.inprocess.v1.test_gpu_connector import (
     test_batched_layerwise_vllm_paged_connector_with_gpu as original_test_batched_layerwise_vllm_paged_connector_with_gpu,
 )
-from lmcache_tests.v1.test_gpu_connector import (
+from lmcache_tests.inprocess.v1.test_gpu_connector import (
     test_layerwise_vllm_paged_connector_with_gpu as original_test_layerwise_vllm_paged_connector_with_gpu,
 )
-from lmcache_tests.v1.test_gpu_connector import (
+from lmcache_tests.inprocess.v1.test_gpu_connector import (
     test_vllm_paged_connector_v2_to_gpu_bench as original_test_vllm_paged_connector_v2_to_gpu_bench,
 )
 import pytest
@@ -33,7 +33,7 @@ import lmcache_ascend.c_ops as lmc_ops
 )
 def test_layerwise_vllm_paged_connector_with_npu(use_npu, gpu_kv_format):
     target_patch = (
-        "lmcache_tests.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
+        "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
     )
 
     with patch(target_patch, new=VLLMPagedMemLayerwiseNPUConnector):
@@ -43,7 +43,7 @@ def test_layerwise_vllm_paged_connector_with_npu(use_npu, gpu_kv_format):
 @pytest.mark.parametrize("use_npu", [True])
 def test_batched_layerwise_vllm_paged_connector_with_npu(use_npu):
     target_patch = (
-        "lmcache_tests.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
+        "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemLayerwiseGPUConnector"
     )
 
     with patch(target_patch, new=VLLMPagedMemLayerwiseNPUConnector):
@@ -51,7 +51,7 @@ def test_batched_layerwise_vllm_paged_connector_with_npu(use_npu):
 
 
 def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
-    target_patch = "lmcache_tests.v1.test_gpu_connector.VLLMPagedMemGPUConnectorV2"
+    target_patch = "lmcache_tests.inprocess.v1.test_gpu_connector.VLLMPagedMemGPUConnectorV2"
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
