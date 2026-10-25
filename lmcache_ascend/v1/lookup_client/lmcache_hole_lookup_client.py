@@ -5,12 +5,12 @@ from typing import Optional, Union
 import json
 
 # Third Party
-from lmcache.logging import init_logger
-from lmcache.v1.rpc_utils import (
+from lmcache.inprocess.v1.rpc_utils import (
     get_zmq_context,
     get_zmq_rpc_path_lmcache,
     get_zmq_socket,
 )
+from lmcache.logging import init_logger
 import msgspec
 import torch
 import zmq

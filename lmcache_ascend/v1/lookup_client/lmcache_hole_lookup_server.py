@@ -4,8 +4,8 @@ import json
 import threading
 
 # Third Party
+from lmcache.inprocess.v1.rpc_utils import get_zmq_rpc_path_lmcache, get_zmq_socket
 from lmcache.logging import init_logger
-from lmcache.v1.rpc_utils import get_zmq_rpc_path_lmcache, get_zmq_socket
 from lmcache.v1.trace_utils import summarize_key, summarize_ranges, trace_flow
 import msgspec
 import zmq

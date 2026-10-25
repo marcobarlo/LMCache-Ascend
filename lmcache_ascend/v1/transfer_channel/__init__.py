@@ -3,7 +3,7 @@
 from typing import List, Union
 
 # Third Party
-from lmcache.v1.transfer_channel.abstract import BaseTransferChannel
+from lmcache.inprocess.v1.transfer_channel.abstract import BaseTransferChannel
 import torch
 import torch_npu  # noqa: F401
 

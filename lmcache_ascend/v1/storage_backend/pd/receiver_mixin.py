@@ -10,10 +10,10 @@ from typing import Callable, Optional
 import time
 
 # Third Party
+from lmcache.inprocess.v1.rpc_utils import get_zmq_socket
 from lmcache.logging import init_logger
 from lmcache.utils import STR_DTYPE_TO_TORCH_DTYPE, CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.storage_backend.pd_backend import AllocRequest
 import msgspec
 import torch

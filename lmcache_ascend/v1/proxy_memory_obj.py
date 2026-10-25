@@ -18,9 +18,9 @@ import asyncio
 import threading
 
 # Third Party
+from lmcache.inprocess.v1.transfer_channel.abstract import BaseTransferChannel
 from lmcache.logging import init_logger
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
-from lmcache.v1.transfer_channel.abstract import BaseTransferChannel
 import torch
 
 # First Party

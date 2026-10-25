@@ -23,6 +23,7 @@ from lmcache import utils
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.inprocess.v1.gpu_connector.utils import need_gpu_interm_buffer
+from lmcache.inprocess.v1.rpc_utils import get_zmq_rpc_path_lmcache
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -54,7 +55,6 @@ from lmcache.v1.rpc.zmq_transport import (
     ZmqReqRepClientTransport,
     ZmqRouterServerTransport,
 )
-from lmcache.v1.rpc_utils import get_zmq_rpc_path_lmcache
 from lmcache.v1.trace_utils import (
     advance_layerwise_storers_with_timing,
     mask_to_string,
