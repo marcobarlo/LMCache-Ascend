@@ -44,9 +44,16 @@ def get_current_git_tag(path):
 
 
 def setup_lmcache_dependency():
-    """Clones or updates the upstream LMCache repo."""
+    """Clones or updates the upstream LMCache repo.
+
+    An explicit ``LMCACHEPATH`` is the tree under test and is left as-is.
+    The default path is pinned to ``LMCACHE_UPSTREAM_TAG``.
+    """
+    explicit = "LMCACHEPATH" in os.environ
     # 1. Check if Repo Exists
     if os.path.exists(LMCACHEPATH):
+        if explicit:
+            return
         current_tag = get_current_git_tag(LMCACHEPATH)
         if current_tag == VERSION_TAG:
             return  # Already on correct version

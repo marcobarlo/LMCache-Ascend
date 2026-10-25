@@ -45,6 +45,9 @@ jobs:
     env:
       NPU_WAIT_SECONDS: 3600
       NPU_WAIT_MAX_TRIES: 24
+      # Same tree that "Checkout LMCache" installed. Do not let tests/bootstrap.py
+      # replace it with LMCACHE_UPSTREAM_TAG.
+      LMCACHEPATH: ${{ github.workspace }}/_lmcache_upstream
     defaults:
       run:
         shell: bash
