@@ -4,10 +4,11 @@ from typing import Optional
 
 # Third Party
 from lmcache.inprocess.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.inprocess.v1.gpu_connector.utils import need_gpu_interm_buffer
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.gpu_connector.utils import LayoutHints, need_gpu_interm_buffer
+from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.metadata import LMCacheMetadata
 import torch
 
