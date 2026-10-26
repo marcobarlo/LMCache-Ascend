@@ -168,14 +168,15 @@ jobs:
           print("lmcache_ascend ok")
           '
 
-      - name: Pytest tests/v1
+      - name: Pytest tests/v1/multiprocess
         id: test-step
         shell: bash
         run: |
           ASCEND_ARCH="$(uname -i)"
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${ASCEND_ARCH}-linux/devlib"
           set +e
-          python3 -u -m pytest -v tests/v1 \
+          python3 -u -m pytest -v --confcutdir=tests/v1/multiprocess \
+            tests/v1/multiprocess \
             --tb=short \
             --junit-xml=test-results.xml \
             --log-cli-level=CRITICAL \

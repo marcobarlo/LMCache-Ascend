@@ -157,6 +157,12 @@ class _FakeStorageManager:
     def finish_read_prefetched(self, keys: list[Any], read_locks: int = 0) -> None:
         pass
 
+    def finish_write_by_owner(self, completion: Any) -> None:
+        pass
+
+    def finish_read_by_owner(self, completion: Any) -> None:
+        pass
+
     def read_prefetched_results(self, keys: list[Any]) -> "_FakeReadWindow":
         return _FakeReadWindow([self.objects[k] for k in keys])
 
@@ -188,7 +194,12 @@ def test_forced_mode_selects_lmcache_driven_context() -> None:
             for i in range(NL)
         }
     )
-    context = create_transfer_context(tensors, mode="lmcache_driven")
+    context = create_transfer_context(
+        tensors,
+        instance_id=0,
+        req_client=object(),
+        mode="lmcache_driven",
+    )
     assert isinstance(context, LMCacheDrivenTransferContext)
     context.close()
 
