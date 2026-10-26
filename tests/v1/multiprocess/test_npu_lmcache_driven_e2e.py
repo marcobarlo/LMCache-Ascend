@@ -116,6 +116,9 @@ class _FakeMemoryObj:
     def data_ptr(self) -> int:
         return self.raw_tensor.data_ptr()
 
+    def get_l1_manager(self) -> int:
+        return 0
+
 
 class _FakeReadWindow:
     def __init__(self, objects: list[_FakeMemoryObj]) -> None:
@@ -131,6 +134,7 @@ class _FakeReadWindow:
 class _FakeStorageManager:
     def __init__(self) -> None:
         self.objects: dict[Any, _FakeMemoryObj] = {}
+        self._l1_managers_by_id: dict[int, object] = {0: object()}
 
     def _bytes(self, layout_desc: Any) -> int:
         return sum(
@@ -162,6 +166,28 @@ class _FakeStorageManager:
 
     def finish_read_by_owner(self, completion: Any) -> None:
         pass
+
+    def prepare_write_completion(
+        self, objects: dict[Any, _FakeMemoryObj]
+    ) -> list[tuple[int, list[Any]]]:
+        groups: dict[int, list[Any]] = {}
+        for key, obj in objects.items():
+            owner = obj.get_l1_manager()
+            if owner is None or owner not in self._l1_managers_by_id:
+                raise ValueError("write completion requires a registered L1 owner")
+            groups.setdefault(owner, []).append(key)
+        return list(groups.items())
+
+    def prepare_read_completion(
+        self, keys: list[Any], l1_owners: Any = None
+    ) -> list[Any]:
+        return []
+
+    def unsafe_read(
+        self, keys: list[Any], l1_owners: Any = None
+    ) -> tuple[list[Any], list[_FakeMemoryObj]]:
+        found = [key for key in keys if key in self.objects]
+        return found, [self.objects[key] for key in found]
 
     def read_prefetched_results(self, keys: list[Any]) -> "_FakeReadWindow":
         return _FakeReadWindow([self.objects[k] for k in keys])
@@ -254,6 +280,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
                         has_subscribers=lambda event_type: False,
                     ),
                     resolve_obj_keys=lambda key, group_ids: [[CHUNK_KEY]],
+                    get_read_owners=lambda request_id: None,
                 )
             )
             with closing(module):
