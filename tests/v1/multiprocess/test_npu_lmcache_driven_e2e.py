@@ -143,7 +143,7 @@ class _FakeStorageManager:
         )
 
     def reserve_write(
-        self, keys: list[Any], layout_desc: Any, mode: str
+        self, keys: list[Any], layout_desc: Any, mode: str | None = None
     ) -> dict[Any, _FakeMemoryObj]:
         reserved = {}
         for key in keys:
