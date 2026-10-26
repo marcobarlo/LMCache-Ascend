@@ -246,6 +246,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             module = lmcache_driven_transfer.LMCacheDrivenTransferModule(
                 SimpleNamespace(
                     chunk_size=CHUNK,
+                    null_block_id=0,
                     storage_manager=storage_manager,
                     event_bus=SimpleNamespace(
                         publish=lambda event: None,
