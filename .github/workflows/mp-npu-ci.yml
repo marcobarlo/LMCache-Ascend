@@ -29,8 +29,6 @@ run-name: >-
 
 permissions:
   contents: read
-  checks: write
-  statuses: write
 
 concurrency:
   group: mp-npu-910b3-${{ github.event.pull_request.number || github.event_name || github.ref }}
@@ -38,8 +36,14 @@ concurrency:
 
 jobs:
   test-910b3:
-    name: Unit tests on 910B3
+    name: Multiprocess unit tests on 910B3
+    # Fork PRs must not run on self-hosted NPUs; same-repo PRs need ci-hardware approval.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, ARM64, 910b3]
+    environment:
+      name: ci-hardware
     # Up to 24 hourly NPU waits + install + pytest.
     timeout-minutes: 1560
     env:
@@ -83,7 +87,10 @@ jobs:
           npu_free() {
             python3 -c '
           import re, subprocess, sys
-          out = subprocess.check_output(["npu-smi", "info"], text=True)
+          try:
+              out = subprocess.check_output(["npu-smi", "info"], text=True)
+          except (subprocess.CalledProcessError, FileNotFoundError):
+              sys.exit(2)
           hbms = []
           for line in out.splitlines():
               pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
@@ -104,8 +111,9 @@ jobs:
             if npu_free; then
               echo "NPUs look free; continuing."
               break
+            else
+              status=$?
             fi
-            status=$?
             if [[ "$status" -eq 2 ]]; then
               echo "::error::Could not parse HBM from npu-smi; refusing to run."
               exit 1
@@ -121,7 +129,7 @@ jobs:
           done
 
       - name: Checkout LMCache-Ascend
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           submodules: true
@@ -131,7 +139,7 @@ jobs:
                 || github.sha }}
 
       - name: Checkout LMCache
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: LMCache/LMCache
           ref: >-
@@ -162,9 +170,17 @@ jobs:
           pip install -v --no-build-isolation -e .
           pip install pytest pytest-benchmark pytest-cov
           python3 -c '
+          import os
           import lmcache
-          print("lmcache ok")
           import lmcache_ascend
+
+          lmcache_root = os.path.realpath(os.environ["LMCACHEPATH"])
+          lmcache_pkg = os.path.realpath(os.path.dirname(lmcache.__file__))
+          if not lmcache_pkg.startswith(lmcache_root + os.sep):
+              raise SystemExit(
+                  f"lmcache resolves to {lmcache_pkg}, expected under {lmcache_root}"
+              )
+          print("lmcache ok", getattr(lmcache, "__version__", "unknown"))
           print("lmcache_ascend ok")
           '
 
@@ -175,6 +191,7 @@ jobs:
           ASCEND_ARCH="$(uname -i)"
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/Ascend/ascend-toolkit/latest/${ASCEND_ARCH}-linux/devlib"
           set +e
+          # Skip tests/conftest.py (in-process connector imports) while running MP-only on LMCache dev.
           python3 -u -m pytest -v --confcutdir=tests/v1/multiprocess \
             tests/v1/multiprocess \
             --tb=short \
@@ -185,19 +202,52 @@ jobs:
           EXIT_CODE=$?
           set -e
           echo "pytest exit=$EXIT_CODE"
-          # CANN may SIGABRT (134) during NPU IPC teardown after assertions pass.
-          if [[ "$EXIT_CODE" -eq 134 ]] && [[ -f test-results.xml ]]; then
+          JUNIT_OK=0
+          if [[ -f test-results.xml ]]; then
             if python3 -c '
-          import sys, xml.etree.ElementTree as ET
+          import sys
+          import xml.etree.ElementTree as ET
+
           root = ET.parse("test-results.xml").getroot()
           suite = root if root.tag == "testsuite" else root.find("testsuite")
           failures = int(suite.get("failures", 0))
           errors = int(suite.get("errors", 0))
-          sys.exit(0 if failures == 0 and errors == 0 else 1)
+          if failures or errors:
+              sys.exit(1)
+
+          required_npu = {
+              "test_forced_mode_selects_lmcache_driven_context",
+              "test_lmcache_driven_store_and_retrieve_roundtrip[0]",
+              "test_lmcache_driven_store_and_retrieve_roundtrip[1]",
+          }
+          passed = set()
+          skipped = set()
+          for case in root.iter("testcase"):
+              name = case.get("name")
+              if name not in required_npu:
+                  continue
+              if case.find("skipped") is not None:
+                  skipped.add(name)
+              elif case.find("failure") is None and case.find("error") is None:
+                  passed.add(name)
+
+          if skipped:
+              print("Required NPU e2e tests were skipped:", sorted(skipped), file=sys.stderr)
+              sys.exit(1)
+          missing = required_npu - passed
+          if missing:
+              print("Required NPU e2e tests did not pass:", sorted(missing), file=sys.stderr)
+              sys.exit(1)
           '; then
-              echo "pytest SIGABRT after green JUnit; treating as success (known IPC teardown)."
-              EXIT_CODE=0
+              JUNIT_OK=1
+            else
+              exit 1
             fi
+          fi
+          # CANN may SIGABRT (134) during NPU IPC teardown after assertions pass.
+          if [[ "$EXIT_CODE" -eq 134 ]] && [[ "$JUNIT_OK" -eq 1 ]]; then
+            echo "pytest SIGABRT after green JUnit; treating as success (known IPC teardown)."
+            EXIT_CODE=0
           fi
           exit "$EXIT_CODE"
 
@@ -210,7 +260,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mp-npu-910b3-logs
           path: |

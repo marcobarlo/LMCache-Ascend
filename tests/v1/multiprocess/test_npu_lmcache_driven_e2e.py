@@ -134,7 +134,6 @@ class _FakeReadWindow:
 class _FakeStorageManager:
     def __init__(self) -> None:
         self.objects: dict[Any, _FakeMemoryObj] = {}
-        self._l1_managers_by_id: dict[int, object] = {0: object()}
 
     def _bytes(self, layout_desc: Any) -> int:
         return sum(
@@ -143,7 +142,7 @@ class _FakeStorageManager:
         )
 
     def reserve_write(
-        self, keys: list[Any], layout_desc: Any, mode: str | None = None
+        self, keys: list[Any], layout_desc: Any
     ) -> dict[Any, _FakeMemoryObj]:
         reserved = {}
         for key in keys:
@@ -172,10 +171,7 @@ class _FakeStorageManager:
     ) -> list[tuple[int, list[Any]]]:
         groups: dict[int, list[Any]] = {}
         for key, obj in objects.items():
-            owner = obj.get_l1_manager()
-            if owner is None or owner not in self._l1_managers_by_id:
-                raise ValueError("write completion requires a registered L1 owner")
-            groups.setdefault(owner, []).append(key)
+            groups.setdefault(obj.get_l1_manager(), []).append(key)
         return list(groups.items())
 
     def prepare_read_completion(
