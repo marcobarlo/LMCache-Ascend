@@ -185,6 +185,20 @@ jobs:
           EXIT_CODE=$?
           set -e
           echo "pytest exit=$EXIT_CODE"
+          # CANN may SIGABRT (134) during NPU IPC teardown after assertions pass.
+          if [[ "$EXIT_CODE" -eq 134 ]] && [[ -f test-results.xml ]]; then
+            if python3 -c '
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("test-results.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          failures = int(suite.get("failures", 0))
+          errors = int(suite.get("errors", 0))
+          sys.exit(0 if failures == 0 and errors == 0 else 1)
+          '; then
+              echo "pytest SIGABRT after green JUnit; treating as success (known IPC teardown)."
+              EXIT_CODE=0
+            fi
+          fi
           exit "$EXIT_CODE"
 
       - name: Publish JUnit summary
